@@ -1,0 +1,18 @@
+channels:
+- conda-forge
+- defaults
+dependencies:
+- asyncssh
+- caiman >= 1.10.0
+- dask
+- distributed
+- hdf5storage
+- mesmerize-core
+- mslex
+- nest-asyncio
+- ipympl
+- pip
+- pip:
+  - mesmerize-viz
+  - roipoly
+  - trycast

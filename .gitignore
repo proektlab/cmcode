@@ -1,0 +1,11 @@
+# Editor settings
+.vscode
+
+# Python data stuff
+*.db
+.ipynb_checkpoints
+__pycache__
+
+# Distribution/packaging
+*.egg-info/
+build/
