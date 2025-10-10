@@ -12,6 +12,7 @@ paths.set_root_data_dir(<your path>)
 
 See cmcode/util/environment.py to see how to change the other settings.
 """
+import os
 from pathlib import PurePosixPath, PurePath
 
 from cmcode.remote.host_info import NetworkInfo, HostInfo
@@ -79,7 +80,9 @@ labstuff_local = labstuff.get_local_path()
 # Root data dir - this is where raw input data and processed results live, as well as
 # a few other utility directories. The raw files should be located at:
 #   <root_data_dir>/raw/<rec_type>/<mouse_id>/<mouse_id>_<session_number>_<trial_number>.sbx
-root_data_dir = labstuff_local / '2p_imaging'
+# allow overriding using environment variable if desired
+if (root_data_dir := os.environ.get('CMCODE_ROOT_DATA_DIR')) is None:
+    root_data_dir = labstuff_local / '2p_imaging'
 
 # Caiman data dir - the location of the caiman_data folder. By default this gets put in
 # your home directory when you install CaImAn, and this is only necessary if you have
