@@ -556,8 +556,8 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
 
 
 def get_daily_offsets_robust(mouse_id: Union[int, str], sess_ids: Union[Sequence[int], np.ndarray],
-                               method: Literal['direct', 'indirect'] = 'indirect', key_session: Optional[Union[int, date]] = None,
-                               n_prev_to_match=5, verbose=False, allow_gaps=True, plot=True) -> ScaledDataFrame:
+                             method: Literal['direct', 'indirect'] = 'indirect', key_session: Optional[Union[int, date]] = None,
+                             n_prev_to_match=5, verbose=False, allow_gaps=True, plot=True) -> ScaledDataFrame:
     """
     For a sequence of sessions (should be consecutive or at least monotonic in time), estimate the
     micron offset from each recording to the first through multiple applications of get_offset_of_stack_from_ref.
@@ -1110,6 +1110,9 @@ def load_or_compute_remaps_for_sessions(
     mapping_load_path = None
     if use_saved_mappings == False:
         logging.info('Not trying to load mappings since use_saved_mappings is false')
+    elif not os.path.exists(alignment_dir):
+        logging.info('Alignment dir not found; creating')
+        os.mkdir(alignment_dir)
     else:
         # find latest tagged or untagged saved file
         if tagged_fn_pattern is None or (mapping_load_path := get_latest_timestamped_file(alignment_dir, tagged_fn_pattern)) is None:
@@ -1172,7 +1175,7 @@ def load_or_compute_remaps_for_sessions(
                 save_mappings_with_grouptag = all(saved_sess in sess_names for saved_sess in untagged_f['sess_names'])
 
     save_file_pattern = tagged_fn_pattern if tagged_fn_pattern and save_mappings_with_grouptag else untagged_fn_pattern
-    mapping_save_path = make_timestamped_filename(save_file_pattern)
+    mapping_save_path = os.path.join(alignment_dir, make_timestamped_filename(save_file_pattern))
     np.savez(mapping_save_path, xy_remaps=xy_remaps, sess_names=np.array(sess_names))
     return xy_remaps, mapping_save_path
 

@@ -25,7 +25,7 @@ from cmcode.util.types import MaybeSparse
 
 def normalize_footprints(A: MaybeSparse) -> sparse.csc_matrix:
     A = sparse.csc_matrix(A, copy=True)
-    norms = np.squeeze(A.power(2).sum(axis=0).sqrt())
+    norms = np.squeeze(np.sqrt(A.power(2).sum(axis=0)).A)
     nonempty = norms != 0
     A[:, nonempty] /= norms[nonempty]
     return A

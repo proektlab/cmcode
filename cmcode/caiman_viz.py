@@ -1260,8 +1260,8 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
 
         if show_accepted_only in [True, 'either']:
             # subsample assignments to cells accepted by either session
-            either_accepted = matchings1.accepted | matchings2.accepted  # pandas will combine according to union id
-            matchings1 = matchings1.loc[either_accepted, :]  # again pandas will do the right thing
+            either_accepted = matchings1.accepted.combine(matchings2.accepted, lambda m1, m2: m1 | m2, fill_value=False)
+            matchings1 = matchings1.loc[either_accepted, :]  # pandas will align indices
             matchings2 = matchings2.loc[either_accepted, :]
             subset_names.append('accepted by either')
         
