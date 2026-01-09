@@ -29,7 +29,7 @@ for (name, val) in COLORS.items():
 COLORS.update(single_letter_colors)
 
 
-@dataclass
+@dataclass(frozen=True)
 class BorderSpec:
     """For specifying the border of a 2D image unambiguously"""
     left: int = 0

@@ -1,10 +1,11 @@
 import asyncio
 from collections import Counter
 from copy import copy, deepcopy
+from dataclasses import asdict
 from datetime import date
 from functools import lru_cache
-from itertools import product, accumulate, pairwise
 import json
+from itertools import accumulate
 import logging
 import math
 import os
@@ -13,7 +14,7 @@ import pickle
 import re
 import shutil
 from subprocess import CalledProcessError
-from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal
+from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, Mapping
 
 import cv2
 from hdf5storage import savemat
@@ -28,8 +29,6 @@ from roipoly import MultiRoi
 from scipy import sparse
 from scipy.spatial import KDTree
 from scipy.stats import mode
-from tifffile import memmap as tiff_memmap
-from trycast import isassignable
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
@@ -47,12 +46,12 @@ from mesmerize_core.caiman_extensions.cnmf import cnmf_cache
 from mesmerize_core.caiman_extensions.common import Waitable, DummyProcess
 from mesmerize_core.utils import get_params_diffs
 
-from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr
-from cmcode.caiman_params import make_cnmf_params, get_default_seed_params
+from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, caiman_params as cmp
+from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
 from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt
-from cmcode.mcorr import PiecewiseMCInfo, MCResult  # to allow unpickling
+# from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
 from cmcode.util import footprints, paths
 from cmcode.util.cluster import Cluster
 from cmcode.util.compat import reconstruct_sessdata_obj
@@ -71,19 +70,6 @@ else:
 # exception identification
 NO_FILES_MSG = 'No .sbx files found'
 
-# parameters to not show in diffs between CNMF runs
-EXCLUDE_FROM_DIFFS = [
-    'online.path_to_model',  # depends on caiman data dir
-    'online.init_batch',
-    'online.movie_name_online',
-    'preprocess.n_pixels_per_process',
-    'spatial.n_pixels_per_process',
-    'patch.n_processes',
-    'data.caiman_version',  # could be irrelevant at some point, but don't show for now
-    'data.last_commit',
-    'data.fnames'
-]
-
 # this is a global variable
 cluster = Cluster()
 
@@ -93,18 +79,13 @@ def setup_cluster(*args, **kwargs):
     cluster.start(*args, **kwargs)
 
 
-def get_mouse_params(mouse_id: Union[int, str]) -> dict:
+def get_mouse_params(mouse_id: Union[int, str]) -> dict[str, dict[str, Any]]:
     """Get mouse-specific parameter overrides"""
     root_data_dir = paths.get_root_data_dir()
     params_filename = root_data_dir / 'mouse_params' / f'params_{mouse_id}.json'
     if params_filename.exists():
-        # load json and select update params with "main" entry
         with open(params_filename, 'r') as json_fh:
-            mouse_params = json.load(json_fh)
-        
-        # special-case processing for non-JSON data
-        if 'crop' in mouse_params:
-            mouse_params['crop'] = BorderSpec(**mouse_params['crop'])
+            mouse_params: dict[str, dict[str, Any]] = json.load(json_fh)
     else:
         mouse_params = {}
     return mouse_params
@@ -182,11 +163,11 @@ def get_batch_for_session(mouse_id: Union[int, str] = 0, sess_id=0, rec_type='le
 
 class SessionAnalysis:
     PATH_FIELDS = ['image_dir', 'data_dir', 'sbx_files', 'plane_tifs',
-                   'mc_result', 'cnmf_fit2_filename', 'cnmf_fit_filename', 'gridsearch_batch_path']
+                   'mc_result', 'mmap_file_transposed', 'cnmf_fit2_filename', 'cnmf_fit_filename']
 
-    def __init__(self, mouse_id: Union[int, str] = 0, sess_id=0, trials_to_include: Optional[Sequence[int]] = None, *_,
-                 rec_type='learning_ppc', tag: Optional[str] = None, loaded_info: Optional[dict[str, Any]] = None,
-                 sess_filename: Optional[str] = None, param_overrides: Optional[dict] = None,
+    def __init__(self, mouse_id: Union[int, str] = 0, sess_id=0, trials_to_include: Optional[Sequence[int]] = None, *,
+                 rec_type='learning_ppc', channel=0, tag: Optional[str] = None, loaded_info: Optional[dict[str, Any]] = None,
+                 sess_filename: Optional[str] = None, param_overrides: Optional[dict[str, dict[str, Any]]] = None,
                  downsample_factor: Optional[int] = None, trials_to_exclude: Optional[Sequence[int]] = None,
                  highpass_cutoff=0.):
         """
@@ -196,45 +177,35 @@ class SessionAnalysis:
         is appended to the tag. If the tag excluding this string matches an existing run, the corrected/converted data from that run
         may be used as a basis for saving the downsampled tif.
         """
-        # fields that aren't saved and thus must be set no matter what
+        # initialize fields that don't depend on input parameters
         self.cluster_args: Optional[dict] = None
         self.sess_filename: str = '' if sess_filename is None else sess_filename  # .pkl file to save to (gets set on first save)
         self._cnmf_fit: Optional[CNMFExt] = None  # CNMF results
+        self._frames_per_trial: Optional[np.ndarray] = None
+        self._cnmf_changed_flag = False  # flag that CNMF results should be changed next time
+
+        self.data_dir: str = ''
+        self.sbx_files: list[str] = []
+        self.metadata: dict[str, Any] = {}
+
+        # initialize fields for later results to None
+        self.plane_tifs: Optional[list[str]] = None      # flag for CONVERT stage; paths to plane TIF files
+        self.mc_result: Optional[mcorr.MCResult] = None  # flag for MCORR stage; results of motion correction
+        self.mmap_file_transposed: Optional[str] = None  # flag for TRANSPOSE stage; transposed, concatenated video
+        self.cnmf_fit_filename: Optional[str] = None     # flag for CNMF stage; path to save location for CNMF results (HDF5 file)
+
+        self.params_to_search: Optional[Union[ParamGrid, Sequence[ParamGrid]]] = None   # used if we are doing a CNMF gridsearch
 
         if loaded_info is None:
-            # set defaults/passed-in parameters
+            # use passed-in parameters
             if tag == '':
                 logging.warning('Empty string tag is interpreted as no tag (just use None)')
                 tag = None
 
-            self.tag_base: Optional[str] = tag
-            if downsample_factor is None:
-                self.tag: Optional[str] = self.tag_base
-            else:
-                tags = [tag] if tag is not None else []
-                tags.append(f'ds{downsample_factor}')
-                self.tag = '_'.join(tags)
+            self.tag: Optional[str] = tag
             self.mouse_id: Union[int, str] = mouse_id
             self.sess_id: int = sess_id
-            self.data_dir: str = ''
-            self.sbx_files: list[str] = []
-            self.metadata: dict[str, Any] = {}
-            self.crop = BorderSpec()  # how to crop each plane
-            self.downsample_factor: Optional[int] = downsample_factor  # process only every Nth frame, then interpolate CNMF results to original size.
-            self.highpass_cutoff: float = highpass_cutoff  # highpass filter cutoff to use after motion correction
-
-            self.snr_type: Literal['normal', 'gamma'] = 'gamma'
-            self.crossplane_merge_thr: Optional[float] = 0.7
-
-            # initialize fields for later results to None
-            self.odd_row_offset: Optional[int] = None            # row alignment correction to apply (if recording is bidirectional)
-            self.odd_row_ndeads: Optional[list[int]] = None      # number of saturated pixels on odd rows for each sbx file
-            self.frames_per_trial: Optional[np.ndarray] = None   # frames concatenated from each sbx file (i.e., each trial) into tif file
-            self.plane_tifs: Optional[list[str]] = None          # paths to plane TIF files
-            self.mc_result: Optional[MCResult] = None            # results of motion correction
-            self.cnmf_fit_filename: Optional[str] = None         # Path to save location for CNMF results (HDF5 file)
-            self.params_to_search: Optional[Union[ParamGrid, Sequence[ParamGrid]]] = None   # for gridsearch
-            self.gridsearch_batch_path: Optional[str] = None     # path to dataframe for use with mesmerize-core for gridsearch
+            self.rec_type: Optional[str] = rec_type
 
             # get mouse-specific overrides
             mouse_params = get_mouse_params(self.mouse_id)
@@ -244,10 +215,9 @@ class SessionAnalysis:
                 param_overrides = {}
 
             # annoyingly we have to apply any snr_type override here as a special case so we have it for make_cnmf_params
-            if 'snr_type' in param_overrides:
-                self.snr_type = param_overrides['snr_type']
-            elif 'snr_type' in mouse_params:
-                self.snr_type = mouse_params['snr_type']
+            for params_dict in [param_overrides, mouse_params]:
+                if 'eval_extra' in params_dict and 'snr_type' in params_dict['eval_extra']:
+                    snr_type = params_dict['eval_extra']['snr_type']
 
             self.data_dir = paths.get_processed_dir(self.mouse_id, rec_type=rec_type, create_if_not_found=True)
             self.sbx_files = find_sess_sbx_files(mouse_id, sess_id, trials_to_include=trials_to_include, trials_to_exclude=trials_to_exclude,
@@ -263,17 +233,23 @@ class SessionAnalysis:
             logging.info('Shape of first file: ' + 
                          f'({meta["num_frames"]}, {meta["frame_size"][0]}, {meta["frame_size"][1]}, {meta["num_planes"]})')
             self.metadata = meta
-            self.cnmf_params = make_cnmf_params(meta, dims=2, snr_type=self.snr_type, downsample_factor=downsample_factor)
-            self.seed_params = get_default_seed_params(meta)
 
-            # now apply overrides on top of defaults
-            self.update_params(mouse_params)
-            self.update_params(param_overrides)
+            self.params = SessionAnalysisParams.from_metadata(
+                metadata=meta, dims=2, downsample_factor=downsample_factor, channel=channel,
+                snr_type=snr_type, highpass_cutoff=highpass_cutoff
+            )
+
+            # now apply overrides on top of defaults (can ignore invalidation info since we're at the START stage already)
+            if mouse_params:
+                self.params = self.params.change_params_and_get_stage_to_invalidate(mouse_params, meta)[0]
+            if param_overrides:
+                self.params = self.params.change_params_and_get_stage_to_invalidate(param_overrides, meta)[0]
         else:
+            # use dict to reconstruct object
             reconstruct_sessdata_obj(self, loaded_info)
 
             # blank out machine-specific params; will set if necessary before running any analysis
-            self.cnmf_params.change_params({
+            self.update_params({
                 'data': {'fnames': None},
                 'preprocess': {'n_pixels_per_process': None},
                 'spatial': {'n_pixels_per_process': None}
@@ -289,13 +265,25 @@ class SessionAnalysis:
         if not all(b_valid):
             raise RuntimeError('Not all trials have trial numbers')
         return nums
+    
+
+    @property
+    def frames_per_trial(self) -> np.ndarray:
+        """frames concatenated from each sbx file (i.e., each trial) into tif file"""
+        if self._frames_per_trial is None:
+            # do not care about downsampling for frames per trial
+            self._frames_per_trial = np.array([sbx_utils.sbx_shape(fn)[-1] for fn in self.sbx_files])
+        return self._frames_per_trial
 
 
     @property
     def cnmf_fit(self) -> Optional[CNMFExt]:
         """Lazy loader for CNMF results"""
-        if self.cnmf_fit_filename is not None and self._cnmf_fit is None:
-            loaded_data = load_cnmf(self.cnmf_fit_filename, metadata=self.metadata, quiet=True)
+        if self.cnmf_fit_filename is None:
+            return None  # either CNMF has not been run or it's invalidated
+        
+        if self._cnmf_fit is None:
+            loaded_data = load_cnmf(self.cnmf_fit_filename, quiet=True)
             if loaded_data is None:
                 self.cnmf_fit_filename = None
             else:
@@ -333,47 +321,156 @@ class SessionAnalysis:
     def sample_rate(self) -> float:
         """Sample rate of movie taking any downsampling into account"""
         sample_rate = self.metadata['frame_rate']
-        if self.downsample_factor is not None:
-            sample_rate /= self.downsample_factor
+        if (ds := self.downsample_factor) is not None:
+            sample_rate /= ds
         return sample_rate
-    
 
+
+    @property
+    def gridsearch_batch_path(self) -> str:
+        df = self.get_gridsearch_results(allow_create=True)
+        return str(df.paths.get_batch_path())
+
+
+    # add read-only properties just for non-mutable params, so there's no confusion about whether they can be changed
+    @property
+    def downsample_factor(self) -> Optional[int]:
+        return self.params._conversion.downsample_factor
+
+    @property
+    def crop(self) -> BorderSpec:
+        return self.params._conversion.crop
+    
     @property
     def plane_size(self) -> tuple[int, int]:
         return self.crop.center_shape(self.metadata['frame_size'])
+    
+    @property
+    def crop_slices(self) -> tuple[slice, slice]:
+        return self.crop.slices(self.metadata['frame_size'])
+    
+    @property
+    def snr_type(self) -> Literal['normal', 'gamma']:
+        return self.params._eval_extra.snr_type
+    
+    @property
+    def crossplane_merge_thr(self) -> Optional[float]:
+        return self.params._cnmf_extra.crossplane_merge_thr
+    
+    @property
+    def highpass_cutoff(self) -> float:
+        return self.params._transposition.highpass_cutoff
+    
+
+    #--------------------------- PARAMS/STAGE/DATA FILE MANAGEMENT-----------------------------#
+
+    @property
+    def last_valid_stage(self) -> AnalysisStage:
+        if self.plane_tifs is None:
+            return AnalysisStage.START
+        if self.mc_result is None:
+            return AnalysisStage.CONVERT
+        if self.mmap_file_transposed is None:
+            return AnalysisStage.MCORR
+        if self.cnmf_fit is None:
+            return AnalysisStage.TRANSPOSE
+        if self.cnmf_fit.estimates.idx_components_eval is None:
+            return AnalysisStage.CNMF
+        return AnalysisStage.EVAL
 
 
-    def update_params(self, param_changes: dict):
+    def invalidate_from_stage(self, stage: AnalysisStage):
+        """
+        Remove info relating to given and later analysis stages,
+        so it must be reloaded or recomputed with current parameters
+        """
+        if stage > self.last_valid_stage:
+            return
+
+        logging.info(f'Invalidating results from {stage.name} onwards')
+        
+        if stage <= AnalysisStage.CONVERT:
+            self.plane_tifs = None
+        
+        if stage <= AnalysisStage.MCORR:
+            self.mc_result = None
+        
+        if stage <= AnalysisStage.TRANSPOSE:
+            self.mmap_file_transposed = None
+        
+        if stage <= AnalysisStage.CNMF:
+            self.cnmf_fit_filename = None
+            self._cnmf_fit = None
+
+        elif stage <= AnalysisStage.EVAL and self.cnmf_fit is not None:
+            self.cnmf_fit.estimates.idx_components_eval = None
+            self.cnmf_fit.estimates.idx_components_bad_eval = None
+            self._cnmf_changed_flag = True
+
+
+    def result_file_matches_params(self, file_path: Union[str, Path], stage: AnalysisStage,
+                                   raise_on_missing_params=False) -> bool:
+        """
+        Test whether a result file can be loaded for a given analysis stage.
+        If the result file does not exist, the saved params do not match the current params for that stage, 
+        return false. If there is no accompanying params file, catches and returns false
+        unless raise_on_missing_params is true, in which case a FileNotFoundError is raised.
+        """
+        if not os.path.isfile(file_path):
+            return False
+
+        # check whether saved params match
+        params_path = paths.params_file_for_result(file_path)
+        try:
+            return self.params.does_params_file_match(stage, params_path, metadata=self.metadata)
+        except FileNotFoundError:
+            if raise_on_missing_params:
+                raise
+            else:
+                return False
+
+
+    def write_params_for_result_file(self, file_path: Union[str, Path], stage: AnalysisStage):
+        """Write params file for a newly-produced result file"""
+        params_path = paths.params_file_for_result(file_path)
+        self.params.write_params_for_stage(stage, path=params_path)
+
+
+    def update_params(self, param_changes: dict[str, dict[str, Any]]):
         """
         Update params, also allowing changes to some things that are not part of CNMFParams:
-        (note that for dicts, unlike for sub-dicts of CNMFParams, the whole dict will be replaced rather than updated)
-        - "seed_params" -> params for constructing projection and seed for initializing CNMF (updates self.seed_params)
-        - "cluster_args" -> multiprocessing options (updates self.cluster_args)
-        - "snr_type" -> change SNR type ("normal" or "gamma")
-        - "crossplane_merge_thr" -> change threshold for crossplane merging (or None to skip crossplane merging)
+
+        - "conversion" -> params for convert_to_tif (see caiman_params.ConversionParams)
+        - "transposition" -> params for transpose_flatten_mc_mmap (see caiman_params.TranspositionParams)
+        - "cnmf_extra" -> custom params for CNMF (see caiman_params.CNMFParamsExtra)
+            - includes "seed_params" subkey for projection and seed used for initializing CNMF (see caiman_params.SeedParams)
+        - "eval_extra" -> custom params for CNMF evaluation (see caiman_params.EvalParamsExtra)
+
         All other sub-fields of CNMFParams may also be present as keys.
+        Results that are not compatible with the new parameters will be invalidated (set to None).
         """
-        # TODO I should subclass CNMFParams and add another field for my custom params to clean things up and make them more visible
-        param_changes = param_changes.copy()
-        updatable_fields = ['seed_params', 'cluster_args', 'snr_type', 'crossplane_merge_thr', 'highpass_cutoff', 'crop']
+        self.params, invalid_stage = self.params.change_params_and_get_stage_to_invalidate(param_changes, self.metadata)
+        if invalid_stage is not None:
+            self.invalidate_from_stage(invalid_stage)
 
-        for fieldname in updatable_fields:
-            if fieldname in param_changes:
-                setattr(self, fieldname, param_changes.pop(fieldname))
-        
-        self.cnmf_params.change_params(param_changes)
+    
+    def read_params(self) -> Mapping[str, Any]:
+        """Return all parameters as a dict, making it clear that this is only for reading"""
+        return self.params.read_all()
 
 
-    def save(self, save_cnmf: bool = True):
+    def save(self, save_cnmf: Optional[bool] = None):
+        if save_cnmf is None:
+            save_cnmf = self._cnmf_changed_flag
+
         if self.sess_filename == '':
-            file_pattern = get_session_analysis_file_pattern(
-                self.mouse_id, self.sess_id, tag=self.tag_base, downsample_factor=self.downsample_factor)  
+            file_pattern = get_session_analysis_file_pattern(self.mouse_id, self.sess_id, tag=self.tag)  
             filename = paths.make_timestamped_filename(file_pattern)
             self.sess_filename = os.path.join(self.data_dir, filename)
 
         logging.info(f'Saving session analysis to {self.sess_filename}')
         fields_to_skip = ['sess_filename', 'cluster_args', 'cnmf_fit1', 'cnmf_fit2',
-                          'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit']
+                          'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit', 'tag_base']
         fields_to_save = {name: val for (name, val) in vars(self).items() if name not in fields_to_skip}
 
         # relativize paths
@@ -383,10 +480,16 @@ class SessionAnalysis:
 
         with open(self.sess_filename, 'wb') as info_file:
             pickle.dump(fields_to_save, info_file)
-            
+        
+        # also save params file
+        params_filename = os.path.splitext(self.sess_filename)[0] + '.json'
+        self.params.write_json_file(params_filename)
+
         if save_cnmf and self.cnmf_fit is not None and self.cnmf_fit_filename is not None:
             logging.info(f'Saving CNMF to {self.cnmf_fit_filename}')
             self.cnmf_fit.save(self.cnmf_fit_filename)
+            self.write_params_for_result_file(self.cnmf_fit_filename, AnalysisStage.EVAL)
+            self._cnmf_changed_flag = False
         
         load.cache_clear()
 
@@ -401,196 +504,202 @@ class SessionAnalysis:
             raise RuntimeError('preview_raw_data only available in Jupyter')
 
         def save_callback(new_offset: int):
-            self.odd_row_offset = new_offset
+            self.update_params({'conversion': {'odd_row_offset': new_offset}})
             self.save(save_cnmf=False)
 
-        widget = caiman_viz.RawDataPreviewContainer(self.sbx_files, frames=frames_to_average, curr_offset=self.odd_row_offset,
-                                                    offset_save_callback=save_callback, channel=channel, title=title)
+        convert_params = self.params.get_params_for_stage(AnalysisStage.CONVERT)
+        curr_offset = convert_params['conversion'].odd_row_offset
+
+        widget = caiman_viz.RawDataPreviewContainer(
+            self.sbx_files, frames=frames_to_average, subinds_spatial=self.crop_slices,
+            curr_offset=curr_offset, offset_save_callback=save_callback, channel=channel, title=title)
         return widget.show()
 
 
-    def convert_to_tif(self, to3D=False, force=False, channel=0, **convert_kwargs):
+    def convert_to_tif(self, load: Optional[bool] = None, **convert_kwargs):
         """
         Concatenate sbx files and convert each plane (by default) or the entire 3D movie to .tif file(s).
         To make sure the frame rate remains mostly correct, if subindices are passed, for each file the
         indices along time must either be a slice with step of 1 or an array where np.diff(subinds) is majority 1
         (could still subvert by doing something stupid, so don't do that)
+
+        load: Whether to try loading previously-computed results.
+            None: load previous results if params match, otherwise compute anew
+            True: load previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results if they already exist.
         """
-        # use odd_row_offset unless explicitly given
-        if 'odd_row_offset' not in convert_kwargs and self.odd_row_offset is not None:
-            convert_kwargs['odd_row_offset'] = self.odd_row_offset
+        # first update with passed-in params
+        self.update_params({'conversion': convert_kwargs})
+        convert_params = self.params.get_params_for_stage(AnalysisStage.CONVERT)['conversion']
 
-        # get nsaturated explicitly for bidirectional recordings so we can use it later
-        if self.metadata['scanning_mode'] == 'bidirectional':
-            if 'odd_row_ndead' in convert_kwargs:
-                ndead = convert_kwargs['odd_row_ndead']
-                self.odd_row_ndeads = list(ndead) if isinstance(ndead, Sequence) else [ndead] * len(self.sbx_files)
-            else:
-                if self.odd_row_ndeads is None:
-                    self.odd_row_ndeads = [sbx_utils.get_odd_row_ndead(f) for f in self.sbx_files]
-                convert_kwargs['odd_row_ndead'] = self.odd_row_ndeads
+        # estimate ndead explicitly if needed so we can use it later
+        if convert_params.odd_row_ndead is None and (
+            self.metadata['scanning_mode'] == 'bidirectional' or convert_params.force_estim_ndead_offset):
+                odd_row_ndead = [sbx_utils.get_odd_row_ndead(f) for f in self.sbx_files]
+                convert_params = convert_params.replace({'odd_row_ndead': odd_row_ndead})
+                self.update_params({'conversion': {'odd_row_ndead': odd_row_ndead}})
+
+        # deal with downsampling
+        if convert_params.downsample_factor is not None:
+            subindices = (slice(None, None, convert_params.downsample_factor),) + self.crop_slices
         else:
-            self.odd_row_ndeads = None
+            subindices = (slice(None),) + self.crop_slices
 
-        def convert_one(filename: str, plane: Optional[int], filename_base: str):
-            """
-            Convert a single plane. If downsample_factor is not None, also downsample, either while converting
-            or from filename_base if it exists.
-            """
-            if self.frames_per_trial is None:
-                # do not care about downsampling for frames per trial
-                logging.debug('Frames per file is missing; inferring') 
-                self.frames_per_trial = np.array([sbx_utils.sbx_shape(fn)[-1] for fn in self.sbx_files])
-                self.save(save_cnmf=False)
-            assert self.frames_per_trial is not None
+        def convert_one(filename: str, plane: Optional[int]):
+            """Convert a single plane. If downsample_factor is not None, also downsample."""
+            plane_prefix = f'Plane {plane}: ' if plane is not None else ''  # for logging
 
-            if not force and os.path.isfile(filename):
-                logging.info((f'Plane {plane}: ' if plane is not None else '') + 'using existing .tif file for this mouse/session.')
-            elif not force and self.downsample_factor is not None and os.path.isfile(filename_base):
-                # Re-save downsampled version
-                logging.info(f'Plane {plane}: saving downsampled version of {filename_base} to {filename}')
-                slices_orig = []  # slices of original data
-                frames_per_file_ds = []
-                for start, stop in pairwise(accumulate(self.frames_per_trial, initial=0)):
-                    frames_per_file_ds.append(math.ceil((stop - start) / self.downsample_factor))
-                    slices_orig.append(slice(start, stop, self.downsample_factor))
-
-                # create file to hold downsampled data
-                mmap_orig = tiff_memmap(filename_base, mode='r')
-                shape_orig = mmap_orig.shape
-                dtype = mmap_orig.dtype
-                shape_ds = (sum(frames_per_file_ds),) + shape_orig[1:]
-                _, out_memmap_args = sbx_utils._prepare_concat_output_memmap(
-                    filename, shape_ds, frames_per_file_ds, dtype=dtype,
-                    bigtiff=convert_kwargs.get('bigtiff', True), imagej=convert_kwargs.get('imagej', False)
-                )
-
-                # save downsampled data to file
-                for in_slice, out_args in zip(tqdm(slices_orig, desc='Downsampling each trial...', unit='trial'), out_memmap_args):
-                    out_memmap = np.memmap(**out_args)
-                    out_memmap[:] = mmap_orig[in_slice]             
-            else:
-                logging.info((f'Plane {plane}: ' if plane is not None else '') +
-                             f'converting {len(self.sbx_files)} .sbx file(s) into one .tif file...')
+            if load != False and os.path.isfile(filename):
+                # check whether saved params match
+                if self.result_file_matches_params(filename, AnalysisStage.CONVERT):
+                    if load is None:
+                        logging.info(plane_prefix + 'using existing .tif file for this mouse/session.')
+                    return
                 
-                # deal with downsampling
-                if self.downsample_factor is not None:
-                    subindices = (slice(None, None, self.downsample_factor),) + self.crop.slices(self.metadata['frame_size'])
+                if load is None:
+                    logging.info(plane_prefix + 'cannot find params file or params did not match.')
                 else:
-                    subindices = (slice(None),) + self.crop.slices(self.metadata['frame_size'])
+                    raise NoMatchingResultError(plane_prefix + 'could not find TIF files matching current params.')
 
-                sbx_utils.sbx_chain_to_tif(self.sbx_files, fileout=filename, channel=channel, plane=plane,
-                                           dead_pix_mode=self.cnmf_params.motion['border_nan'],
-                                           dview=cluster.dview, subindices=subindices, **convert_kwargs)
+            logging.info(plane_prefix + f'converting {len(self.sbx_files)} .sbx file(s) into one .tif file...')
+
+            param_dict = asdict(convert_params)
+            # remove items that are not arguments to sbx_chain_to_tif
+            for other_param in ['crop', 'downsample_factor', 'keep_3d']:
+                del param_dict[other_param]
+
+            sbx_utils.sbx_chain_to_tif(
+                self.sbx_files, fileout=filename, subindices=subindices, plane=plane, dview=cluster.dview, **param_dict)
+            self.write_params_for_result_file(filename, AnalysisStage.CONVERT)
       
         conversion_dir = os.path.join(self.data_dir, 'conversion')
         os.makedirs(conversion_dir, exist_ok=True)
-        tagstr_base = '_' + self.tag_base if self.tag_base is not None else ''
         tagstr = '_' + self.tag if self.tag is not None else ''
 
-        if to3D:
-            tif_filename_base = os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr_base}.tif')
+        if convert_params.keep_3d:
             tif_filename = os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}.tif')
-            convert_one(tif_filename, plane=None, filename_base=tif_filename_base)
+            convert_one(tif_filename, plane=None)
             tif_filenames = [tif_filename]
         else:
-            tif_filenames_base = [os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr_base}_plane{plane}.tif')
-                             for plane in range(self.metadata['num_planes'])]
             tif_filenames = [os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_plane{plane}.tif')
-                                for plane in range(self.metadata['num_planes'])]
+                             for plane in range(self.metadata['num_planes'])]
             
             if (len(tif_filenames) == 1):
-                convert_one(tif_filenames[0], plane=None, filename_base=tif_filenames_base[0])
+                convert_one(tif_filenames[0], plane=None)
             else:
-                for i, (filename, filename_base) in enumerate(zip(tif_filenames, tif_filenames_base)):
-                    convert_one(filename, plane=i, filename_base=filename_base)
+                for i, filename in enumerate(tif_filenames):
+                    convert_one(filename, plane=i)
         
         self.plane_tifs = tif_filenames
         self.save(save_cnmf=False)
-        
-
-    def convert_functional_to_tif(self, force: bool = False, **convert_kwargs) -> None:
-        logging.warning('Deprecated, just use convert_to_tif')
-        self.convert_to_tif(to3D=False, force=force, channel=0, **convert_kwargs)
 
 
     #-------------------------- MOTION CORRECTION -----------------------------#
 
 
-    def do_motion_correction(self, force: bool = False):
+    def do_mcorr_only(self, load: Optional[bool] = None):
         """
-        Do motion correction, also re-saving the results in C order and with planes concatenated along the X axis.
+        Do motion correction. 
         If results are already available, skip unless force is true.
         Saves the SessionAnalysis object if motion correction is not skipped.
+
+        load: Whether to try loading previously-computed results.
+            None: load previous results if params match, otherwise compute anew
+            True: load previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results if they already exist.
         """
         if self.plane_tifs is None:
-            self.convert_to_tif(channel=0)
-            assert self.plane_tifs is not None
+            raise RuntimeError('Must convert to TIF before doing motion correction')
 
-        if (not force and self.mc_result is not None and
-            all(os.path.exists(f) for f in self.mc_result.mmap_files)):
-            logging.info('Using existing motion correction results')
-            if not os.path.exists(self.mc_result.mmap_file_transposed):
-                self.mc_result.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
-                    self.mc_result.mmap_files, self.mc_result.border_to_0, sample_rate=self.sample_rate,
-                    highpass_cutoff=self.highpass_cutoff)
-                self.save(save_cnmf=False)
-        else:
-            try:
-                if not self.cnmf_params.motion['pw_rigid']:
-                    # take left border into account (i.e. exclude it) if applicable
-                    ndead_max = 0 if self.odd_row_ndeads is None else max(self.odd_row_ndeads)
-                    shift_max = 0 if self.odd_row_offset is None else math.ceil(abs(self.odd_row_offset) / 2)
-                    n_to_clip = ndead_max + shift_max
+        plane_results: list[mcorr.PlaneMcorrResult] = []
+        params_for_mcorr = self.params.get_params_up_to_stage(AnalysisStage.MCORR)
+
+        for k_plane, tif_path in enumerate(self.plane_tifs):
+            plane_prefix = f'Plane {k_plane}: ' if len(self.plane_tifs) > 1 else ''
+
+            # update indices if necessary
+            mcorr_extra = params_for_mcorr['mcorr_extra']
+            if mcorr_extra.auto_adjust_indices and not mcorr_extra._indices_are_adjusted:
+                new_indices = mcorr.compute_adjusted_indices(params_for_mcorr)
+                param_updates: dict[str, dict[str, Any]] = {'mcorr_extra': {'_indices_are_adjusted': True}}
+                if new_indices is not None:
+                    logging.info(f'Changing indices to {new_indices} to avoid dead pixels')
+                    params_for_mcorr['motion']['indices'] = new_indices
+                    param_updates['motion'] = {'indices': new_indices}
+                
+                mcorr_extra.replace({'_indices_are_adjusted': True})
+                self.update_params(param_updates)
+
+            if load != False:  # try to load existing results
+                is_piecewise = params_for_mcorr['motion']['pw_rigid']
+                candidate_files = mcorr.get_candidate_mcorr_result_files(tif_path, is_piecewise)
+                found_result = None
+                for path in candidate_files:
+                    if self.result_file_matches_params(path, AnalysisStage.MCORR):
+                        found_result = mcorr.load_mcorr_result(path)
+                        if load is None:  # only log if we were unsure whether to load
+                            logging.info(plane_prefix + 'using existing motion correction results from ' + path)
+                        break
+                
+                if found_result is not None:
+                    plane_results.append(found_result)
+                    continue
                 else:
-                    n_to_clip = 0  # can't apply piecewise shifts to different-size movie (doesn't make sense)
+                    no_match_msg = plane_prefix + 'cannot find matching motion correction results.'
+                    if load is None:
+                        logging.info(no_match_msg)
+                    else:  # error to not load results if load is True
+                        raise NoMatchingResultError(no_match_msg)
+            
+            # we are doing mcorr for this plane
+            logging.info(plane_prefix + 'doing motion correction.')
 
-                inds = list(self.cnmf_params.motion['indices'])
-                if n_to_clip > 0:
-                    inds[1] = slice(n_to_clip, None, None)
-                else:
-                    inds[1] = slice(None)
-                inds = tuple(inds)
-                self.cnmf_params.change_params({'motion': {'indices': inds}})
-
-                # initialize variables to update for each plane
-                mmap_files: list[str] = []
-                shifts: list[np.ndarray] = []
-                shifts_els: Optional[list[np.ndarray]] = []
-                max_b20 = 0
+            plane_result = mcorr.motion_correct_file(
+                tif_path, motion_params=params_for_mcorr['motion'], dview=cluster.dview)
+            plane_results.append(plane_result)
+            self.write_params_for_result_file(plane_result['mmap_path'], AnalysisStage.MCORR)
         
-                any_new = False
-                for k_plane, plane_tif in enumerate(self.plane_tifs):
-                    logging.info(f'Correcting plane {k_plane}')
-                    mmap_file, this_shifts, b20, this_shifts_els, new_result = mcorr.motion_correct_file(
-                        plane_tif, self.cnmf_params, cluster_args=self.cluster_args, force=force)
-                    mmap_files.append(mmap_file)
-                    shifts.append(this_shifts)
-                    max_b20 = max(max_b20, b20)
-                    if this_shifts_els is not None:
-                        shifts_els.append(this_shifts_els)
-                    any_new = any_new or new_result
+        # build MCResult from list of PlaneMcorrResults
+        shifts_els: Optional[list[np.ndarray]] = None
+        if params_for_mcorr['motion']['pw_rigid']:
+            shifts_els = []
+            for res in plane_results:
+                assert res['shifts_els'] is not None, 'Should have piecewise shifts in results'
+                shifts_els.append(res['shifts_els'])
 
-                if len(shifts_els) == 0:
-                    shifts_els = None
+        self.mc_result = mcorr.MCResult(
+            mmap_files=[res['mmap_path'] for res in plane_results],
+            border_to_0=max(res['border_to_0'] for res in plane_results),
+            border_asym=[res['border_asym'] for res in plane_results],
+            shifts_rig=[res['shifts_rig'] for res in plane_results],
+            shifts_els=shifts_els,
+            dims=self.plane_size,
+            motion_params=params_for_mcorr['motion']
+        )
 
-                mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
-                    mmap_files, max_b20, sample_rate=self.sample_rate, highpass_cutoff=self.highpass_cutoff, force=any_new)
+        self.save(save_cnmf=False)
+    
 
-                self.mc_result = MCResult(
-                    mmap_files=mmap_files, mmap_file_transposed=mmap_file_transposed,
-                    border_to_0=max_b20, shifts_rig=shifts, shifts_els=shifts_els,
-                    dims=self.plane_size, motion_params=self.cnmf_params.motion)
-            except:
-                # remove final result file to ensure we don't erroneously think we're done
-                if self.mc_result is not None and os.path.exists(self.mc_result.mmap_file_transposed):
-                    os.remove(self.mc_result.mmap_file_transposed)
-                raise
-            self.save(save_cnmf=False)
+    def do_motion_correction(self, load: Optional[bool] = None):
+        """"
+        For convenience/compatibility, do motion correction and transpose in one function.
+            
+        load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+        """
+        # do motion correction if necessary
+        if self.mc_result is None or load == False:
+            self.do_mcorr_only(load=load)
+            assert self.mc_result is not None
+
+        self.concat_and_transpose(load=load)
 
     
-    def apply_motion_correction(self, mc_result: MCResult, do_transpose=False, force=False):
+    def apply_motion_correction(self, mc_result: 'mcorr.MCResult', do_transpose=False, force=False):
         """
+        TODO: update
         Apply motion correction result (typically from another channel of the same movie) to the current tiffs.
         By default concatenates the results, but does not transpose to C order, since the output
         will typically not be used for CNMF.
@@ -620,13 +729,13 @@ class SessionAnalysis:
         mcorr_objs = mc_result.recreate_mcorr_objects()
         this_result.mmap_files = [mcorr.apply_mcorr_to_file(mcorr_obj, tif_file)
                                   for mcorr_obj, tif_file in zip(mcorr_objs, self.plane_tifs)]
-        this_result.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
+        self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
             this_result.mmap_files, this_result.border_to_0, sample_rate=self.sample_rate,
             highpass_cutoff=self.highpass_cutoff, do_transpose=do_transpose, force=True
         )
         self.mc_result = this_result
         self.save(save_cnmf=False)
-                
+
 
     def get_original_and_corrected_movies(self, ds_ratio=5, xy_ds_ratio=1) -> tuple[np.ndarray, np.ndarray]:
         """
@@ -726,6 +835,40 @@ class SessionAnalysis:
             fig_corr.savefig(os.path.join(self.data_dir, 'mcorr', f'{self.mouse_id}_{self.sess_id:03d}_corr.png'), dpi=200)
 
 
+    # ------------------------------- PLANE CONCATENATION/TRANSPOSITION ------------------------#
+
+    def concat_and_transpose(self, load: Optional[bool] = None):
+        """
+        Concatenate motion-corrected planes and convert to C-order for CNMF.
+        Also does blurring and high-pass filtering steps if requested.
+
+        load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+        """
+        if self.mc_result is None:
+            raise RuntimeError('Must do motion correction before concatenating/transposing planes')
+        
+        trans_params = self.params.get_params_for_stage(AnalysisStage.TRANSPOSE)['transposition']
+        
+        if load != False:   # try to load existing results
+            expected_file = mcorr.get_transposed_mmap_name(self.mc_result.mmap_files, trans_params)
+            if self.result_file_matches_params(expected_file, AnalysisStage.TRANSPOSE):
+                if load is None:  # only log if we were unsure whether to load
+                    logging.info('Using existing transposed file: ' + expected_file)
+                self.mmap_file_transposed = expected_file
+                return
+            elif load == True:
+                raise NoMatchingResultError('Cannot find matching transposed file.')
+            
+        # we are doing the transpose
+        self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
+            self.mc_result, trans_params, fr=self.sample_rate, dview=cluster.dview)
+        self.write_params_for_result_file(self.mmap_file_transposed, AnalysisStage.TRANSPOSE) 
+        self.save(save_cnmf=False)
+
+
     #------------------------------------ SUMMARY IMAGES ----------------------------------------#
 
 
@@ -772,7 +915,8 @@ class SessionAnalysis:
         if blur_kernel_size > 1 and proj_type == 'mean':
             # linear operation, can just blur here
             proj = cv2.GaussianBlur(
-                proj, (blur_kernel_size, blur_kernel_size), blur_kernel_size//4, None, blur_kernel_size//4, cv2.BORDER_REPLICATE)
+                proj, ksize=(blur_kernel_size, blur_kernel_size), sigmaX=blur_kernel_size/4,
+                sigmaY=blur_kernel_size/4, borderType=cv2.BORDER_REPLICATE)
 
         proj[np.isnan(proj)] = 0
         return proj
@@ -945,7 +1089,9 @@ class SessionAnalysis:
         """Make a copy of the current CNMF params and make changes that need to be made between motion correction and CNMF"""
         if self.mc_result is None:
             raise RuntimeError('No MC results; cannot run CNMF')
-        mc_res_fn = self.mc_result.mmap_file_transposed
+
+        if (mc_res_fn := self.mmap_file_transposed) is None:
+            raise RuntimeError('No transposed data file; cannot run CNMF')
         file_size = get_file_size(mc_res_fn)[0]
         
         if is3D:
@@ -1124,7 +1270,7 @@ class SessionAnalysis:
         """
         Start a CNMF run through mesmerize-core, so results will be in the batch dataframe. Defaults to running in background.
         is3D: whether to do 3D CNMF.
-        seed_params: if None, usees default seeed params (see caiman_params.py). Use empty dict to use non-seeded CNMF.
+        seed_params: if None, usees default seed params (see caiman_params.py). Use empty dict to use non-seeded CNMF.
         do_refit only takes effect if seed_params is empty ({}) (no need for refit with seeded CNMF)
         cluster_args are used when setting up the cluster if the backend is 'local' or 'local_async'
         run_args are set to series.caiman.run in mescore.
@@ -1162,8 +1308,11 @@ class SessionAnalysis:
                 row = cast(MescoreSeries, row)
                 params_diffs: Sequence[dict[str, Any]] = get_params_diffs([params_cnmf, row.at['params']])
                 # ignore quality parameters when checking for match; don't need to re-run CNMF for different quality params
-                if all(param_name.startswith('quality.') or param_name in EXCLUDE_FROM_DIFFS
-                       for param_name in params_diffs[0]):
+                def can_exclude(param_name: str):
+                    sub_names = accumulate(param_name.split('.'), lambda p1, p2: '.'.join((p1, p2)))
+                    return any(name in cmp.EXCLUDE_FROM_DIFFS for name in sub_names)
+
+                if all(can_exclude(param_name) for param_name in params_diffs[0]):
                     logging.info('Found matching CNMF run')
                     if len(params_diffs[0]) > 0:
                         # load in order to compare quality params
@@ -1393,20 +1542,14 @@ class SessionAnalysis:
             
     
     def get_gridsearch_results(self, allow_create=False) -> MescoreBatch:
-        if self.gridsearch_batch_path is None:
-            # See if a batch file already exists
-            df = get_batch_for_session(
-                self.mouse_id, self.sess_id, tag=self.tag, data_dir=self.data_dir, create=allow_create)
-            self.gridsearch_batch_path = str(df.paths.get_batch_path())
-        else:
-            df = cast(MescoreBatch, mc.load_batch(self.gridsearch_batch_path))
+        df = get_batch_for_session(self.mouse_id, self.sess_id, tag=self.tag, data_dir=self.data_dir, create=allow_create)
 
         # fix input_movie_path for new directory structure - make relative to parent raw data path
         any_changed = False
         for _, row in df.iterrows():
             abs_path_from_data_dir = Path(self.data_dir) / str(row['input_movie_path'])
             if abs_path_from_data_dir.exists():
-                new_rel_path = abs_path_from_data_dir.relative_to(mc.get_parent_raw_data_path())
+                new_rel_path = df.paths.split(abs_path_from_data_dir)[1]
                 row['input_movie_path'] = str(PurePosixPath(new_rel_path))
                 any_changed = True
         if any_changed:
@@ -1450,6 +1593,8 @@ class SessionAnalysis:
         Sets self.cnmf_fit, self.cnmf_fit_filename, and self.cnmf_params to match the selected run
         Returns the UUID of the selected run.
         """
+        # TODO make this also load matching motion correction results, etc.
+
         if index is not None and uuid is not None:
             raise ValueError('Cannot specify both uuid and index')
         
@@ -1473,7 +1618,6 @@ class SessionAnalysis:
                 return curr_uuid
 
         df = self.get_gridsearch_results()
-        assert self.gridsearch_batch_path is not None, 'Gridsearch batch path should be set after get_gridsearch_results'
 
         if index is not None:
             try:
@@ -1495,7 +1639,7 @@ class SessionAnalysis:
             raise RuntimeError('Selected item is not a CNMF run')
         
         # OK, we have a CNMF run and it has completed successfully. Set fields.
-        self.cnmf_fit_filename = str(Path(self.gridsearch_batch_path).parent / row.outputs['cnmf-hdf5-path'])
+        self.cnmf_fit_filename = str(df.paths.get_batch_path().parent / row.outputs['cnmf-hdf5-path'])
         if cluster.dview is None:
             setup_cluster()
         cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
@@ -1530,14 +1674,16 @@ class SessionAnalysis:
             return None
         
         # find cnmf_fit_filename in batch
-        completed_inds = [i for i, out in enumerate(batch.outputs) if out is not None and out['success']]
-        completed_runs = batch.loc[completed_inds, :].reset_index(drop=True)
-        run_filenames = [os.path.split(outputs['cnmf-hdf5-path'])[1] for outputs in completed_runs.outputs]
         selected_filename = os.path.split(self.cnmf_fit_filename)[1]
-        if selected_filename in run_filenames:
-            return completed_inds[run_filenames.index(selected_filename)]
-        else:
-            return None
+        for ind, row in batch.iterrows():
+            outputs: dict = row.at['outputs']
+            if outputs is None or not outputs['success']:
+                continue
+
+            run_filename = os.path.split(outputs['cnmf-hdf5-path'])[1]
+            if run_filename == selected_filename:
+                return cast(int, ind)
+        return None
         
     def get_selected_uuid(self) -> Optional[str]:
         index = self.get_selected_index()
@@ -2195,12 +2341,8 @@ class SessionAnalysis:
 
         return save_paths
 
-
-def get_session_analysis_file_pattern(mouse_id: Union[str, int], sess_id: int,
-                                      tag: Optional[str], downsample_factor: Optional[int] = None) -> str:
+def get_session_analysis_file_pattern(mouse_id: Union[str, int], sess_id: int, tag: Optional[str]) -> str:
     tagstr = '_' + tag if tag else ''
-    if downsample_factor is not None:
-        tagstr = tagstr + f'_ds{downsample_factor}'
     return f'{mouse_id}_{sess_id:03d}{tagstr}_%dt.pkl'
 
 
@@ -2217,13 +2359,13 @@ def load(filename: str, quiet=True, lazy=True, **field_overrides) -> SessionAnal
     # load CNMF
     sessdata._cnmf_fit = None
     if sessdata.cnmf_fit_filename is not None and not lazy:
-        sessdata._cnmf_fit = load_cnmf(sessdata.cnmf_fit_filename, metadata=sessdata.metadata, quiet=quiet)
+        sessdata._cnmf_fit = load_cnmf(sessdata.cnmf_fit_filename, quiet=quiet)
         if sessdata._cnmf_fit is None:
             sessdata.cnmf_fit_filename = None
     return sessdata
 
 
-def load_cnmf(cnmf_filename: str, metadata: dict, quiet=True) -> Optional[CNMFExt]:
+def load_cnmf(cnmf_filename: str, quiet=True) -> Optional[CNMFExt]:
     """
     Tries to load CNMF results
     """

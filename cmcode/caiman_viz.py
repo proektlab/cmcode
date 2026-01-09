@@ -682,7 +682,8 @@ class CNMFDataFrameVizWideExtension(CNMFDataFrameVizExtension):
 class RawDataPreviewContainer:
     """Widget that shows a mean projection of n frames of the raw data and allows bidirectional correction"""
 
-    def __init__(self, sbx_files: list[str], frames: Union[int, slice], curr_offset: Optional[int],
+    def __init__(self, sbx_files: list[str], frames: Union[int, slice], *,
+                 subinds_spatial: Sequence[sbx_utils.DimSubindices]=(), curr_offset: Optional[int],
                  offset_save_callback: Optional[Callable[[int], None]] = None, channel: Optional[int] = 0,
                  title: Optional[str] = None):
         # check whether bidirectional
@@ -695,7 +696,7 @@ class RawDataPreviewContainer:
             raise RuntimeError('Cannot preview combination of uni- and birectional files')
         
         self.mean_data_3d = average_raw_frames(sbx_files, frames, channel=channel, crop_dead=self.bidi,
-                                               dview=cma.cluster.dview)
+                                               subinds_spatial=subinds_spatial, dview=cma.cluster.dview)
         self.offset_data_3d = np.copy(self.mean_data_3d, order='F')  # pre-allocate
         self.curr_offset = 0 if curr_offset is None else curr_offset
 

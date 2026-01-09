@@ -11,17 +11,30 @@ from tqdm import tqdm
 
 from cmcode.util import paths
 
-def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]) -> tuple[dict[int, slice], int]:
+def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]
+                     ) -> tuple[dict[int, slice], int, tuple[int, int, int]]:
     """
     For loading files for average_raw_frames.
     Determine the slice of frames to load from each file to satisfy the overall frames slice
     Second output is the total number of frames that will be loaded
+    Third output is the spatial dimensions - (Y, X, [Z]) - which should be the same for all files.
     """
     if isinstance(frames, int):
         frames = slice(frames)
 
     # first get the indices from the whole session to pull
-    all_nframes = [sbx_utils.sbx_shape(file)[4] for file in sbx_files]
+    all_nframes: list[int] = []
+    dims: Optional[tuple[int, int, int]] = None
+    for file in sbx_files:
+        _, y, x, z, nframes = sbx_utils.sbx_shape(file)
+        if dims is None:
+            dims = (y, x, z)
+        elif dims != (y, x, z):
+            raise RuntimeError('Files do not have the same spatial dimensions')
+        all_nframes.append(nframes)
+    if dims is None:
+        raise RuntimeError('List of files was empty')
+
     cum_frames = np.insert(np.cumsum(all_nframes), 0, 0)
     frames_arr = np.arange(cum_frames[-1], dtype=int)[frames]
 
@@ -35,19 +48,35 @@ def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]) -> tuple[d
             sub_end = max(this_frames) - start + 1
             frames_map[i] = slice(sub_start, sub_end, step)
     
-    return frames_map, len(frames_arr)
+    return frames_map, len(frames_arr), dims
 
 
-def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], channel: Optional[int] = 0,
+def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], *, channel: Optional[int] = 0,
                        subinds_spatial: Sequence[sbx_utils.DimSubindices] = (), crop_dead=True,
                        plane: Optional[int] = None, to32: Optional[bool] = None, quiet=False, dview=None,
                        odd_row_offset=0) -> np.ndarray:
     """load frames, slicing across all given files, and take mean projection"""
-    subinds_map, total_frames = subinds_per_file(sbx_files, frames)
+    subinds_map, total_frames, dims = subinds_per_file(sbx_files, frames)
     mean_data = None
     file_iterator = subinds_map.items()
     if not quiet:
         file_iterator = tqdm(file_iterator, desc='Loading and averaging selected frames...', unit='file')
+
+    if crop_dead:  # crop out dead columns
+        ndead = sbx_utils.get_odd_row_ndead(sbx_files[0]) - odd_row_offset // 2
+        if len(subinds_spatial) == 0:
+            subinds_spatial = (slice(None), slice(ndead, None))
+        elif len(subinds_spatial) == 1:
+            subinds_spatial = (subinds_spatial[0], slice(ndead, None))
+        else:
+            # remove the dead columns from the existing column subindices using setdiff
+            curr_subinds_x = subinds_spatial[1]
+            if isinstance(curr_subinds_x, slice):
+                curr_subinds_x = range(dims[1])[curr_subinds_x]
+            new_subinds_x = list(np.setdiff1d(curr_subinds_x, range(ndead)))
+            subinds_spatial = list(subinds_spatial)
+            subinds_spatial[1] = new_subinds_x
+
     for file_ind, subinds_t in file_iterator:
         subindices = (subinds_t,) + tuple(subinds_spatial)
         data = sbx_utils.sbxread(sbx_files[file_ind], subindices=subindices, channel=channel, plane=plane, odd_row_ndead=0,
@@ -57,13 +86,8 @@ def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], channel:
             mean_data += mean_data_file
         else:
             mean_data = mean_data_file
-    assert mean_data is not None, "No files passed to average"
-
-    # crop out dead columns
-    if crop_dead:
-        ndead = sbx_utils.get_odd_row_ndead(sbx_files[0]) - odd_row_offset // 2
-        mean_data = mean_data[:, ndead:]
     
+    assert mean_data is not None, "No files passed to average"   
     return mean_data
 
 

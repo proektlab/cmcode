@@ -315,22 +315,34 @@ def make_timestamped_filename(file_pattern: str) -> str:
     return PctTemplate(file_pattern).substitute({'dt': timestamp})
 
 
-def get_latest_timestamped_file(parent_dir: str, file_pattern: str) -> Optional[str]:
+def get_all_timestamped_files(parent_dir: Union[str, Path], file_pattern: str) -> list[str]:
     """
-    Find the file within parent_dir matching a pattern with the latest timestamp
-    (where the timestamp is part of the filename, not the modified time)
-    and return the full path (or None if none were found).
+    Find files within parent_dir matching a pattern with timestamps
+    included in the filename and return the full paths,
+    sorted from newest to oldest timestamp.
         - file_pattern: string with "%dt" or "%{dt}" where the date should go.
     """
-    # make the regular expression
     file_pattern_escaped = re.escape(file_pattern)
     dt_re = r'(\d{4}-\d\d-\d\d_\d\d-\d\d-\d\d)'
     file_re = PctTemplate(file_pattern_escaped).substitute({'dt': dt_re}) + '$'
 
     # find files in the dir that match and sort by date
     all_files = os.listdir(parent_dir)
-    matches = [re.match(file_re, f) for f in all_files]
-    matches = sorted(filter(None, matches), key=lambda m: m[1], reverse=True)
-    if len(matches) == 0:
-        return None
-    return os.path.join(parent_dir, matches[0][0])
+    match_objs = [re.match(file_re, f) for f in all_files]
+    matches = sorted(filter(None, match_objs), key=lambda m: m[1], reverse=True)
+    return [os.path.join(parent_dir, match[0]) for match in matches]
+
+
+def get_latest_timestamped_file(parent_dir: Union[str, Path], file_pattern: str) -> Optional[str]:
+    """
+    Find the file within parent_dir matching a pattern with the latest timestamp
+    (where the timestamp is part of the filename, not the modified time)
+    and return the full path (or None if none were found).
+        - file_pattern: string with "%dt" or "%{dt}" where the date should go.
+    """
+    all_files = get_all_timestamped_files(parent_dir, file_pattern)
+    return all_files[0] if len(all_files) > 0 else None
+
+
+def params_file_for_result(result_file: Union[str, Path]) -> str:
+    return os.path.splitext(result_file)[0] + '_params.json'

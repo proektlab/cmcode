@@ -1,15 +1,16 @@
 """Utilities for saving/loading data such as dealing with changes to conventions, etc."""
+from copy import copy
+from glob import glob
 import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 
-from cmcode import caiman_analysis as cma
-from cmcode.util.image import BorderSpec
-from cmcode.util.paths import normalize_path
+from cmcode import caiman_analysis as cma, caiman_params as cmp
+from cmcode.util.paths import normalize_path, params_file_for_result
 
 from caiman.source_extraction.cnmf.params import CNMFParams
 
@@ -18,67 +19,147 @@ def reconstruct_sessdata_obj(sessdata: 'cma.SessionAnalysis', loaded_info: dict[
     """to be called from the SessionAnalysis constructor with loaded_fields passed in"""
     if 'cnmf_params' not in loaded_info:
         raise ValueError('Cannot load SessionAnalysis without saved params')
+    _populate_missing_fields(loaded_info)
+    _set_params(sessdata, loaded_info)
     _set_fields(sessdata, loaded_info)
-    _populate_missing_fields(sessdata)
     _fix_field_types(sessdata)
     _fix_tif_field_on_load(sessdata)
     _fix_mc_field_on_load(sessdata)
     _fix_cnmf_fields_on_load(sessdata)
+    _validate_or_write_missing_params_files(sessdata)
+
+
+def _populate_missing_fields(loaded_info: dict[str, Any]):
+    """Set missing fields to what they would have been before these fields were added"""
+    if 'mmap_file_transposed' not in loaded_info:
+        if (mc_result := loaded_info.get('mc_result')) is not None:
+            # bypass __getattribute__ which will throw an AttributeError
+            loaded_info['mmap_file_transposed'] = object.__getattribute__(mc_result, 'mmap_file_transposed')
+        else:
+            loaded_info['mmap_file_transposed'] = None
+    
+    if 'rec_type' not in loaded_info:
+        if 'data_dir' in loaded_info and loaded_info['data_dir']:
+            loaded_info['rec_type'] = os.path.split(os.path.split(loaded_info['data_dir'])[0])[1]
+        else:
+            loaded_info['rec_type'] = None
+
+
+def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
+    # find or create SessionAnalysisParams object, then populate with fields
+    if 'params' in loaded_info:
+        params: cmp.SessionAnalysisParams = loaded_info.pop('params')
+        sessdata.params = params
+
+    elif 'cnmf_params' in loaded_info:
+        # re-create params object from dict for backward compatibility
+        params_orig: CNMFParams = loaded_info.pop('cnmf_params')
+        cnmf_params = CNMFParams(params_dict=params_orig.to_dict())
+        
+        # update other parameters from loaded fields as needed
+        conv_changes = {}
+        for conv_field in ['odd_row_offset', 'downsample_factor', 'crop']:
+            if conv_field in loaded_info:
+                conv_changes[conv_field] = loaded_info.pop(conv_field)
+
+        if 'odd_row_ndeads' in loaded_info:
+            conv_changes['odd_row_ndead'] = loaded_info.pop('odd_row_ndeads')
+        
+        if (rec_type := loaded_info.get('rec_type')) and rec_type in ('learning_ppc_dlx', 'dlx_calibration'):
+            # set channel for structural rec types to 1
+            conv_changes['channel'] = 1
+        
+        conversion = cmp.ConversionParams(**conv_changes)
+
+        # old method was to auto adjust indices only if rigid shifts were used
+        mcorr_extra_changes = {}
+        if loaded_info.get('mc_result'):
+            if cnmf_params.motion['pw_rigid']:
+                mcorr_extra_changes['auto_adjust_indices'] = False
+            else:
+                mcorr_extra_changes['_indices_are_adjusted'] = True
+        
+        mcorr_extra = cmp.McorrParamsExtra(**mcorr_extra_changes)
+
+        trans_changes = {}
+        if 'highpass_cutoff' in loaded_info:
+            trans_changes['highpass_cutoff'] = loaded_info.pop('highpass_cutoff')
+        
+        transposition = cmp.TranspositionParams(**trans_changes)
+
+        cnmf_extra_changes = {}
+        if 'crossplane_merge_thr' in loaded_info:
+            cnmf_extra_changes['crossplane_merge_thr'] = loaded_info.pop('crossplane_merge_thr')
+
+        # try to infer seed params from the existing seed file, if any
+        if 'cnmf_fit_filename' in loaded_info:
+            sessdata.cnmf_fit_filename = normalize_path(loaded_info.pop('cnmf_fit_filename'))
+        if sessdata.cnmf_fit_filename is not None:
+            # look for Ain... file in same directory (should be mesmerize directory)
+            logging.info('Trying to infer seed params from seed file...')
+            cnmf_run_dir = os.path.split(sessdata.cnmf_fit_filename)[0]
+            matching_files = glob('Ain_*.npy', root_dir=cnmf_run_dir)
+            if len(matching_files) == 1:
+                seed_path = os.path.join(cnmf_run_dir, matching_files[0])
+                cnmf_extra_changes['seed_params'] = cmp.SeedParams.infer_from_seed_path(seed_path)
+                logging.info('Successfully inferred seed params')
+            elif len(matching_files) == 0:
+                logging.info('No seed file found; assuming no seed was used')
+            else:
+                logging.warning('Failed to infer seed params: multiple seed files found')
+        
+        if 'seed_params' not in cnmf_extra_changes and 'seed_params' in loaded_info:
+            # saved seed params take lower precedence. small chance it does not match CNMF results.
+            logging.info('Loading seed params saved in SessionAnalysis object')
+            cnmf_extra_changes['seed_params'] = loaded_info.pop('seed_params')
+        
+        cnmf_extra = cmp.CNMFParamsExtra(**cnmf_extra_changes)
+                
+        eval_extra_changes = {}
+        if 'snr_type' in loaded_info:
+            eval_extra_changes['snr_type'] = loaded_info.pop('snr_type')
+        else:
+            # try to infer from CNMF estimates
+            if 'cnmf_fit_filename' in loaded_info:
+                sessdata.cnmf_fit_filename = normalize_path(loaded_info.pop('cnmf_fit_filename'))
+            if sessdata.cnmf_fit is not None:
+                # set snr type based on whether gamma SNR values are populated
+                snr_type = 'normal' if sessdata.cnmf_fit.estimates.snr_gamma_vals is None else 'gamma'
+                eval_extra_changes['snr_type'] = snr_type
+
+        eval_extra = cmp.EvalParamsExtra(**eval_extra_changes)
+
+        sessdata.params = cmp.SessionAnalysisParams(
+            cnmf=cnmf_params, conversion=conversion, mcorr_extra=mcorr_extra, transposition=transposition, 
+            cnmf_extra=cnmf_extra, eval_extra=eval_extra
+        )
+    else:
+        raise ValueError('Cannot construct SessionAnalysis without either params or cnmf_params field')
 
 
 def _set_fields(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
-    caiman_logger = logging.getLogger('caiman')
 
     # obsolete fields that we don't care about anymore
-    fields_to_discard = ['structural_sbx_files', 'structural_offset', 'structural_tif_file',
-                         'cnmf_fit1', 'cnmf_fit1_filename', 'cnmf_fit2', 'image_dir']
-
+    fields_to_discard = ['structural_sbx_files', 'structural_offset', 'structural_tif_file', 'tag_base',
+                         'cnmf_fit1', 'cnmf_fit1_filename', 'cnmf_fit2', 'image_dir', 'gridsearch_batch_path']
+    
     for key, val in loaded_info.items():
         if key in fields_to_discard:
             continue
+
         if key in cma.SessionAnalysis.PATH_FIELDS:
             val = normalize_path(val)
 
-        if key == 'cnmf_params' and isinstance(val, CNMFParams):
-            # create a new params object and set each sub-dict for backward compatibility
-            sessdata.cnmf_params = CNMFParams()
-            params_dict = val.to_dict()
-            
-            # don't log each loaded parameter
-            old_level = caiman_logger.level
-            caiman_logger.setLevel(logging.WARNING)
+        if key == 'frames_per_trial':
+            key = '_frames_per_trial'
 
-            for subdict_key, subdict in params_dict.items():
-                sessdata.cnmf_params.set(subdict_key, subdict)
-            
-            caiman_logger.setLevel(old_level)
-        else:
-            setattr(sessdata, key, val)
-
-
-def _populate_missing_fields(sessdata: 'cma.SessionAnalysis'):
-    """Set missing fields to what they would have been before these fields were added"""
-    if not hasattr(sessdata, 'snr_type') and sessdata.cnmf_fit is not None:
-        # set snr type based on whether gamma SNR values are populated
-        sessdata.snr_type = 'normal' if sessdata.cnmf_fit.estimates.snr_gamma_vals is None else 'gamma'
-    
-    if not hasattr(sessdata, 'tag_base'):
-        sessdata.tag_base = sessdata.tag
-
-    if not hasattr(sessdata, 'crossplane_merge_thr'):
-        sessdata.crossplane_merge_thr = None
-    
-    if not hasattr(sessdata, 'downsample_factor'):
-        sessdata.downsample_factor = None
-
-    if not hasattr(sessdata, 'crop'):
-        sessdata.crop = BorderSpec()
+        setattr(sessdata, key, val)
 
 
 def _fix_field_types(sessdata: 'cma.SessionAnalysis'):
-    if isinstance(sessdata.frames_per_trial, list):
+    if isinstance(sessdata._frames_per_trial, list):
         # better to avoid lists for exporting
-        sessdata.frames_per_trial = np.array(sessdata.frames_per_trial)
+        sessdata._frames_per_trial = np.array(sessdata._frames_per_trial)
 
 
 def _fix_tif_field_on_load(sessdata: 'cma.SessionAnalysis'):
@@ -118,7 +199,8 @@ def _fix_mc_field_on_load(sessdata: 'cma.SessionAnalysis'):
         if sessdata.mc_result.dims is None:
             sessdata.mc_result.dims = sessdata.plane_size
         if sessdata.mc_result.motion_params is None:
-            sessdata.mc_result.motion_params = sessdata.cnmf_params.motion
+            # need motion params to reconstruct MotionCorrect object
+            sessdata.mc_result.motion_params = copy(sessdata.params._cnmf.motion)
 
 
 def _fix_cnmf_fields_on_load(sessdata: 'cma.SessionAnalysis'):
@@ -160,3 +242,100 @@ def _fix_cnmf_fields_on_load(sessdata: 'cma.SessionAnalysis'):
                         else:
                             shutil.move(old_fn, str(new_fn))
                             logging.info(f'Moved {old_fn} into cnmf subdirectory')
+
+
+def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
+    """
+    Validate existing params files and/or write missing params files for result files.
+    
+    For most results, the exact parameters that were used are not saved outside of params files,
+    so we just have to assume when loading the first time after the SessionAnalysisParams feature
+    was added that we were diligent about re-running stages after changing relevant parameters.
+
+    For CNMF, we can check against the params in mesmerize, and if they don't match,
+    write the params that were actually used, then invalidate according to what doesn't match.
+    """
+    def check_file(file_path: str, stage: cmp.AnalysisStage, file_desc: str) -> Optional[bool]:
+        """
+        Check one file, invalidating stage and returning False if params don't match
+        and returning None and writing out params if no params file was found.
+        """
+        try:
+            if not sessdata.result_file_matches_params(file_path, stage, raise_on_missing_params=True):
+                logging.warning(file_desc + ' had non-matching parameters')
+                sessdata.invalidate_from_stage(stage)
+                return False
+        except FileNotFoundError:
+            # assume current params are correct
+            logging.info('Writing missing parameters for ' + file_desc)
+            sessdata.write_params_for_result_file(file_path, stage)
+        return True
+
+    if sessdata.plane_tifs is not None:
+        for k_plane, plane_file in enumerate(sessdata.plane_tifs):
+            file_desc = f'plane {k_plane} TIF file'
+            valid = check_file(plane_file, cmp.AnalysisStage.CONVERT, file_desc)
+            if valid == False:
+                return
+            
+    # to know where to invalidate if motion params saved in CNMF don't match
+    # we assume the farthest back we will have to go is the conversion step
+    last_validated_stage = cmp.AnalysisStage.CONVERT
+
+    if sessdata.mc_result is not None:
+        for k_plane, mcorr_file in enumerate(sessdata.mc_result.mmap_files):
+            file_desc = f'plane {k_plane} motion correction'
+            valid = check_file(mcorr_file, cmp.AnalysisStage.MCORR, file_desc)
+            if valid == True:
+                last_validated_stage = cmp.AnalysisStage.MCORR
+            elif valid == False:
+                return
+    
+    if sessdata.mmap_file_transposed is not None:
+        valid = check_file(sessdata.mmap_file_transposed, cmp.AnalysisStage.TRANSPOSE,
+                             'transposed/concatenated mmap file')
+        if valid == True:
+            last_validated_stage = cmp.AnalysisStage.TRANSPOSE
+        elif valid == False:
+            return
+    
+    if sessdata.cnmf_fit_filename is not None:
+        try:
+            if not sessdata.result_file_matches_params(
+                sessdata.cnmf_fit_filename, cmp.AnalysisStage.CNMF, raise_on_missing_params=True):
+                logging.warning('CNMF had non-matching parameters')
+                sessdata.invalidate_from_stage(cmp.AnalysisStage.CNMF)
+        except FileNotFoundError:
+            logging.info('Params file not found for CNMF')
+            mesmerize_index = sessdata.get_selected_index()
+            if mesmerize_index is None:
+                logging.info('Not a mesmerize run - assuming saved parameters are correct & writing missing params file')
+                sessdata.write_params_for_result_file(sessdata.cnmf_fit_filename, cmp.AnalysisStage.CNMF)
+            else:
+                # read CNMF params from batch file and merge with current params, then write.
+                df = sessdata.get_gridsearch_results()
+                saved_params = df.at[mesmerize_index, 'params']
+                cnmf_params = saved_params['main']
+                # blank out fnames to avoid validation issue
+                cnmf_params['data']['fnames'] = None
+
+                # write out params for this CNMF run and get stage of mismatch
+                cnmf_run_params, invalid_stage = sessdata.params.change_params_and_get_stage_to_invalidate(
+                    cnmf_params, metadata=sessdata.metadata
+                )
+                params_file = params_file_for_result(sessdata.cnmf_fit_filename)
+                logging.info('Writing missing parameters for CNMF')
+                cnmf_run_params.write_params_for_stage(cmp.AnalysisStage.CNMF, params_file)
+
+                if invalid_stage is None:
+                    # It matches, we can update our params (only things that don't matter for comparison)
+                    logging.info('CNMF batch item was saved with compatible parameters - updating params')
+                    sessdata.params = cnmf_run_params
+                else:
+                    # don't just invalidate this stage, because we're doing something different here:
+                    # we know the given stage doesn't match the CNMF results, not our current params.
+                    # If we have params files for previous stages, we know those results do match our params,
+                    # so we can keep them. But otherwise, it's ambiguous what happened, so
+                    # invalidate from where there is a mismatch to be safe.
+                    logging.warning('CNMF batch item was saved with incompatible parameters - invalidating')
+                    sessdata.invalidate_from_stage(cmp.AnalysisStage(max(invalid_stage, last_validated_stage)))

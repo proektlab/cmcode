@@ -8,6 +8,7 @@ install_requires = [
     "ipympl",
     "mesmerize-core",
     "mesmerize-viz",
+    "msgspec",
     "mslex",
     "nest-asyncio",
     "roipoly",

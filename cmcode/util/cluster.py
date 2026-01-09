@@ -100,7 +100,6 @@ class Cluster:
               host_specs: Optional[list[str]] = None):
         """
         Setup parallel processing environment with the given backend ('single' = no parallel processing).
-        If this function has been called already, the current setup should be passed as curr_cluster_info.
         hosts defaults to just the current computer. If hosts is not None, a shared profile dir defined by the project is used
         to manage ipyparallel workers (even if the only entry in hosts is localhost).
         """

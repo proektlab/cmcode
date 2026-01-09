@@ -305,10 +305,11 @@ def compute_matching_performance(n1: int, n2: int, n_matched: int) -> dict[str, 
 
 
 def my_extract_binary_masks_from_structural_channel(Y,
-                                                    blur_gSig_multiple = 0.75,
+                                                    blur_type: Literal['box', 'gaussian'] = 'gaussian',
+                                                    blur_gSig_multiple: Optional[float] = None,
                                                     min_area_size: int = 30,
                                                     min_hole_size: int = 15,
-                                                    gSig=(5, 7, 9),
+                                                    gSig=5,
                                                     expand_method: str = 'closing',
                                                     selem: np.ndarray = np.ones((3, 3))) -> tuple[csc_array, np.ndarray]:
     """
@@ -320,8 +321,11 @@ def my_extract_binary_masks_from_structural_channel(Y,
         Y:                  caiman movie object
                             movie of the structural channel (assumed motion corrected)
         
+        blur_type:          'box' | 'gaussian'
+                            type of blurring to use
+        
         blur_gSig_multiple: float
-                            what to multiply (each) gSig by to get Gaussian blur sigma
+                            what to multiply (each) gSig by to get blur sigma or size
 
         min_area_size:      int
                             ignore components with smaller size
@@ -348,6 +352,9 @@ def my_extract_binary_masks_from_structural_channel(Y,
     if not hasattr(gSig, '__len__'):
         gSig = (gSig,)
 
+    if blur_gSig_multiple is None:
+        blur_gSig_multiple = 1 if blur_type == 'box' else 0.75
+
     mR = Y.mean(axis=0) if Y.ndim == 3 else Y
     n_pix = np.prod(mR.shape)
     occupied = np.zeros(n_pix, dtype=bool)
@@ -355,7 +362,11 @@ def my_extract_binary_masks_from_structural_channel(Y,
     features_added = 0
 
     for single_gSig in gSig:
-        img = cv2.GaussianBlur(mR, (0, 0), blur_gSig_multiple * single_gSig)
+        blur_sig = blur_gSig_multiple * single_gSig
+        if blur_type == 'box':
+            img = cv2.blur(mR, (blur_sig, blur_sig))
+        else:
+            img = cv2.GaussianBlur(mR, (0, 0), blur_sig)
         img = (img - np.min(img)) / (np.max(img) - np.min(img)) * 255.
         img = img.astype(np.uint8)
 
