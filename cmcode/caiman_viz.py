@@ -578,10 +578,11 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
         # add brightness-equalized images
         border = series.params['main']['patch']['border_pix']
+        borders = [BorderSpec.equal(border)] * self.n_planes
 
         def get_equalized_projection(proj_type: str):
             proj = mapping[proj_type]()
-            return preprocess_proj_for_seed(proj, border=border, concat_planes=self.n_planes)
+            return preprocess_proj_for_seed(proj, borders=borders)
 
         for proj_type in ['mean', 'max']:
             mapping[proj_type + '_equalized'] = partial(get_equalized_projection, proj_type)

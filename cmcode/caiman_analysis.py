@@ -18,25 +18,20 @@ from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, Mapp
 
 import cv2
 from hdf5storage import savemat
-import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+from msgspec.structs import asdict as struct2dict
 import numpy as np
 import pandas as pd
 from pandas._libs.missing import NAType
-from roipoly import MultiRoi
 from scipy import sparse
-from scipy.spatial import KDTree
-from scipy.stats import mode
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
 from caiman.base import rois
-from caiman.source_extraction.cnmf import cnmf
 from caiman.source_extraction.cnmf.estimates import Estimates
 from caiman.source_extraction.cnmf.params import CNMFParams
-from caiman.source_extraction.cnmf.spatial import threshold_components
 from caiman.source_extraction.cnmf.utilities import detrend_df_f
 from caiman.utils import sbx_utils
 from caiman.utils.visualization import view_quilt
@@ -99,37 +94,35 @@ def save_contour_plot_as_pdf(fig: Figure, filename):
     fig.savefig(filename)
 
 
-def get_projection_name(seed_params: dict) -> str:
+def get_projection_name(seed_params: cmp.SeedParams) -> str:
     """
     Make a string to identify the type of projection
     (like get_spatial_seed_name but ignores parameters only used for identifying neurons)
     """
-    proj_type = seed_params.get('type', 'mean')
-    norm_medw = seed_params.get('norm_medw', None)
-    blur_size = seed_params.get('blur_size', 1)
-
-    proj_name = proj_type
-    if blur_size > 1:
-        proj_name += f'_blur_{blur_size}'
-    if norm_medw is not None:
-        proj_name += f'_medw_{norm_medw}'
+    proj_name = seed_params.type
+    if seed_params.blur_size > 1:
+        proj_name += f'_blur_{seed_params.blur_size}'
+    if seed_params.norm_medw is not None:
+        proj_name += f'_medw_{seed_params.norm_medw}'
     
     return proj_name
 
 
-def get_spatial_seed_name(seed_params: dict) -> str:
+def get_spatial_seed_name(seed_params: cmp.SeedParams) -> str:
     """Make a string to identify the type of seed (used as filename)"""
     proj_name = get_projection_name(seed_params)
-    seed_blur_multiple = seed_params.get('blur_gSig_multiple', 0.75)
 
     Ain_name = f'Ain_caiman_from_{proj_name}'
-    if 'gSig' in seed_params:  # just leave out of name if not specified
-        gSig = seed_params['gSig']
-        if not hasattr(gSig, '__len__'):
+    if seed_params.gSig is not None:  # just leave out of name if default
+        gSig = seed_params.gSig
+        if isinstance(gSig, int) or not hasattr(gSig, '__len__'):
             gSig = [gSig]
+        else:
+            gSig = list(gSig)
         Ain_name += '_gSig_' + ','.join(str(gs) for gs in gSig)
-    if seed_blur_multiple != 0.75:
-        Ain_name += f'_blurmult_{seed_blur_multiple:.2f}'
+
+    if seed_params.blur_gSig_multiple is not None:
+        Ain_name += f'_blurmult_{seed_params.blur_gSig_multiple:.2f}'
     return Ain_name
 
 
@@ -379,33 +372,72 @@ class SessionAnalysis:
         return AnalysisStage.EVAL
 
 
-    def invalidate_from_stage(self, stage: AnalysisStage):
+    def invalidate_from_stage(self, stage: AnalysisStage) -> dict[str, Any]:
         """
         Remove info relating to given and later analysis stages,
         so it must be reloaded or recomputed with current parameters
+        Returns the removed or modified attributes in a dictionary.
         """
         if stage > self.last_valid_stage:
-            return
+            return {}
 
         logging.info(f'Invalidating results from {stage.name} onwards')
-        
+        removed_attrs = {}
+
         if stage <= AnalysisStage.CONVERT:
+            removed_attrs['plane_tifs'] = self.plane_tifs
             self.plane_tifs = None
         
         if stage <= AnalysisStage.MCORR:
+            removed_attrs['mc_result'] = self.mc_result
             self.mc_result = None
         
         if stage <= AnalysisStage.TRANSPOSE:
+            removed_attrs['mmap_file_transposed'] = self.mmap_file_transposed
             self.mmap_file_transposed = None
         
         if stage <= AnalysisStage.CNMF:
+            removed_attrs['cnmf_fit_filename'] = self.cnmf_fit_filename
             self.cnmf_fit_filename = None
+            removed_attrs['_cnmf_fit'] = self._cnmf_fit
             self._cnmf_fit = None
 
         elif stage <= AnalysisStage.EVAL and self.cnmf_fit is not None:
+            removed_attrs['_cnmf_fit'] = self._cnmf_fit
             self.cnmf_fit.estimates.idx_components_eval = None
             self.cnmf_fit.estimates.idx_components_bad_eval = None
             self._cnmf_changed_flag = True
+        
+        return removed_attrs
+
+    
+    def process_stage(self, stage: AnalysisStage, load: Optional[bool] = None):
+        """Run or load a given stage of the pipeline"""
+        match stage:
+            case AnalysisStage.START:
+                pass
+            case AnalysisStage.CONVERT:
+                self.convert_to_tif(load=load)
+            case AnalysisStage.MCORR:
+                self.do_mcorr_only(load=load)
+            case AnalysisStage.TRANSPOSE:
+                self.concat_and_transpose(load=load)
+            case AnalysisStage.CNMF:
+                self.do_cnmf(load=load)
+            case AnalysisStage.EVAL:
+                self.do_cnmf_evaluation(recalc=(load == False))
+            case AnalysisStage.FINAL:
+                pass
+
+    def process_up_to_stage(self, stage: AnalysisStage, load: Optional[bool] = None):
+        """Run or load pipeline from the last valid stage through the given stage"""
+        curr_stage = self.last_valid_stage
+        for stage_num in range(curr_stage + 1, stage + 1):
+            next_stage = AnalysisStage(stage_num)
+            self.process_stage(next_stage, load=load)
+
+    def run_to_end(self):
+        self.process_up_to_stage(AnalysisStage.FINAL)
 
 
     def result_file_matches_params(self, file_path: Union[str, Path], stage: AnalysisStage,
@@ -436,7 +468,7 @@ class SessionAnalysis:
         self.params.write_params_for_stage(stage, path=params_path)
 
 
-    def update_params(self, param_changes: dict[str, dict[str, Any]]):
+    def update_params(self, param_changes: dict[str, dict[str, Any]]) -> dict[str, Any]:
         """
         Update params, also allowing changes to some things that are not part of CNMFParams:
 
@@ -448,10 +480,13 @@ class SessionAnalysis:
 
         All other sub-fields of CNMFParams may also be present as keys.
         Results that are not compatible with the new parameters will be invalidated (set to None).
+        Returns dict of removed or modifed attributes.
         """
         self.params, invalid_stage = self.params.change_params_and_get_stage_to_invalidate(param_changes, self.metadata)
         if invalid_stage is not None:
-            self.invalidate_from_stage(invalid_stage)
+            return self.invalidate_from_stage(invalid_stage)
+        else:
+            return {}
 
     
     def read_params(self) -> Mapping[str, Any]:
@@ -699,42 +734,43 @@ class SessionAnalysis:
     
     def apply_motion_correction(self, mc_result: 'mcorr.MCResult', do_transpose=False, force=False):
         """
-        TODO: update
+        TODO: update, figure out how this works with new params system (if at all)
         Apply motion correction result (typically from another channel of the same movie) to the current tiffs.
         By default concatenates the results, but does not transpose to C order, since the output
         will typically not be used for CNMF.
         """
-        # sanity checks
-        if self.plane_tifs is None:
-            raise RuntimeError('Must convert to TIF first')
+        raise NotImplementedError('Not implemented for new params system')
+        # # sanity checks
+        # if self.plane_tifs is None:
+        #     raise RuntimeError('Must convert to TIF first')
 
-        if len(mc_result.mmap_files) != len(self.plane_tifs):
-            raise RuntimeError('Number of planes does not match given motion correction results')
+        # if len(mc_result.mmap_files) != len(self.plane_tifs):
+        #     raise RuntimeError('Number of planes does not match given motion correction results')
         
-        if mc_result.dims is None or mc_result.motion_params is None:
-            raise RuntimeError('Must set dims and motion_params on MCResult before proceeding')
+        # if mc_result.dims is None or mc_result.motion_params is None:
+        #     raise RuntimeError('Must set dims and motion_params on MCResult before proceeding')
         
-        if mc_result.is_piecewise and tuple(mc_result.dims) != tuple(self.plane_size):
-            raise RuntimeError('Cannot apply piecewise results to movie of different size')
+        # if mc_result.is_piecewise and tuple(mc_result.dims) != tuple(self.plane_size):
+        #     raise RuntimeError('Cannot apply piecewise results to movie of different size')
         
-        # check if already done
-        if not force and self.mc_result is not None and self.mc_result.has_same_shifts_as(mc_result):
-            logging.info('Our current mcorr shifts match the passed ones - not re-applying.')
-            return
+        # # check if already done
+        # if not force and self.mc_result is not None and self.mc_result.has_same_shifts_as(mc_result):
+        #     logging.info('Our current mcorr shifts match the passed ones - not re-applying.')
+        #     return
 
-        # should be safe to do a shallow copy, not really any situation where any of the fields would be mutated
-        this_result = copy(mc_result)
+        # # should be safe to do a shallow copy, not really any situation where any of the fields would be mutated
+        # this_result = copy(mc_result)
 
-        # make MotionCorrect objects and apply the passed shifts
-        mcorr_objs = mc_result.recreate_mcorr_objects()
-        this_result.mmap_files = [mcorr.apply_mcorr_to_file(mcorr_obj, tif_file)
-                                  for mcorr_obj, tif_file in zip(mcorr_objs, self.plane_tifs)]
-        self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
-            this_result.mmap_files, this_result.border_to_0, sample_rate=self.sample_rate,
-            highpass_cutoff=self.highpass_cutoff, do_transpose=do_transpose, force=True
-        )
-        self.mc_result = this_result
-        self.save(save_cnmf=False)
+        # # make MotionCorrect objects and apply the passed shifts
+        # mcorr_objs = mc_result.recreate_mcorr_objects()
+        # this_result.mmap_files = [mcorr.apply_mcorr_to_file(mcorr_obj, tif_file)
+        #                           for mcorr_obj, tif_file in zip(mcorr_objs, self.plane_tifs)]
+        # self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
+        #     this_result.mmap_files, this_result.border_to_0, sample_rate=self.sample_rate,
+        #     highpass_cutoff=self.highpass_cutoff, do_transpose=do_transpose, force=True
+        # )
+        # self.mc_result = this_result
+        # self.save(save_cnmf=False)
 
 
     def get_original_and_corrected_movies(self, ds_ratio=5, xy_ds_ratio=1) -> tuple[np.ndarray, np.ndarray]:
@@ -802,7 +838,14 @@ class SessionAnalysis:
         Save movie(s) to show original (top) vs. motion-corrected (bottom) data as avi.
         """
         mov = self.make_mc_comparison_movie(ds_ratio=ds_ratio, xy_ds_ratio=xy_ds_ratio)
-        mov.save(os.path.join(self.data_dir, 'mcorr', f'{self.mouse_id}_{self.sess_id:03d}_comparison.avi'), compress=compress)   
+        # get prefix of mcorr result file that includes datetime
+        if self.mc_result is None:
+            raise RuntimeError('Motion correction not done')
+        
+        mmap_fname = os.path.split(self.mc_result.mmap_files[0])[1]
+        d1_ind = mmap_fname.index('__d1')
+        movie_fname = mmap_fname[:d1_ind] + '_comparison.avi'
+        mov.save(os.path.join(self.data_dir, 'mcorr', movie_fname), compress=compress)   
 
 
     def make_mc_comparison_summary_plots(self) -> tuple[Figure, Figure]:
@@ -829,10 +872,17 @@ class SessionAnalysis:
 
     def save_mc_comparison_summary_plots(self):
         """Compare max projection and correlation images - original (top) vs. motion-corrected (bottom) and save as png"""
+        if self.mc_result is None:
+            raise RuntimeError('Motion correction not done')
+
+        # get filename to use for saving
+        mmap_fname = os.path.split(self.mc_result.mmap_files[0])[1]
+        fname_prefix = mmap_fname[:mmap_fname.index('__d1')]
+
         with plt.ioff():
             fig_mean, fig_corr = self.make_mc_comparison_summary_plots()
-            fig_mean.savefig(os.path.join(self.data_dir, 'mcorr', f'{self.mouse_id}_{self.sess_id:03d}_meanproj.png'), dpi=200)
-            fig_corr.savefig(os.path.join(self.data_dir, 'mcorr', f'{self.mouse_id}_{self.sess_id:03d}_corr.png'), dpi=200)
+            fig_mean.savefig(os.path.join(self.data_dir, 'mcorr', fname_prefix + '_meanproj.png'), dpi=200)
+            fig_corr.savefig(os.path.join(self.data_dir, 'mcorr', fname_prefix + '_corr.png'), dpi=200)
 
 
     # ------------------------------- PLANE CONCATENATION/TRANSPOSITION ------------------------#
@@ -850,57 +900,67 @@ class SessionAnalysis:
         if self.mc_result is None:
             raise RuntimeError('Must do motion correction before concatenating/transposing planes')
         
-        trans_params = self.params.get_params_for_stage(AnalysisStage.TRANSPOSE)['transposition']
+        params = self.params.get_params_up_to_stage(AnalysisStage.TRANSPOSE)
         
-        if load != False:   # try to load existing results
-            expected_file = mcorr.get_transposed_mmap_name(self.mc_result.mmap_files, trans_params)
-            if self.result_file_matches_params(expected_file, AnalysisStage.TRANSPOSE):
-                if load is None:  # only log if we were unsure whether to load
-                    logging.info('Using existing transposed file: ' + expected_file)
-                self.mmap_file_transposed = expected_file
-                return
-            elif load == True:
-                raise NoMatchingResultError('Cannot find matching transposed file.')
-            
-        # we are doing the transpose
-        self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
-            self.mc_result, trans_params, fr=self.sample_rate, dview=cluster.dview)
-        self.write_params_for_result_file(self.mmap_file_transposed, AnalysisStage.TRANSPOSE) 
+        self.mmap_file_transposed = mcorr.do_or_load_transpose(
+            self.mc_result, params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview, load=load
+        )
         self.save(save_cnmf=False)
 
 
     #------------------------------------ SUMMARY IMAGES ----------------------------------------#
 
 
-    def make_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True) -> np.ndarray:
+    def make_projection(self, proj_type: str, blur_kernel_size: Optional[int] = None, motion_corrected=True) -> np.ndarray:
         """
         Make correlation image or {mean/std/max}-projection
         If blur_kernel_size > 1, do gaussian blur on a downsampled copy of the movie before computing projection
-        blur_downsample_factor: factor to downsample full movie (in time) when doing blur to avoid OOM (default = 10)
+            (defaults to the same as what is in the transpose params if motion_corrected=True, else 1)
         Because it uses the transposed file, setting motion_corrected=True also includes the high-pass filter if any.
         """
         if motion_corrected:
             if self.mc_result is None:
                 raise RuntimeError('Motion correction not run')
+            
+            params = self.params.get_params_up_to_stage(AnalysisStage.TRANSPOSE)
+            curr_trans_params = params['transposition']
+            if blur_kernel_size is None:
+                blur_kernel_size = curr_trans_params.blur_kernel_size
 
-            if blur_kernel_size > 1 and proj_type != 'mean':  # for nonlinear projections, must blur before projecting
-                mov_or_filename = mcorr.transpose_flatten_mc_mmap(
-                    self.mc_result.mmap_files, self.mc_result.border_to_0, sample_rate=self.sample_rate,
-                    blur_kernel_size=blur_kernel_size, highpass_cutoff=self.highpass_cutoff)
-            else:
-                mov_or_filename = self.mc_result.mmap_file_transposed
+            blur_matches_params = blur_kernel_size == curr_trans_params.blur_kernel_size
+            # if mean, it's a linear projection; we can blur after projecting if the initial projection has no blur
+            post_blur = proj_type == 'mean' and curr_trans_params.blur_kernel_size == 1 and not blur_matches_params
+
+            if blur_matches_params or post_blur:
+                if self.mmap_file_transposed is None:
+                    # move forward with the transpose step
+                    self.concat_and_transpose()
+                    assert self.mmap_file_transposed is not None
+                mov_or_filename = self.mmap_file_transposed
+
+            else:  # do a one-off transposition for this call
+                trans_params = curr_trans_params.replace({'blur_kernel_size': blur_kernel_size})
+                params['transposition'] = trans_params
+                mov_or_filename = mcorr.do_or_load_transpose(
+                    self.mc_result, params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview
+                )                
 
             if proj_type == 'corr':
                 proj = make_correlation_parallel(mov_or_filename, cluster.dview)
             else:
-                ignore_nan = self.cnmf_params.motion['border_nan'] == True
+                ignore_nan = params['motion']['border_nan'] == True
                 proj = make_projection_parallel(mov_or_filename, proj_type, cluster.dview, ignore_nan=ignore_nan)
         else:
             if self.plane_tifs is None:
                 raise RuntimeError('Conversion to TIF not run')
             
+            if blur_kernel_size is None:
+                blur_kernel_size = 1
+            
             if blur_kernel_size > 1 and proj_type != 'mean':
                 raise NotImplementedError('Blurring not supported for raw movie (except for mean projection)')
+            
+            post_blur = blur_kernel_size > 1
             
             # operate on each plane individually, then combine
             plane_projs = []
@@ -912,7 +972,7 @@ class SessionAnalysis:
                 plane_projs.append(plane_proj)
             proj = np.concatenate(plane_projs, axis=1)
         
-        if blur_kernel_size > 1 and proj_type == 'mean':
+        if post_blur:
             # linear operation, can just blur here
             proj = cv2.GaussianBlur(
                 proj, ksize=(blur_kernel_size, blur_kernel_size), sigmaX=blur_kernel_size/4,
@@ -922,7 +982,7 @@ class SessionAnalysis:
         return proj
 
 
-    def load_projection_from_result(self, proj_type: str) -> tuple[np.ndarray, pd.Series]:
+    def load_projection_from_result(self, proj_type: str) -> tuple[np.ndarray, MescoreSeries]:
         """
         Attempt to load a projection (corr, mean, std, or max) from a previous mesmerize result.
         Returns the projection and the item the projection was pulled from (a Series).
@@ -934,101 +994,81 @@ class SessionAnalysis:
             raise NoMatchingResultError('No matching mesmerize items to pull projection from') from e
 
         completed_runs = batch.loc[[o is not None and o['success'] for o in batch.outputs]]
-        # check whether motion params match for each candidate item
-        motion_params_match = np.empty(len(completed_runs), dtype=bool)
+        # check whether params up to transposition match for each candidate item
+        trans_params_match = np.zeros(len(completed_runs), dtype=bool)
         for i in range(len(completed_runs)):
-            # update blank CNMFParams with these motion parameters so that default and newly added params are taken into account
-            # can't update with all the params because it will error if the input file(s) aren't loadable
-            item_params = CNMFParams()
-            item_params.change_params({'motion': completed_runs.iloc[i].params['main']['motion']})
-            motion_params_match[i] = item_params.motion == self.cnmf_params.motion
+            res_row = cast(MescoreSeries, completed_runs.iloc[i])
+            res_file = res_row.cnmf.get_output_path()
+            trans_params_match[i] = self.result_file_matches_params(res_file, AnalysisStage.TRANSPOSE)
 
-        matching_runs = completed_runs.loc[motion_params_match, :]
+        matching_runs = completed_runs.loc[trans_params_match, :]
         if len(matching_runs) == 0:
             raise NoMatchingResultError('No matching mesmerize items to pull projection from')
 
-        completed_row = matching_runs.iloc[-1]
+        completed_row = cast(MescoreSeries, matching_runs.iloc[-1])
         if proj_type == 'corr':
             return completed_row.caiman.get_corr_image(), completed_row
         else:
-            uuid = completed_row['uuid']
+            uuid = completed_row.at['uuid']
             batch_path = completed_row.paths.get_batch_path()
             proj_path = batch_path.parent / uuid / f'{uuid}_{proj_type}_projection.npy'
             return np.load(proj_path), completed_row
 
 
-    def get_projection_and_border(self, proj_type: str, blur_kernel_size=1, need_border=True, motion_corrected=True) -> tuple[np.ndarray, int]:
+    def get_borders(self, motion_corrected=True) -> list[BorderSpec]:
+        if motion_corrected:
+            # load from motion correction results
+            if self.mc_result is None:
+                raise RuntimeError('Motion correction not run')
+            return self.mc_result.border_asym
+        else:
+            if self.plane_tifs is None:
+                raise RuntimeError('Conversion to TIF not run')
+            return [BorderSpec.equal(0)] * len(self.plane_tifs)
+
+
+    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True) -> np.ndarray:        
         if blur_kernel_size > 1:
             logging.info('Cannot pull from mesmerize (blur_kernel_size > 1)')
         elif not motion_corrected or proj_type not in ['corr', 'mean', 'std', 'max']:
             pass
         else:
             try:
-                proj, item = self.load_projection_from_result(proj_type=proj_type)
-                # get border size used to run this item
-                if need_border:
-                    cnmf = load_CNMFExt(item.cnmf.get_output_path(), quiet=True)
-                    border = cnmf.params.patch['border_pix']
-                else:
-                    border = 0  # skip getting border to save time
-                return proj, border
+                return self.load_projection_from_result(proj_type=proj_type)[0]
             except NoMatchingResultError:
                 logging.info('No matching mesmerize items - computing projection anew')
 
-        proj = self.make_projection(proj_type, blur_kernel_size=blur_kernel_size, motion_corrected=motion_corrected)
-        if motion_corrected:
-            assert self.mc_result is not None  # would throw error in make_projection
-            border = self.mc_result.border_to_0
-        else:
-            border = 0
-        return proj, border
-
-
-    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True) -> np.ndarray:
-        """Try to pull projection from previous mesmerize result, falling back to make_projection if not available"""
-        return self.get_projection_and_border(proj_type=proj_type, blur_kernel_size=blur_kernel_size,
-                                              need_border=False, motion_corrected=motion_corrected)[0]        
+        return self.make_projection(proj_type, blur_kernel_size=blur_kernel_size, motion_corrected=motion_corrected)
 
         
     def get_projection_for_seed(self, type='mean', motion_corrected=True, blur_size=1, norm_medw: Optional[int] = None,
-                                border: Union[None, int, BorderSpec] = None, **seed_params_extra) -> tuple[np.ndarray, dict]:
+                                borders: Optional[list[BorderSpec]] = None, **seed_params_extra) -> tuple[np.ndarray, dict]:
         """
-        Make 2D projection image to use for making seed with given params. See make_spatial_seed for parameter meanings.
+        Make 2D projection image to use for making seed with given params.
         Returns the projection along with any unused params
         """
-        assert self.mc_result is not None, 'Motion correction not done'
+        proj = self.get_projection(proj_type=type, blur_kernel_size=blur_size, motion_corrected=motion_corrected)
 
-        if border is None:
-            proj, border = self.get_projection_and_border(proj_type=type, blur_kernel_size=blur_size, motion_corrected=motion_corrected)
-        else:
-            proj = self.get_projection(proj_type=type, blur_kernel_size=blur_size, motion_corrected=motion_corrected)
-            
-        if not isinstance(border, BorderSpec):
-            border = BorderSpec.equal(border)
-
-        if proj.ndim == 2:
-            concat_planes = len(self.mc_result.mmap_files)
-        else:
-            concat_planes = 1
+        if borders is None:
+            borders = self.get_borders(motion_corrected=motion_corrected)
 
         if norm_medw is not None:
-            proj = preprocess_proj_for_seed(proj, med_w=norm_medw, border=border, concat_planes=concat_planes)
+            proj = preprocess_proj_for_seed(proj, med_w=norm_medw, borders=borders)
 
-        seed_params_extra['concat_planes'] = concat_planes
-        seed_params_extra['border'] = border
+        seed_params_extra['borders'] = borders
         return proj, seed_params_extra
     
 
     def get_plane_projections(self, projection_params: Union[str, dict], motion_corrected=True, exclude_border=True) -> list[np.ndarray]:
         if isinstance(projection_params, str):
-            proj, border = self.get_projection_and_border(projection_params, motion_corrected=motion_corrected, need_border=exclude_border)
-        else:
-            proj, seed_params_extra = self.get_projection_for_seed(motion_corrected=motion_corrected, **projection_params)
-            border = seed_params_extra['border']
+            projection_params = {'type': projection_params}
 
-        plane_projs = np.split(proj, self.metadata['num_planes'], axis=1)
+        proj, seed_params_extra = self.get_projection_for_seed(motion_corrected=motion_corrected, **projection_params)
+        borders: list[BorderSpec] = seed_params_extra['borders']
+
+        plane_projs = np.split(proj, len(borders), axis=1)
         if exclude_border:
-            plane_projs = [plane[BorderSpec.equal(border).slices(plane.shape)] for plane in plane_projs]
+            plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
         return plane_projs
 
 
@@ -1044,20 +1084,20 @@ class SessionAnalysis:
             if ind is None:
                 raise RuntimeError('No selected CNMF run; cannot use seed projection')
 
-            item = self.get_gridsearch_results().iloc[ind]
-            output_path: Path = item.cnmf.get_output_path()
+            item = cast(MescoreSeries, self.get_gridsearch_results().iloc[ind])
+            output_path = item.cnmf.get_output_path()
             proj_path = output_path.parent / 'projection_for_seed.npy'
             if proj_path.exists():
                 full_proj = np.load(proj_path)
                 plane_projs = np.split(full_proj, self.metadata['num_planes'], axis=1)
                 if exclude_border:
-                    cnmf = load_CNMFExt(item.cnmf.get_output_path(), quiet=True)
-                    border = cnmf.params.patch['border_pix']
-                    plane_projs = [plane[BorderSpec.equal(border).slices(plane.shape)] for plane in plane_projs]
+                    borders = self.get_borders(motion_corrected=True)
+                    plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
             else:
                 # fall back to recomputing based on seed_params
-                logging.warning(f'projection_for_seed not saved - recomputing with params {self.seed_params}')
-                plane_projs = self.get_plane_projections(self.seed_params, exclude_border=exclude_border)
+                seed_params = struct2dict(self.params.get_params_for_stage(AnalysisStage.CNMF)['cnmf_extra'].seed_params)
+                logging.warning(f'projection_for_seed not saved - recomputing with params {seed_params}')
+                plane_projs = self.get_plane_projections(seed_params, exclude_border=exclude_border)
         else:
             plane_projs = self.get_plane_projections(projection_params, exclude_border=exclude_border)
 
@@ -1069,8 +1109,9 @@ class SessionAnalysis:
 
     def check_patch_params(self, ax=None):
         """Use view_quilt to check the current CNMF patch parameters"""
-        patch_width = self.cnmf_params.patch['rf'] * 2 + 1
-        patch_overlap = self.cnmf_params.patch['stride'] + 1
+        patch_params = self.params.get_params_for_stage(AnalysisStage.CNMF)['patch']
+        patch_width = patch_params['rf'] * 2 + 1
+        patch_overlap = patch_params['stride'] + 1
         patch_stride = patch_width - patch_overlap
         print(f'Patch width: {patch_width}, stride: {patch_stride}, overlap: {patch_overlap}')
 
@@ -1083,147 +1124,141 @@ class SessionAnalysis:
                               ax=ax, figsize=(4, 4))
 
         patch_ax.set_title(f'width={patch_width}\noverlap={patch_overlap}')
+    
+
+    def do_cnmf(self, load: Optional[bool] = None) -> None:
+        """
+        Do or load CNMF.
+
+        load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+        """
+        uuid, _ = self.start_cnmf_with_mescore(load=load, backend='local', wait=True)
+        self.finish_cnmf_processing(uuid)
 
 
-    def get_cnmf_run_params(self, is3D=False, seeded=False) -> CNMFParams:
-        """Make a copy of the current CNMF params and make changes that need to be made between motion correction and CNMF"""
+    def start_cnmf_with_mescore(self, load: Optional[bool] = None, backend='local_async', wait=False,
+                                **run_args) -> tuple[str, Waitable]:
+        """
+        Start a CNMF run through mesmerize-core, so results will be in the batch dataframe. Defaults to running in background.
+        run_args are set to series.caiman.run in mescore.
+        Returns the UUID and process, which may still be running depending on whether 'wait' is set to True in run_args.
+        Once the process is done, finish_cnmf_processing should be called with the resulting UUID.
+
+        load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+        """        
+        # Get params to pass to mescore
+        batch = self.get_gridsearch_results(allow_create=True)
+        params_to_cnmf = self.params.get_params_up_to_stage(AnalysisStage.CNMF)
+        
+        if load != False:  # try loading existing
+            completed_runs = batch.loc[[out is not None and out['success'] for out in batch.outputs], :]
+            for _, row in completed_runs.iterrows():
+                row = cast(MescoreSeries, row)
+
+                # check whether CNMF params match
+                # eval param differences are handled in finish_cnmf_processing.
+                output_path = row.cnmf.get_output_path()
+                params_path = paths.params_file_for_result(output_path)
+                try:
+                    saved_params = cmp.read_params_up_to_stage(AnalysisStage.EVAL, params_path)
+                except FileNotFoundError:
+                    continue
+                
+                if cmp.do_params_match(params_to_cnmf, saved_params, metadata=self.metadata):
+                    uuid = str(row.at['uuid'])
+                    logging.info(f'Found matching CNMF run with uuid {uuid}')
+                    return uuid, DummyProcess()
+            
+            # no matching run found
+            if load == True:
+                raise RuntimeError('No CNMF run found matching current parameters')
+            else:
+                logging.info('No previous matching CNMF run found - starting process')
+
+        
+        params_obj = self.params.read_cnmf_params()
+
+        # set params that depend on previous results
         if self.mc_result is None:
             raise RuntimeError('No MC results; cannot run CNMF')
 
-        if (mc_res_fn := self.mmap_file_transposed) is None:
+        if self.mmap_file_transposed is None:
             raise RuntimeError('No transposed data file; cannot run CNMF')
-        file_size = get_file_size(mc_res_fn)[0]
-        
-        if is3D:
-            # rename mmap to undo reshape
-            h, w = file_size
-            file_size = (h, w // self.metadata['num_planes'], self.metadata['num_planes'])
-            mc_res_fn_reshaped = re.sub(f'd2_{w}_d3_1', f'd2_{file_size[1]}_d3_{file_size[2]}', mc_res_fn)
-            if not os.path.exists(mc_res_fn_reshaped):
-                os.link(mc_res_fn, mc_res_fn_reshaped)
-            mc_res_fn = mc_res_fn_reshaped
+        file_size = get_file_size(self.mmap_file_transposed)[0]
 
-        default_params = CNMFParams()
+        params_obj.change_params({
+            'data': {'fnames': [self.mmap_file_transposed], 'dims': file_size},
+            'patch': {'border_pix': self.mc_result.border_to_0}  # only allows scalar value for border
+        })
 
-        new_params = {
-            'data': {'fnames': [mc_res_fn], 'dims': file_size},
-            # this is overridden when creating the CNMF object anyway
-            'patch': {
-                'n_processes': default_params.patch['n_processes'],
-                'border_pix': self.mc_result.border_to_0
-                },
-            'online': {
-                # paths that may be different on different machines
-                'movie_name_online': default_params.online['movie_name_online'],
-                'path_to_model': default_params.online['path_to_model'],
-                'init_batch': default_params.online['init_batch']
-                }
+        # infer name of spatial seed, if using
+        seed_params = params_to_cnmf['cnmf_extra'].seed_params
+        if seed_params.type != 'none':
+            Ain_name = get_spatial_seed_name(seed_params)
+        else:
+            Ain_name = None
+
+        # create mesmerize item (do this first to get a UUID, which tells us where to save the seed)
+        batch.caiman.add_item(
+            algo='cnmf',
+            item_name=batch.paths.get_batch_path().stem,
+            input_movie_path=self.mmap_file_transposed,
+            params={
+                'main': params_obj.to_dict(),
+                'refit': seed_params.type == 'none',
+                'Ain_path': f'{Ain_name}.npy' if Ain_name is not None else None
             }
+        )
 
-        # correct patch parameters based on is3D
-        curr_patch = self.cnmf_params.patch
-        default_patch_z = {'rf': self.metadata['num_planes'], 'stride': 0}
-        for patch_key, default_z in default_patch_z.items():
-            curr_param = curr_patch[patch_key]
-            if is3D:
-                if np.isscalar(curr_param):
-                    new_params['patch'][patch_key] = [curr_param, curr_param, default_z]
-                elif len(curr_param) == 2:
-                    new_params['patch'][patch_key] = [*curr_param, default_z]
-            elif isinstance(curr_param, (Sequence, np.ndarray)) and len(curr_param) == 3:
-                new_params['patch'][patch_key] = curr_param[:2]
-        
-        # correct gSig based on is3D
-        curr_gSig = self.cnmf_params.init['gSig']
-        if is3D:
-            if np.isscalar(curr_gSig) or len(curr_gSig) < 3:
-                raise ValueError('Must pass gSig as length-3 list for 3D CNMF')
-        elif isinstance(curr_gSig, (Sequence, np.ndarray)) and len(curr_gSig) == 3:
-            new_params['init'] = {'gSig': curr_gSig[:2]}
-        
-        if is3D:
-            # CNN does not support 3D CNMF
-            logging.info('Disabling CNN for 3D CNMF')
-            new_params['quality'] = {'use_cnn': False}
+        item = cast(MescoreSeries, batch.iloc[-1])
+        uuid = str(item.uuid)
+        if seed_params.type != 'none':
+            # actually make and save seed
+            output_dir = batch.paths.get_batch_path().parent.joinpath(uuid).resolve()
+            output_dir.mkdir(parents=True, exist_ok=True)
 
-            # Set custom structuring element for binary closing step to avoid eroding top and bottom planes
-            if self.cnmf_params.spatial['se'] is None:
-                new_params['spatial']['se'] = np.ones((3, 3, 1), dtype=np.uint8)
+            seed_param_dict = struct2dict(seed_params)
+            # fill in default value of gSig
+            if seed_param_dict['gSig'] is None:
+                seed_param_dict['gSig'] = params_obj.init['gSig'][0]
 
-        if seeded:
-            # settings for seeded run - cannot use patches
-            new_params['patch']['rf'] = None
-            new_params['patch']['only_init'] = False
+            proj, seed_params_extra = self.get_projection_for_seed(**seed_param_dict)
+            np.save(output_dir / 'projection_for_seed.npy', proj)
+            Ain = footprints.make_spatial_seed_from_projection(proj, seed_params_extra)
+            np.save(output_dir / f'{Ain_name}.npy', np.array(Ain))  # saves as object array
 
-        run_params = deepcopy(self.cnmf_params)
-        run_params.change_params(new_params)
-        return run_params
+        if 'dview' not in run_args and backend in ['local', 'local_async']:
+            run_args['dview'] = cluster.dview
+
+        proc = item.caiman.run(backend=backend, wait=wait, **run_args)
+        return uuid, proc
     
 
-    def make_spatial_seed(self, seed_params: dict, proj: Optional[np.ndarray] = None) -> sparse.csc_array:
+    def finish_cnmf_processing(self, finished_or_loaded_cnmf_uuid: str):
         """
-        Make a spatial seed (initialization for spatial components) based on a correlation image or projection
-        seed_params:
-            - 'type': one of ['mean', 'max', 'std', 'corr']  (default: 'mean')
-            - 'blur_size': size of Gaussian kernel to use to blur movie in 2D before taking projection
-                           (SD = blur_size // 2)
-            - 'norm_medw': width of median filter for brightness normalization (default: skip this step)
-            - 'border': border pixels to exclude from each plane, either an int to use the same on all sides or a BorderSpec
-            - 'gSig': sigma for neuron spatial template
-            - other params: see caiman.base.rois.extract_binary_masks_from_structural_channel
-        proj: (optional) a pre-computed projection; in this case seed_params should be the extra ones returned from get_projection_for_seed.
+        Post-processing to do after a mesmerize CNMF run has finished or been loaded,
+        to select (load) the run and ensure results match cnmf_extra and eval parameters.
         """
-        if proj is None:
-            proj, seed_params_extra = self.get_projection_for_seed(**seed_params)
-        else:
-            seed_params_extra = seed_params
+        self.select_gridsearch_run(finished_or_loaded_cnmf_uuid, quiet=True)
 
-        concat_planes = seed_params_extra.pop('concat_planes')
-        border: BorderSpec = seed_params_extra.pop('border')
-        
-        # get masks from each plane separately
-        if concat_planes > 1:
-            planes = np.split(proj, concat_planes, axis=1)
-        else:
-            planes = [proj]
-
-        Ain_planes: list[sparse.csc_array] = []
-        for plane in planes:
-            center_slices = border.slices(plane.shape)
-            plane_center = plane[center_slices]
-            Ain_plane, _ = cmcustom.my_extract_binary_masks_from_structural_channel(plane_center, **seed_params_extra)
-            # fix rows to take border into account
-            ind_array = np.arange(plane.size, dtype=int).reshape(plane.shape, order='F')
-            inds_used = ind_array[center_slices].ravel(order='F')
-            Ain_plane.resize((plane.size, Ain_plane.shape[1]))  # expand shape to take border into account
-            Ain_plane.indices = inds_used[Ain_plane.indices]  # offset indices to take border into account
-            Ain_planes.append(Ain_plane)
-
-        return sparse.block_diag(Ain_planes, format='csc')  # type: ignore
-
-
-    def do_cnmf(self, do_refit=True, force=False, cluster_args: Optional[dict] = None,
-                is3D=False, seed_params: Optional[dict] = None, snr_type: Optional[Literal['normal', 'gamma']] = None) -> None:
-        """
-        Do or load CNMF.
-        This function now does the same thing as do_cnmf_with_mescore - loading a
-        CNMF run that was not run with mesmerize-core is no longer supported
-        Generally it is better to use update_params to set cluster_args, seed_params, and snr_type instead of passing them here
-        """
-        if snr_type is None:
-            snr_type = self.snr_type
-
-        uuid, _ = self.start_cnmf_with_mescore(is3D=is3D, seed_params=seed_params, force=force,
-                                               backend='local', wait=True, do_refit=do_refit, cluster_args=cluster_args)
-        self.select_gridsearch_run(uuid, quiet=True)
         assert self.cnmf_fit is not None
-        logging.info(f'Selected CNMF run with UUID {uuid}')
+        logging.info(f'Selected CNMF run with UUID {finished_or_loaded_cnmf_uuid}')
 
-        redo_eval = False
-        if self.crossplane_merge_thr is not None and not is3D and self.metadata['num_planes'] > 1:
+        redo_eval = False  # need to recalc evaluation if current state of estimates doesn't match params
+        # will also redo (automatically) if the quality parameters have changed from what was loaded
+
+        # if we loaded the result and crossplane merging was already done, don't redo
+        if (self.crossplane_merge_thr is not None and self.cnmf_fit.estimates.crossplane_merge_thr_used is None
+            and self.metadata['num_planes'] > 1):
             logging.info('Doing crossplane merging')
             n_merged = self.cnmf_fit.estimates.merge_components_crossplane(
-                n_planes=self.metadata['num_planes'], params=self.cnmf_params, thr=self.crossplane_merge_thr)
+                n_planes=self.metadata['num_planes'], params=self.cnmf_fit.params, thr=self.crossplane_merge_thr)
             logging.info(f'Merged {n_merged} sets of components')
             if n_merged > 0:
                 logging.info('Redoing evaluation after merging')
@@ -1231,16 +1266,15 @@ class SessionAnalysis:
         else:
             n_merged = 0
         
-        if snr_type != 'normal':
+        if self.snr_type != self.cnmf_fit.estimates.snr_type:
             # redo evaluation after switching SNR type
             if n_merged == 0:
-                logging.info(f'Redoing evaluation with {snr_type} SNR type')
+                logging.info(f'Redoing evaluation with {self.snr_type} SNR type')
             redo_eval = True
-            
-        if redo_eval:
-            self.do_cnmf_evaluation(snr_type=snr_type, cluster_args=cluster_args)
-        
-        self.make_df_over_f()
+
+        self.do_cnmf_evaluation(recalc=redo_eval)
+
+        self.make_df_over_f(recalc=False)
 
         if self.downsample_factor is not None:
             assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
@@ -1249,111 +1283,6 @@ class SessionAnalysis:
             self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)
         
         self.save(save_cnmf=True)
-
-
-    def do_cnmf_with_mescore(self, force=False, is3D=False, seed_params: Optional[dict] = None,
-                             do_refit=True, cluster_args: Optional[dict] = None) -> None:
-        """
-        Run a CNMF run through mesmerize-core, so results will be in the batch dataframe.
-        Waits for process to finish and then selects the run to make it active for further processing.
-        force: whether to just load the last run in the batch file if there is one.
-        is3D: whether to do 3D CNMF.
-        """
-        logging.warning('do_cnmf_with_mescore is deprecated, you can just use do_cnmf with the same keyword arguments')
-        self.do_cnmf(do_refit=do_refit, force=force, cluster_args=cluster_args,
-                     is3D=is3D, seed_params=seed_params)
-
-
-    def start_cnmf_with_mescore(self, is3D=False, seed_params: Optional[dict] = None, force=True,
-                                backend='local_async', wait=False, do_refit=True, cluster_args: Optional[dict] = None,
-                                **run_args) -> tuple[str, Waitable]:
-        """
-        Start a CNMF run through mesmerize-core, so results will be in the batch dataframe. Defaults to running in background.
-        is3D: whether to do 3D CNMF.
-        seed_params: if None, usees default seed params (see caiman_params.py). Use empty dict to use non-seeded CNMF.
-        do_refit only takes effect if seed_params is empty ({}) (no need for refit with seeded CNMF)
-        cluster_args are used when setting up the cluster if the backend is 'local' or 'local_async'
-        run_args are set to series.caiman.run in mescore.
-        Returns the UUID and process, which may still be running depending on whether 'wait' is set to True in run_args.
-        """
-        if os.name == "nt":
-            cnmf_cache.set_maxsize(0)
-        
-        if seed_params is None:
-            seed_params = copy(self.seed_params)
-
-        # Get params to pass to mescore
-        batch = self.get_gridsearch_results(allow_create=True)
-        item_name = batch.paths.get_batch_path().stem
-        run_params = self.get_cnmf_run_params(is3D=is3D, seeded=bool(seed_params))
-        
-        # Use CNMF params to make seed if necessary
-        if bool(seed_params):
-            seed_params['border'] = run_params.patch['border_pix']
-            Ain_name = get_spatial_seed_name(seed_params)
-            if 'gSig' not in seed_params:  # should not be included in name
-                seed_params['gSig'] = run_params.init['gSig'][0]
-        else:
-            Ain_name = None
-
-        params_cnmf = {
-            'main': run_params.to_dict(),
-            'refit': do_refit and not seed_params,
-            'Ain_path': f'{Ain_name}.npy' if Ain_name is not None else None
-        }
-
-        if not force:
-            completed_runs = batch.loc[[out is not None and out['success'] for out in batch.outputs], :]
-            for _, row in completed_runs.iterrows():
-                row = cast(MescoreSeries, row)
-                params_diffs: Sequence[dict[str, Any]] = get_params_diffs([params_cnmf, row.at['params']])
-                # ignore quality parameters when checking for match; don't need to re-run CNMF for different quality params
-                def can_exclude(param_name: str):
-                    sub_names = accumulate(param_name.split('.'), lambda p1, p2: '.'.join((p1, p2)))
-                    return any(name in cmp.EXCLUDE_FROM_DIFFS for name in sub_names)
-
-                if all(can_exclude(param_name) for param_name in params_diffs[0]):
-                    logging.info('Found matching CNMF run')
-                    if len(params_diffs[0]) > 0:
-                        # load in order to compare quality params
-                        cnmf_found = load_CNMFExt(str(row.cnmf.get_output_path()), quiet=True)
-                        quality_params_actual = cnmf_found.params.quality
-                        quality_diffs = get_params_diffs([params_cnmf['main']['quality'], quality_params_actual])
-                        if len(quality_diffs[0]) > 0:
-                            logging.warning('Found run has different ROI quality settings:')
-                            quality_diffs_df = pd.DataFrame.from_dict(quality_diffs, dtype=object)  # type: ignore
-                            quality_diffs_df.rename(index={0: 'Current settings', 1: 'Saved settings'}, inplace=True)
-                            print(quality_diffs_df)
-
-                    return str(row.at['uuid']), DummyProcess()
-            logging.info('No previous matching CNMF run found - starting process')
-
-        batch.caiman.add_item(
-            algo='cnmf',
-            item_name=item_name,
-            input_movie_path=params_cnmf['main']['data']['fnames'][0],
-            params=params_cnmf
-        )
-
-        item = cast(MescoreSeries, batch.iloc[-1])
-        uuid = str(item.uuid)
-        if bool(seed_params):
-            # actually make and save seed
-            output_dir = batch.paths.get_batch_path().parent.joinpath(uuid).resolve()
-            output_dir.mkdir(parents=True, exist_ok=True)
-
-            proj, seed_params_extra = self.get_projection_for_seed(**seed_params)
-            np.save(output_dir / 'projection_for_seed.npy', proj)
-            Ain = self.make_spatial_seed(seed_params_extra, proj=proj)
-            np.save(output_dir / f'{Ain_name}.npy', np.array(Ain))  # saves as object array
-
-        if 'dview' not in run_args and backend in ['local', 'local_async']:
-            if cluster_args is not None:
-                cluster.start(**cluster_args)
-            run_args['dview'] = cluster.dview
-
-        proc = item.caiman.run(backend=backend, wait=wait, **run_args)
-        return uuid, proc
 
 
     def do_cnmf_gridsearch(self, gridsearch_params: Union[ParamGrid, Sequence[ParamGrid]], wait=True,
@@ -1365,9 +1294,6 @@ class SessionAnalysis:
         Runs on a remote cluster if host is given and matches an entry in host_info.py (e.g. login.tj).
         To run locally, use 'localhost'.
         If wait is false, launches grid search process but does not wait for it to finish or validate success.
-
-        The following specal entries of gridsearch_params are allowed (and will be removed before passing to CNMFParams):
-        - ('special', '3D'): (bool) - set to True to do 3D CNMF. Note gSig should also be set accordingly.
         """
         # Make/get a dataframe that will hold results
         df = self.get_gridsearch_results(allow_create=True)
@@ -1417,7 +1343,7 @@ class SessionAnalysis:
     """Same as do_cnmf_gridsearch, but runs on a remote host (and waits for completion)"""
     
 
-    def make_df_over_f(self, force: bool = False, denoised: Optional[bool] = None):
+    def make_df_over_f(self, recalc: bool = False, denoised: Optional[bool] = None):
         """
         Calculates delta F over F for all ROIs using our default settings and
         saves to estimates.F_dff and estimates.F_dff_denoised. Set denoised to True or False
@@ -1428,14 +1354,14 @@ class SessionAnalysis:
         est = self.cnmf_fit.estimates   
     
         if denoised is None or not denoised:
-            if force or est.F_dff is None:
+            if recalc or est.F_dff is None:
                 logging.info('Calculating df/f')
                 est.F_dff = calc_df_over_f(est, use_residuals=True)
             else:
                 logging.info('Found df/f - not recalculating')
         
         if denoised is None or denoised:
-            if force or est.F_dff_denoised is None:
+            if recalc or est.F_dff_denoised is None:
                 logging.info('Calculating denoised df/f')
                 est.F_dff_denoised = calc_df_over_f(est, use_residuals=False)
             else:
@@ -1445,97 +1371,43 @@ class SessionAnalysis:
     #------------------------- ROI EVALUATION -----------------------------#
 
 
-    def do_cnmf_evaluation(self, new_quality_params=None, snr_type: Optional[Literal['normal', 'gamma']] = None,
-                           recalc=False, cluster_args: Optional[dict] = None):
+    def do_cnmf_evaluation(self, recalc=False):
         """
         Recalculates idx_components based on automatic criteria.
-        new_quality_params: Unused, throws an error if not None, use self.cnmf_params.change_params({'quality': <new params>}) instead
+        new_quality_params: Unused, throws an error if not None, use self.update_params({'quality': <new params>}) instead
         snr_type: which type of SNR to use; if left as None, uses self.snr_type. Otherwise updates self.snr_type.
         recalc: If true, recomputes all metrics; otherwise reuses them if they already exist.
         """
-        if self.mc_result is None:
+        if self.mmap_file_transposed is None:
             raise RuntimeError('Cannot do CNMF evaluation without input file (motion correction result)')
 
-        if self.cnmf_fit is None:
+        if self.cnmf_fit_filename is None:
             raise RuntimeError('CNMF fit not found')
         
-        if new_quality_params is not None:
-            raise RuntimeError('Use self.cnmf_params.change_params({"quality": <new params>}) instead of setting new_quality_params')
-        new_quality_params = self.cnmf_params.quality
-        
-        if snr_type is None:
-            snr_type = self.snr_type
-        elif snr_type != self.snr_type:
-            self.snr_type = snr_type
+        eval_params = self.params.get_params_for_stage(AnalysisStage.EVAL)
 
-        if cluster_args is not None:
-            cluster.start(**cluster_args)
+        if not recalc:  # if the eval params match, no need to redo.
+            params_file = paths.params_file_for_result(self.cnmf_fit_filename)
+            try:
+                old_eval_params = cmp.read_params_up_to_stage(AnalysisStage.EVAL, params_file)
+            except FileNotFoundError:
+                pass
+            else:
+                if cmp.do_params_match(eval_params, old_eval_params, self.metadata):
+                    logging.info('Eval params have not changed - skipping evaluation')
+                    return
+
+        new_quality_params = eval_params['quality']
+        snr_type = eval_params['eval_extra'].snr_type
 
         logging.info('Doing CNMF component evaluation')
-        evaluate_cnmf(self.cnmf_fit, self.mc_result.mmap_file_transposed, snr_type=snr_type,
+        assert (cnmf_fit := self.cnmf_fit) is not None
+        evaluate_cnmf(cnmf_fit, self.mmap_file_transposed, snr_type=snr_type,
                       new_quality_params=new_quality_params, recalc=recalc, dview=cluster.dview)
 
         # re-save cnmf object with evaluation data added
         logging.info('Re-saving CNMF object with evaluation data')
         self.save(save_cnmf=True)
-
-
-    def pick_gt_rois(self):
-        """
-        Interactively select ROIs that should be recognized as neurons from the correlation plot.
-        Saves ROIs in sparse CSC format as {mouseid}_{sessid}_{tag}_gtroi.npz.
-        """
-        if mpl.get_backend().lower() == 'agg':
-            raise RuntimeError('Must have interactive backend to pick ROIs')
-        
-        # get and plot correlations
-        corr_concat = self.get_projection('corr')
-        fig, ax = plt.subplots()
-        ax.imshow(corr_concat, interpolation=None,
-                  vmin=float(np.percentile(corr_concat[~np.isnan(corr_concat)], 1)),
-                  vmax=float(np.percentile(corr_concat[~np.isnan(corr_concat)], 99)))
-        
-        # prompt for ROIs
-        rois = MultiRoi(fig=fig, ax=ax)
-        # figure will close automatically
-
-        # make CSC matrix and save
-        n_rois = len(rois.rois)
-        masks_lil = sparse.lil_array((n_rois, corr_concat.size), dtype=bool)
-        b_keep = np.ones(n_rois, dtype=bool)  # for excluding empty masks
-        for i, roi in enumerate(rois.rois.values()):
-            mask = roi.get_mask(corr_concat).ravel(order='F')
-            if np.any(mask):
-                masks_lil[i, :] = mask
-            else:
-                b_keep[i] = False
-
-        masks_csc = sparse.csr_array(masks_lil[b_keep, :]).T
-        tagstr = f'_{self.tag}' if self.tag is not None else ''
-        mask_file = os.path.join(self.data_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_gtroi.npz')
-        sparse.save_npz(mask_file, masks_csc)
-
-
-    def get_roi_gt_score(self, gt_file: Optional[Union[str, Path]] = None, binarize=True, nrgthr=0.9, accepted_only=False) -> float:
-        """
-        Score CNMF ROIs against ground-truth file (see caiman_analysis.get_roi_gt_score)
-        """
-        # get estimates and ground truth
-        cnmf_fit = self.cnmf_fit
-        if cnmf_fit is None:
-            raise RuntimeError('No CNMF results to use')
-        est = cnmf_fit.estimates
-        if not isinstance(est.dims, tuple):
-            raise RuntimeError('CNMF has not been run')
-
-        if gt_file is None:
-            tagstr = f'_{self.tag}' if self.tag is not None else ''
-            gt_file = os.path.join(self.data_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_gtroi.npz')
-
-        # make dims that correspond to actual spatial layout
-        dims = self.get_dims_in_um()
-        return get_roi_gt_score(cnmf_fit, gt_file, dims, binarize=binarize, nrgthr=nrgthr,
-                                accepted_only=accepted_only, dview=cluster.dview)
 
     
     #--------------------- ACCESSING CNMF RESULTS -----------------------------#
@@ -1557,11 +1429,10 @@ class SessionAnalysis:
         return df
 
 
-    def get_gridsearch_diffs(self, batch: Optional[MescoreBatch] = None, add_gt_scores=False, gt_file=None) -> pd.DataFrame:
+    def get_gridsearch_diffs(self, batch: Optional[MescoreBatch] = None) -> pd.DataFrame:
         """
         Get table of parameter differences between all the gridsearch runs that have been run so far
         If batch is given, use this batch dataframe instead of calling get_gridsearch_results()
-        If add_gt_scores is true, also adds ground-truth Jaccard scores to the table (computed by get_roi_gt_score).
         """
         if batch is None:
             df = self.get_gridsearch_results()
@@ -1571,30 +1442,26 @@ class SessionAnalysis:
         df_diffs = df.caiman.get_params_diffs('cnmf', df.item_name.iat[0])
 
         # filter out unimportant parameters (in case they aren't fixed by get_cnmf_run_params)
-        df_diffs = df_diffs.loc[:, ~np.isin(df_diffs.columns, EXCLUDE_FROM_DIFFS)]
+        df_diffs = df_diffs.loc[:, ~np.isin(df_diffs.columns, cmp.EXCLUDE_FROM_DIFFS)]
 
         # add UUIDs
         df_diffs = pd.concat([df_diffs, df.loc[:, 'uuid']], axis=1)
-
-        if add_gt_scores:
-            gt_scores = pd.Series(np.zeros(len(df)), index=df.index, name='gt_score')
-            for i, uuid in enumerate(df.uuid.array):
-                self.select_gridsearch_run(uuid=uuid, quiet=True)
-                gt_scores.at[i] = self.get_roi_gt_score(gt_file)
-            df_diffs = pd.concat([gt_scores, df_diffs], axis=1)
-            df_diffs.sort_values(by='gt_score', axis=0, inplace=True, ascending=False)
-
         return df_diffs
             
 
-    def select_gridsearch_run(self, uuid=None, *_, index=None, quiet=False, force_reload=True) -> str:
+    def select_gridsearch_run(self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
+                              allow_rerunning_prereqs=False, allow_inconsistent_state=True) -> str:
         """
         Select a CNMF gridsearch run by either UUID or index in the dataframe, and make it the current run
-        Sets self.cnmf_fit, self.cnmf_fit_filename, and self.cnmf_params to match the selected run
+        Sets params and prerequisite and CNMF outputs to match the selected run
         Returns the UUID of the selected run.
-        """
-        # TODO make this also load matching motion correction results, etc.
 
+        allow_rerunning_prereqs: Set to true to re-compute prerequisites (motion correction, etc.) 
+            rather than just loading if outputs matching the saved params are not found (or if it's indeterminate)
+        allow_inconsistent_state: Don't error but print a big warning if the params can't be
+            validated with existing saved prerequisites (in this case the params are left as is,
+            possibly not matching the loaded data).
+        """
         if index is not None and uuid is not None:
             raise ValueError('Cannot specify both uuid and index')
         
@@ -1621,8 +1488,8 @@ class SessionAnalysis:
 
         if index is not None:
             try:
-                row = df.iloc[index]
-                uuid = row.uuid
+                row = cast(MescoreSeries, df.iloc[index])
+                uuid = str(row.uuid)
             except KeyError:
                 raise ValueError(f'Index {index} not present in gridsearch dataframe')
         else:
@@ -1630,28 +1497,66 @@ class SessionAnalysis:
             rows = df.loc[df.uuid == uuid]
             if len(rows) != 1:
                 raise ValueError(f'UUID {uuid} not present in gridsearch dataframe')
-            row = rows.iloc[0]
+            row = cast(MescoreSeries, rows.iloc[0])
 
         if row.outputs is None or not row.outputs['success']:
             raise RuntimeError('Run has not completed or did not succeed')
         
-        if row.algo != 'cnmf':
+        if str(row.algo) != 'cnmf':
             raise RuntimeError('Selected item is not a CNMF run')
         
         # OK, we have a CNMF run and it has completed successfully. Set fields.
-        self.cnmf_fit_filename = str(df.paths.get_batch_path().parent / row.outputs['cnmf-hdf5-path'])
-        if cluster.dview is None:
-            setup_cluster()
+        # Load prerequisites first
+        cnmf_path = str(row.cnmf.get_output_path())
+        params_path = paths.params_file_for_result(cnmf_path)
+        loading_inconsistent_msg = (
+            'Because allow_inconsistent_state is True, the CNMF result will still be loaded, '
+            'but please be aware that the results may not match current values of params '
+            'and re-running anything may not work as expected.')
+
+        try:
+            loaded_params = cmp.SessionAnalysisParams.from_dict(cmp.read_params_up_to_stage(AnalysisStage.FINAL, params_path))
+        except FileNotFoundError as e:
+            cannot_determine_msg = (
+                'The parameters for prerequisite stages of the selected run could not be determined conclusively. ')
+
+            if allow_inconsistent_state:
+                logging.warning(cannot_determine_msg + loading_inconsistent_msg)
+                loaded_params = None
+            else:
+                raise RuntimeError(
+                    cannot_determine_msg + 
+                    'You can set allow_inconsistent_state=True to load anyway.') from e
+
+        if loaded_params is not None:
+            # save attributes to restore if this fails
+            stage_to_invalidate = self.params.get_first_nonmatching_stage(loaded_params, metadata=self.metadata)
+            backup_attrs = self.invalidate_from_stage(stage_to_invalidate)
+            backup_attrs['params'] = self.params
+            self.params = loaded_params
+
+            try:
+                load = None if allow_rerunning_prereqs else True
+                self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load)
+
+            except NoMatchingResultError as e:
+                # restore backed-up attributes
+                for k, v in backup_attrs.items():
+                    setattr(self, k, v)
+
+                cannot_load_msg = 'Cannot load prerequisite results of the selected CNMF run. '
+                if allow_inconsistent_state:
+                    logging.warning(cannot_load_msg + loading_inconsistent_msg)
+                else:
+                    raise RuntimeError(
+                        cannot_load_msg +
+                        'You can run select_gridsearch_run with allow_rerunning_prereqs to recalculate them if you want, '
+                        'or set allow_inconsistent_state=True to load CNMF anyway without re-running.'
+                        ) from e
+
+        self.cnmf_fit_filename = cnmf_path
         cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
         self.cnmf_fit = cnmf_fit
-
-        params_from_row = row.params['main']
-        # update specifically quality parameters from CNMF object because they could be changed post-hoc
-        params_from_row['quality'] = cnmf_fit.params.quality
-        # also blank out fnames to avoid path normalization issues
-        params_from_row['data']['fnames'] = None
-        self.cnmf_params = CNMFParams(params_dict=params_from_row)
-
         return uuid
     
     def select_successful_run(self, quiet=True) -> Optional[str]:
@@ -2066,7 +1971,7 @@ class SessionAnalysis:
         n_comps = len(est.f)
         fig = plt.figure()
         gs = fig.add_gridspec(2 * n_comps, 1, height_ratios=[3, 1] * n_comps)
-        image_dims = self.cnmf_params.data['dims']
+        image_dims = self.cnmf_fit.dims
 
         for i, (comp_s, comp_t) in enumerate(zip(est.b.T, est.f)):
             im_ax = fig.add_subplot(gs[2*i, 0])
@@ -2384,11 +2289,10 @@ def load_cnmf(cnmf_filename: str, quiet=True) -> Optional[CNMFExt]:
 
 
 def load_latest(mouse_id: Union[int, str], sess_id: int, rec_type: str = 'learning_ppc',
-                tag: Optional[str] = None, downsample_factor: Optional[int] = None,
-                quiet=True, lazy=True) -> SessionAnalysis:
+                tag: Optional[str] = None, quiet=True, lazy=True) -> SessionAnalysis:
     """Load latest saved analysis for given mouse/session/tag"""
     data_dir = paths.get_processed_dir(mouse_id, rec_type=rec_type)
-    file_pattern = get_session_analysis_file_pattern(mouse_id, sess_id, tag=tag, downsample_factor=downsample_factor)
+    file_pattern = get_session_analysis_file_pattern(mouse_id, sess_id, tag=tag)
     latest_file = paths.get_latest_timestamped_file(data_dir, file_pattern)
     if latest_file is None:
         raise RuntimeError('No saved analysis found')
@@ -2460,91 +2364,6 @@ def evaluate_cnmf(cnmf_fit: CNMFExt, mc_res_path_or_images: Union[str, np.ndarra
         reject = np.flatnonzero(reject_y | reject_x)
         est.idx_components_bad = np.union1d(est.idx_components_bad, reject)
         est.idx_components = np.setdiff1d(range(est.A.shape[-1]), est.idx_components_bad)
-
-
-def get_roi_gt_score(cnmf_fit: cnmf.CNMF, gt_file: Union[str, Path], dims: Optional[Sequence[Union[int, slice, np.ndarray]]] = None,
-                     binarize=True, nrgthr=0.9, accepted_only=False, dview=None) -> float:
-    """
-    Score CNMF ROIs against ground-truth file by computing the average Jaccard index
-    between each ground-truth ROI and the identified ROI with the nearest center of mass.
-    By default, ground-truth ROIs are loaded from the same path as pick_gt_rois saves to.
-    If dims is specified, each entry (y, x[, z]) specifies either the number of pixels in this dimension or
-        the spatial location of each pixel in this dimension, for accurate distance calculation.
-    If binarize is True, binarize the identified ROIs before computing Jaccard index.
-    If nrgthr is <1, use only up this fraction of cumulative energy (from highest- to lowest-value pixels)
-    If accepted_only is true, uses the subset of identified ROIs that were accepted by the quality criteria.
-    """
-    # get estimates and ground truth
-    est = cnmf_fit.estimates
-    assert est.A is not None and isinstance(est.dims, tuple), 'Estimates elements should not be None - has CNMF been run?'
-    A = sparse.csc_array(est.A)
-
-    if accepted_only:
-        if est.idx_components is None:
-            raise RuntimeError('Cannot score accepted components - no CNMF evaluation has been run')
-        A = A[:, est.idx_components]
-
-    gt_masks: sparse.csc_array = sparse.load_npz(gt_file).astype(est.A.dtype)
-    n_gt = gt_masks.shape[1]
-
-    if dims is None:
-        dims = est.dims
-
-    if len(dims) != len(est.dims):
-        raise ValueError('Incorrect number of dimensions given')
-
-    gt_planes = np.zeros(n_gt)
-    xy_size = est.dims[0] * est.dims[1]
-    if len(est.dims) == 3:
-        # ensure each ground-truth mask is only on one plane
-        gt_masks = gt_masks.tolil()  # allows changing sparsity structure more efficiently
-        for col in range(n_gt):
-            # get plane that most (usually ALL) pixels are in for this ground-truth ROI
-            kplane = mode(gt_masks[:, [col]].nonzero()[0] // xy_size)[0]
-            gt_masks[:kplane*xy_size, col] = 0
-            gt_masks[(kplane+1)*xy_size:, col] = 0
-            gt_planes[col] = kplane
-
-    # map gt ROIs to nearest identified ROI
-    coms_gt = cmcustom.my_com(gt_masks, *dims)
-    coms_id = cmcustom.my_com(A, *dims)
-
-    # builds tree for nearest-neighbor lookups, then queries with the gt ROI COMs
-    nn_tree_id = KDTree(coms_id)
-    _, nn_inds = nn_tree_id.query(coms_gt)
-    A_closest = A[:, nn_inds]
-
-    # process each ROI using threshold_components function
-    if nrgthr < 1:
-        thresh_args = {
-            'medw': (1,) * len(est.dims),  # disable median filtering
-            'thr_method': 'nrg',
-            'nrgthr': nrgthr,
-            # morphological closing makes sense after threhsolding, but don't do it in Z
-            'se': np.ones((3, 3, 1)[:len(est.dims)], dtype=int),
-            'dview': dview
-        }
-        A_closest = sparse.csc_array(threshold_components(A_closest, est.dims, **thresh_args))
-    
-    if binarize:
-        A_closest = A_closest.astype(bool)
-
-    # just take pixels on plane of each ROI
-    if len(est.dims) == 3:
-        A_closest = A_closest.tolil()  # allows changing sparsity structure more efficiently
-        for col, kplane in enumerate(gt_planes):
-            A_closest[:kplane*xy_size, col] = 0
-            A_closest[(kplane+1)*xy_size:, col] = 0
-
-    if not binarize:
-        # normalize so that pixels have average value of 1 (not necessary if binarized)
-        A_closest = A_closest.multiply(A_closest.getnnz(axis=0) / A_closest.sum(axis=0))
-
-    # compute Jaccard index
-    intersection = np.array(A_closest.minimum(gt_masks).sum(axis=0))
-    union = np.array(A_closest.maximum(gt_masks).sum(axis=0))
-    iou = intersection / union
-    return float(np.mean(iou))
 
 
 def identify_marked_rois(cnmf_obj: CNMFExt, cnmf_filename: Optional[str], A_structural: sparse.csc_array,

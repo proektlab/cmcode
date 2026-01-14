@@ -8,9 +8,7 @@ import logging
 import math
 import os
 from pathlib import Path
-import psutil
 import re
-import shutil
 import tempfile
 from typing import Optional, Union, Generator, ParamSpec, TypedDict, Any, cast
 
@@ -23,16 +21,11 @@ import holoviews as hv
 from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel
 from mesmerize_core.utils import Border
 import numpy as np
-from scipy import signal
 
-from cmcode import in_jupyter, caiman_analysis as cma, caiman_params as cmp
+from cmcode import caiman_analysis as cma, caiman_params as cmp
 from cmcode.util import paths
 from cmcode.util.image import BorderSpec
-
-if in_jupyter():
-    from tqdm.notebook import tqdm_notebook as tqdm
-else:
-    from tqdm import tqdm
+from cmcode.util.types import NoMatchingResultError
 
 
 @dataclass
@@ -50,12 +43,12 @@ class PiecewiseMCInfo:
 class MCResult(paths.CustomPathMappable):
     mmap_files: list[str]
     border_to_0: int
+    border_asym: list[BorderSpec]  # border on each side (old results just repeat border_to_0)
     shifts_rig: list[np.ndarray]
     shifts_els: Optional[list[np.ndarray]] = None
     dims: Optional[tuple[int, int]] = None
     motion_params: Optional[dict] = None
     mmap_file_transposed: Optional[str] = None  # deprecated, keep for unpickling
-    border_asym: Optional[list[BorderSpec]] = None  # border on each side (not present in older results)
 
     # cached datasets
     _shifts_rig_hv: Optional[hv.Dataset] = field(init=False, default=None)
@@ -92,6 +85,10 @@ class MCResult(paths.CustomPathMappable):
         for hv_field in ['_shifts_rig_hv', '_shifts_els_hv']:
             if hv_field not in state: 
                 state[hv_field] = None
+
+        if 'border_asym' not in state:
+            state['border_asym'] = [BorderSpec.equal(state['border_to_0'])] * len(state['mmap_files'])
+
         self.__dict__.update(state)
 
     def __setattr__(self, name, val):
@@ -584,3 +581,37 @@ def transpose_flatten_mc_mmap(
             )
 
     return expected_file
+
+
+def do_or_load_transpose(
+        mc_result: MCResult, params: cmp.UpToTransposeParamDict, fr: float, metadata: dict[str, Any],
+        dview: Optional[Cluster] = None, load: Optional[bool] = None) -> str:
+    """
+    Either load existing result or do the transpose, saving a params file along with it
+
+    load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+    """
+    if load != False:   # try to load existing results
+        expected_file = get_transposed_mmap_name(mc_result.mmap_files, params['transposition'])
+        params_file = paths.params_file_for_result(expected_file)
+        try:
+            loaded_params = cmp.read_params_up_to_stage(cmp.AnalysisStage.TRANSPOSE, params_file)
+            if cmp.do_params_match(params, loaded_params, metadata=metadata):
+                if load is None:  # only log if we were unsure whether to load
+                    logging.info('Using existing transposed file: ' + expected_file)
+                return expected_file
+        except FileNotFoundError:
+            pass
+        
+    if load == True:
+        raise NoMatchingResultError('Cannot find matching transposed file.')
+    else:
+        # we are doing the transpose
+        res_file = transpose_flatten_mc_mmap(mc_result, params['transposition'], fr=fr, dview=dview)
+        # write params file as well
+        params_file = paths.params_file_for_result(res_file)
+        cmp.write_params(params, params_file)
+        return res_file

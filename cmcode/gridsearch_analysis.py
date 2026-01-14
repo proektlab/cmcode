@@ -1,14 +1,10 @@
 """
 Functions for doing grid searches of parameters using mesmerize-core
-For now, this picks up after motion correction, from the transposed/concatenated mmap file.
 """
 from itertools import product
-import logging
 import os
 from pathlib import Path
-import time
-import traceback
-from typing import Optional, Iterable, Union, Mapping, Sequence, Any
+from typing import Any, Optional, Iterable, Union, Mapping, Sequence
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,7 +12,7 @@ import matplotlib.pyplot as plt
 from mesmerize_core.caiman_extensions.common import Waitable
 
 from cmcode import caiman_analysis as cma, cmcustom
-from cmcode.cnmf_ext import load_CNMFExt
+from cmcode.caiman_params import AnalysisStage
 
 
 ParamGrid = Mapping[tuple[str, str], Iterable]
@@ -49,34 +45,26 @@ def do_cnmf_gridsearch(sessdata: 'cma.SessionAnalysis', params_to_search: Union[
     elif n_procs_var in os.environ:
         del os.environ[n_procs_var]
 
-    dview = None
-    if backend in ['local', 'local_async']:
-        dview = cma.cluster.dview
-
     procs: list[Waitable] = []
     uuids = []
 
     for param_dict in param_dicts:
-        param_changes = {}
-        is3D = False
-        seed_params = None
+        param_changes: dict[str, dict[str, Any]] = {}
         for (group, key), val in param_dict.items():
-            if group != 'special':
-                if group not in param_changes:
-                    param_changes[group] = {}
-                param_changes[group][key] = val
-            elif key == '3D':
-                is3D = val
-            elif key in ['mask_in_args', 'seed'] and val is not None:
-                if key == 'mask_in_args':
-                    logging.warning("deprecated key 'mask_in_args'; use ('special', 'seed')")
-                # save seed_params to use after we have the rest of the params
-                seed_params = val
+            if group not in param_changes:
+                param_changes[group] = {}
+            param_changes[group][key] = val
         
-        sessdata.cnmf_params.change_params(param_changes)
+        sessdata.update_params(param_changes)
 
-        uuid, proc = sessdata.start_cnmf_with_mescore(is3D=is3D, backend=backend, wait=False, partition=partition,
-                                                      seed_params=seed_params, dview=dview)
+        # get up to the point of doing CNMF for these parameters if necessary
+        if sessdata.last_valid_stage < AnalysisStage.CONVERT:
+            sessdata.convert_to_tif()
+        
+        if sessdata.last_valid_stage < AnalysisStage.TRANSPOSE:
+            sessdata.do_motion_correction()
+
+        uuid, proc = sessdata.start_cnmf_with_mescore(backend=backend, wait=False, partition=partition)
 
         uuids.append(uuid)
         procs.append(proc)

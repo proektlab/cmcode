@@ -15,5 +15,4 @@ dependencies:
 - pip
 - pip:
   - mesmerize-viz
-  - roipoly
   - trycast

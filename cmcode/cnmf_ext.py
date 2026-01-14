@@ -4,8 +4,9 @@ from dataclasses import dataclass, asdict
 import logging
 import math
 import os
+from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 
 import numpy as np
 from numpy.typing import NDArray
@@ -14,8 +15,9 @@ from scipy import sparse
 from scipy.interpolate import PchipInterpolator, interp1d
 from caiman.source_extraction.cnmf import cnmf, params, merging
 
-from cmcode import alignment
+from cmcode import alignment, caiman_params as cmp
 from cmcode.cmcustom import compute_snr_gamma
+from cmcode.util import paths
 
 @dataclass
 class MetricInfo:
@@ -30,8 +32,8 @@ class EstimatesExt(cnmf.Estimates):
     I wrote this in a weird way that behaves like inheritance externally but is actually composition
     to satisfy static type checkers while keeping the base Estimates object available
     """
-    __slots__ = ('estimates', 'accepted_list', 'rejected_list',
-                 'structural_reg_res', 'F_dff_denoised', 'snr_type', 'snr_gamma_vals')
+    __slots__ = ('estimates', 'accepted_list', 'rejected_list', 'structural_reg_res',
+                 'F_dff_denoised', 'snr_type', 'snr_gamma_vals', 'crossplane_merge_thr_used')
 
     def __new__(cls, _: cnmf.Estimates):
         self = object.__new__(cls)  # don't actually create an estimates object under the hood
@@ -49,6 +51,7 @@ class EstimatesExt(cnmf.Estimates):
         self.F_dff_denoised: Optional[np.ndarray] = getattr(base_obj, 'F_dff_denoised', None)
         self.snr_type: Literal['normal', 'gamma'] = getattr(base_obj, 'snr_type', 'normal')
         self.snr_gamma_vals: Optional[np.ndarray] = getattr(base_obj, 'snr_gamma_vals', None)
+        self.crossplane_merge_thr_used: Optional[float] = getattr(base_obj, 'crossplane_merge_thr_used', None)
     
     def __getattribute__(self, name):
         """defer to estimates object"""
@@ -294,6 +297,11 @@ class EstimatesExt(cnmf.Estimates):
         Merge components across planes as if they were in the same plane, by flattening A
         Returns number of sets that were merged.
         """
+        if self.crossplane_merge_thr_used is not None:
+            raise RuntimeError(f'Crossplane merging already run with threshold {self.crossplane_merge_thr_used}; cannot re-run.')
+        
+        self.crossplane_merge_thr_used = thr
+
         est = self.estimates
         assert est.A is not None and est.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'
         A = est.A
@@ -422,14 +430,25 @@ class CNMFExt(cnmf.CNMF):
             cnmf.save_dict_to_hdf5(obj_dict, filename)
 
 
-def load_CNMFExt(filename: str, n_processes=1, dview=None, quiet=True) -> CNMFExt:
+def load_CNMFExt(filename: Union[Path, str], n_processes=1, dview=None, quiet=True) -> CNMFExt:
     logger = logging.getLogger()
     old_level = logger.level
     if quiet:
         logger.setLevel(logging.WARNING)
-    cnmf_obj = cnmf.load_CNMF(filename, n_processes=n_processes, dview=dview)
+    cnmf_obj = cnmf.load_CNMF(str(filename), n_processes=n_processes, dview=dview)
     if quiet:
         logger.setLevel(old_level)
 
     cnmf_obj_ext = CNMFExt(copy_from=cnmf_obj)
+
+    # to account for not setting crossplane_merge_thr_used previously, set it here if needed
+    if hasattr(cnmf_obj, 'estimates_ext') and 'crossplane_merge_thr_used' not in getattr(cnmf_obj, 'estimates_ext'):
+        params_path = paths.params_file_for_result(filename)
+        try:
+            saved_params = cmp.read_params_up_to_stage(cmp.AnalysisStage.EVAL, params_path)
+        except FileNotFoundError:
+            pass
+        else:
+            cnmf_obj_ext.estimates.crossplane_merge_thr_used = saved_params['cnmf_extra'].crossplane_merge_thr
+
     return cnmf_obj_ext

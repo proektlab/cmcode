@@ -3,7 +3,7 @@ from dataclasses import dataclass
 from functools import cache
 import logging
 import math
-from typing import Literal, Union, Sequence, Callable, Optional, Mapping
+from typing import Any, Literal, Union, Sequence, Callable, Optional, Mapping
 from warnings import warn
 
 import cv2
@@ -16,7 +16,7 @@ from scipy import sparse
 
 from caiman.source_extraction.cnmf.merging import get_ROIs_to_merge
 
-from cmcode import caiman_analysis as cma
+from cmcode import caiman_analysis as cma, cmcustom
 from cmcode.cmcustom import my_get_contours
 from cmcode.util.image import make_merge, BorderSpec
 from cmcode.util.naming import make_sess_name
@@ -208,6 +208,32 @@ def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray]
         cols = np.concatenate((cols, np.repeat(i, len(roi_nonzero))))
 
     return sparse.csc_matrix(sparse.coo_matrix((coo_data, (rows, cols)), shape=A2.shape))
+
+
+def make_spatial_seed_from_projection(proj: np.ndarray, seed_params_extra: dict[str, Any]) -> sparse.csc_array:
+    """Extract binary spatial seed from projection image and parameters"""
+    borders: list[BorderSpec] = seed_params_extra.pop('borders')
+    concat_planes = len(borders)
+    
+    # get masks from each plane separately
+    if concat_planes > 1:
+        planes = np.split(proj, concat_planes, axis=1)
+    else:
+        planes = [proj]
+
+    Ain_planes: list[sparse.csc_array] = []
+    for plane, border in zip(planes, borders):
+        center_slices = border.slices(plane.shape)
+        plane_center = plane[center_slices]
+        Ain_plane, _ = cmcustom.my_extract_binary_masks_from_structural_channel(plane_center, **seed_params_extra)
+        # fix rows to take border into account
+        ind_array = np.arange(plane.size, dtype=int).reshape(plane.shape, order='F')
+        inds_used = ind_array[center_slices].ravel(order='F')
+        Ain_plane.resize((plane.size, Ain_plane.shape[1]))  # expand shape to take border into account
+        Ain_plane.indices = inds_used[Ain_plane.indices]  # offset indices to take border into account
+        Ain_planes.append(Ain_plane)
+
+    return sparse.block_diag(Ain_planes, format='csc')  # type: ignore
 
 
 def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[float], np.ndarray], n_border_points,

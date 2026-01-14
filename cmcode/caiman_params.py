@@ -1,4 +1,3 @@
-from abc import ABC, abstractmethod
 from copy import copy, deepcopy
 from datetime import date
 from enum import IntEnum
@@ -6,7 +5,7 @@ from itertools import pairwise
 import os
 from pathlib import Path
 
-from typing import (Iterable, Sequence, Optional, Literal, Protocol, overload, cast,
+from typing import (Iterable, Sequence, Optional, Literal, overload, cast,
                     Union, Any, Type, TypedDict, Mapping, TypeVar)
 
 import msgspec
@@ -29,7 +28,6 @@ EXCLUDE_FROM_DIFFS = [
     'data.caiman_version',  # could be relevant at some point, but don't show for now
     'data.last_commit',
     'data.fnames',
-    'quality'
 ]
 
 
@@ -215,10 +213,10 @@ class SeedParams(StageParams, frozen=True):
     type: str = 'none' # e.g. "mean", "skew"; "none" means don't use a seed at all
     norm_medw: Optional[int] = None
     blur_size: int = 1  # 1 = blurring in projection disabled
-    border: Union[int, BorderSpec, None] = None  # None = auto-fill from mcorr
+    borders: Optional[list[BorderSpec]] = None  # None = auto-fill from mcorr
 
     # defaults from my_extract_binary_masks_from_structural_channel
-    gSig: Union[int, Sequence[int]] = 5  # neuron pixel size
+    gSig: Optional[Union[int, Sequence[int]]] = 5  # neuron pixel size (None = same as CNMF gSig)
     blur_type: Literal['box', 'gaussian'] = 'gaussian'
     blur_gSig_multiple: Optional[float] = None  # this is for the extract_binary_masks step, not projection
     min_area_size: int = 30
@@ -464,6 +462,12 @@ def get_differing_params(first: Mapping[str, Any], second: Mapping[str, Any], me
     include_different_toplevel: include top-level keys if one is present and the other is not.
         By default, only compares top-level keys that are present in both dicts.
     """
+    # infer whether CNMF is seeded because in this case we don't care about patch.rf and patch.only_init
+    seeded = True
+    for mapping in [first, second]:
+        if 'cnmf_extra' not in mapping or mapping['cnmf_extra'].seed_params.type == 'none':
+            seeded = False
+
     for key in set(first.keys()) | set(second.keys()):
         if key in EXCLUDE_FROM_DIFFS:
             continue
@@ -478,8 +482,14 @@ def get_differing_params(first: Mapping[str, Any], second: Mapping[str, Any], me
                 for subkey in diff_subkeys:
                     # skip ones that we don't care about
                     subkey_flat = key + '.' + subkey
-                    if subkey_flat not in EXCLUDE_FROM_DIFFS:
-                        yield subkey_flat
+                    if subkey_flat in EXCLUDE_FROM_DIFFS:
+                        continue
+
+                    # ignore rf and only_init if we are using seeded CNMF
+                    if seeded and key == 'patch' and subkey in ['rf', 'only_init']:
+                        continue
+
+                    yield subkey_flat
             else:
                 # annoyingly it seems like Mapping[str, Union[dict, StageParams]] doesn't work due to @dataclass
                 assert isinstance(val1, StageParams), 'params dict should only contain subdicts and StageParams objects'
@@ -691,6 +701,20 @@ class SessionAnalysisParams:
         return not any(self.get_differing_params_from_file(stage, path, metadata=metadata))
 
 
+    def get_first_nonmatching_stage(self, other: 'SessionAnalysisParams',
+                                    metadata: dict[str, Any]) -> AnalysisStage:
+        """Just identify the first invalid/nonmatching stage compared to another params object"""
+        for last_valid in range(int(AnalysisStage.START) + 1, int(AnalysisStage.FINAL)):
+            curr_stage = AnalysisStage(last_valid)
+            this_stage_params = self.get_params_for_stage(curr_stage)
+            other_stage_params = other.get_params_for_stage(curr_stage)
+
+            if not do_params_match(this_stage_params, other_stage_params, metadata=metadata):
+                return curr_stage
+
+        return AnalysisStage.FINAL
+
+
     # Updating, safely
     def change_params_and_get_stage_to_invalidate(
             self, changes: Mapping[str, Mapping[str, Any]], metadata: dict[str, Any]
@@ -757,7 +781,28 @@ class SessionAnalysisParams:
     
     def read_cnmf_params(self) -> params.CNMFParams:
         """Copy and return CNMFParams object"""
-        return deepcopy(self._cnmf)
+        # fix some fields that aren't relevant/depend on current environment
+        default_params = params.CNMFParams()
+        updates = {
+            'patch': {
+                'n_processes': default_params.patch['n_processes']
+            },
+            'online': {
+                'movie_name_online': default_params.online['movie_name_online'],
+                'path_to_model': default_params.online['path_to_model'],
+                'init_batch': default_params.online['init_batch']
+            }
+        }
+
+        # fix rf and only_init depending on whether we are doing seeded CNMF
+        if self._cnmf_extra.seed_params.type != 'none':
+            updates['patch']['rf'] = None
+            updates['patch']['only_init'] = False
+
+        run_params = deepcopy(self._cnmf)
+        run_params.change_params(updates)
+        return run_params
+
     
     def __repr__(self) -> str:
         dict_rep = self.read_all()

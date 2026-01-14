@@ -11,7 +11,6 @@ install_requires = [
     "msgspec",
     "mslex",
     "nest-asyncio",
-    "roipoly",
     "trycast",
 ]
 

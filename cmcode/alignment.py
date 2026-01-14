@@ -1,5 +1,5 @@
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from itertools import pairwise
 import logging
@@ -824,7 +824,7 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
     template2_shift_guess: (Y, X) amount to shift each plane of template 2 before attempting alignment.
         The resulting remaps will include this shift.
     
-    Ouptupt: (x_remap, y_remap) to be used in remap_image, etc.
+    Ouptput: (x_remap, y_remap) to be used in remap_image, etc.
     """
     dims = template1.shape
     if template2.shape != dims:
@@ -849,13 +849,13 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
             # shift plane2 based on shift guess and adjust borders
             plane2 = ndimage.shift(plane2, template2_shift_guess)
             if guess_y > 0:
-                border.top += math.ceil(guess_y)
+                border = replace(border, top=border.top + math.ceil(guess_y))
             else:
-                border.bottom += math.ceil(-guess_y)
+                border = replace(border, bottom=border.bottom + math.ceil(-guess_y))
             if guess_x > 0:
-                border.left += math.ceil(guess_x)
+                border = replace(border, left=border.left + math.ceil(guess_x))
             else:
-                border.right += math.ceil(-guess_x)
+                border = replace(border, right=border.right + math.ceil(-guess_x))
 
         # get just non-blacked out center to compute transform
         center_slices = border.slices(plane_dims)

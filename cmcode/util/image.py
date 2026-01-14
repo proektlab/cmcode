@@ -1,6 +1,6 @@
 # Plotting/image helpers
 from dataclasses import dataclass
-from functools import partialmethod
+from functools import partialmethod, partial, reduce
 from typing import Union, Sequence, Optional, Callable, Literal
 
 import cv2
@@ -92,14 +92,18 @@ class BorderSpec:
         )
 
     @classmethod
-    def max(cls, border1: Union[int, 'BorderSpec'], border2: Union[int, 'BorderSpec']) -> 'BorderSpec':
+    def max(cls, first: Union[int, 'BorderSpec'], *others: Union[int, 'BorderSpec']) -> 'BorderSpec':
         """Make a BorderSpec for the maximum border along each side"""
-        return cls.combine(max, border1, border2)
+        if isinstance(first, int):
+            first = cls.equal(first)
+        return reduce(partial(cls.combine, max), others, first)
 
     @classmethod
-    def min(cls, border1: Union[int, 'BorderSpec'], border2: Union[int, 'BorderSpec']) -> 'BorderSpec':
+    def min(cls, first: Union[int, 'BorderSpec'], *others: Union[int, 'BorderSpec']) -> 'BorderSpec':
         """Make a BorderSpec for the minimum border along each side"""
-        return cls.combine(min, border1, border2)
+        if isinstance(first, int):
+            first = cls.equal(first)
+        return reduce(partial(cls.combine, min), others, first)
     
     def is_center_nonempty(self, shape: tuple[int, int]) -> bool:
         """Whether there are any pixels left in the center, given shape"""
@@ -329,14 +333,13 @@ def remap_points_from_df(df: pd.DataFrame, x_remap: Optional[np.ndarray],
 
 
 def preprocess_proj_for_seed(mean_img: np.ndarray, med_w: int = 25,
-                         border: Union[int, BorderSpec] = 0, concat_planes = 1) -> np.ndarray:
+                             borders: list[BorderSpec] = [BorderSpec.equal(0)]) -> np.ndarray:
     """Make a brightness-normalized mean image for CNMF seed calculation"""
-    if isinstance(border, int):
-        border = BorderSpec.equal(border)
+    concat_planes = len(borders)
 
     mean_frac_img_planes: list[np.ndarray] = []
     # split apart to process each plane separately
-    for plane in np.split(mean_img, concat_planes, axis=1):
+    for plane, border in zip(np.split(mean_img, concat_planes, axis=1), borders):
         # exclude the border, if any, for normalization
         center_slices = border.slices(plane.shape)
         center_part = plane[center_slices]

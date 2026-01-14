@@ -309,7 +309,7 @@ def my_extract_binary_masks_from_structural_channel(Y,
                                                     blur_gSig_multiple: Optional[float] = None,
                                                     min_area_size: int = 30,
                                                     min_hole_size: int = 15,
-                                                    gSig=5,
+                                                    gSig: Union[int, Sequence[int]] = 5,
                                                     expand_method: str = 'closing',
                                                     selem: np.ndarray = np.ones((3, 3))) -> tuple[csc_array, np.ndarray]:
     """
@@ -349,7 +349,7 @@ def my_extract_binary_masks_from_structural_channel(Y,
         mR:                 np.ndarray
                             mean image used to detect cell boundaries
     """
-    if not hasattr(gSig, '__len__'):
+    if isinstance(gSig, int):
         gSig = (gSig,)
 
     if blur_gSig_multiple is None:
@@ -364,6 +364,7 @@ def my_extract_binary_masks_from_structural_channel(Y,
     for single_gSig in gSig:
         blur_sig = blur_gSig_multiple * single_gSig
         if blur_type == 'box':
+            blur_sig = round(blur_sig)
             img = cv2.blur(mR, (blur_sig, blur_sig))
         else:
             img = cv2.GaussianBlur(mR, (0, 0), blur_sig)
