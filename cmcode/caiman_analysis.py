@@ -1,7 +1,7 @@
 import asyncio
 from collections import Counter
 from dataclasses import asdict
-from datetime import date
+from datetime import date, datetime
 from functools import lru_cache
 import json
 import logging
@@ -286,6 +286,9 @@ class SessionAnalysis:
     @property
     def scan_day(self) -> Optional[date]:
         """Infer what day the scan took place from modified time"""
+        if isinstance(dt := self.metadata['ended_time'], datetime):
+            return dt.date()
+
         if len(self.sbx_files) == 0:
             return None
         
