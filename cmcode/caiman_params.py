@@ -525,10 +525,7 @@ class SessionAnalysisParams:
 
     @classmethod
     def from_dict(cls, input_dict: FullParamDict) -> 'SessionAnalysisParams':
-        """
-        Construct from deserialized or updated dict (like returned from read_all())
-        Must at least have CNMFParams fields.
-        """
+        """Construct from deserialized or updated dict (like returned from read_all())"""
         # remove nb from spatial and temporal so caiman doesn't complain
         spatial_dict = copy(input_dict['spatial'])
         spatial_dict.pop('nb', None)
@@ -785,7 +782,7 @@ class SessionAnalysisParams:
         default_params = params.CNMFParams()
         updates = {
             'patch': {
-                'n_processes': default_params.patch['n_processes']
+                'n_processes': default_params.patch['n_processes']  # set in mesmerize
             },
             'online': {
                 'movie_name_online': default_params.online['movie_name_online'],

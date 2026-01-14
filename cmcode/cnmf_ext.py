@@ -1,6 +1,7 @@
 """Wrappers for CNMF and Estimates classes"""
 from copy import copy
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 import logging
 import math
 import os
@@ -15,7 +16,7 @@ from scipy import sparse
 from scipy.interpolate import PchipInterpolator, interp1d
 from caiman.source_extraction.cnmf import cnmf, params, merging
 
-from cmcode import alignment, caiman_params as cmp
+from cmcode import alignment, caiman_analysis as cma, caiman_params as cmp
 from cmcode.cmcustom import compute_snr_gamma
 from cmcode.util import paths
 
@@ -430,15 +431,25 @@ class CNMFExt(cnmf.CNMF):
             cnmf.save_dict_to_hdf5(obj_dict, filename)
 
 
-def load_CNMFExt(filename: Union[Path, str], n_processes=1, dview=None, quiet=True) -> CNMFExt:
-    logger = logging.getLogger()
+def load_CNMFExt(filename: Union[Path, str], dview=None, quiet=True) -> CNMFExt:
+    logger = logging.getLogger('caiman')
     old_level = logger.level
     if quiet:
         logger.setLevel(logging.WARNING)
-    cnmf_obj = cnmf.load_CNMF(str(filename), n_processes=n_processes, dview=dview)
+    cnmf_obj_ext = _load_CNMFExt(str(filename))
     if quiet:
         logger.setLevel(old_level)
 
+    if dview is not None:
+        cnmf_obj_ext.dview = dview
+
+    return cnmf_obj_ext
+
+
+@lru_cache(maxsize=10)
+def _load_CNMFExt(filename: str) -> CNMFExt:
+    """Cached version of load_CNMFExt"""
+    cnmf_obj = cnmf.load_CNMF(filename)
     cnmf_obj_ext = CNMFExt(copy_from=cnmf_obj)
 
     # to account for not setting crossplane_merge_thr_used previously, set it here if needed
@@ -452,3 +463,7 @@ def load_CNMFExt(filename: Union[Path, str], n_processes=1, dview=None, quiet=Tr
             cnmf_obj_ext.estimates.crossplane_merge_thr_used = saved_params['cnmf_extra'].crossplane_merge_thr
 
     return cnmf_obj_ext
+
+
+def clear_cnmf_cache():
+    _load_CNMFExt.cache_clear()

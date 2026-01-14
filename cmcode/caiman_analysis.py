@@ -1,11 +1,9 @@
 import asyncio
 from collections import Counter
-from copy import copy, deepcopy
 from dataclasses import asdict
 from datetime import date
 from functools import lru_cache
 import json
-from itertools import accumulate
 import logging
 import math
 import os
@@ -31,25 +29,22 @@ import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
 from caiman.base import rois
 from caiman.source_extraction.cnmf.estimates import Estimates
-from caiman.source_extraction.cnmf.params import CNMFParams
 from caiman.source_extraction.cnmf.utilities import detrend_df_f
 from caiman.utils import sbx_utils
 from caiman.utils.visualization import view_quilt
 import mesmerize_core as mc
 from mesmerize_core.algorithms._utils import make_projection_parallel, make_correlation_parallel
-from mesmerize_core.caiman_extensions.cnmf import cnmf_cache
 from mesmerize_core.caiman_extensions.common import Waitable, DummyProcess
-from mesmerize_core.utils import get_params_diffs
 
 from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, caiman_params as cmp
 from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
-from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt
+from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt, clear_cnmf_cache
 # from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
 from cmcode.util import footprints, paths
 from cmcode.util.cluster import Cluster
-from cmcode.util.compat import reconstruct_sessdata_obj
+from cmcode.util.compat import reconstruct_sessdata_obj, infer_params_from_cnmf_run
 from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_files
 from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
@@ -525,8 +520,7 @@ class SessionAnalysis:
             self.cnmf_fit.save(self.cnmf_fit_filename)
             self.write_params_for_result_file(self.cnmf_fit_filename, AnalysisStage.EVAL)
             self._cnmf_changed_flag = False
-        
-        load.cache_clear()
+            clear_cnmf_cache()
 
 
     #--------------------------- PREPROCESSING --------------------------------#
@@ -1450,7 +1444,7 @@ class SessionAnalysis:
             
 
     def select_gridsearch_run(self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
-                              allow_rerunning_prereqs=False, allow_inconsistent_state=True) -> str:
+                              allow_rerunning_prereqs=False) -> str:
         """
         Select a CNMF gridsearch run by either UUID or index in the dataframe, and make it the current run
         Sets params and prerequisite and CNMF outputs to match the selected run
@@ -1458,9 +1452,6 @@ class SessionAnalysis:
 
         allow_rerunning_prereqs: Set to true to re-compute prerequisites (motion correction, etc.) 
             rather than just loading if outputs matching the saved params are not found (or if it's indeterminate)
-        allow_inconsistent_state: Don't error but print a big warning if the params can't be
-            validated with existing saved prerequisites (in this case the params are left as is,
-            possibly not matching the loaded data).
         """
         if index is not None and uuid is not None:
             raise ValueError('Cannot specify both uuid and index')
@@ -1509,50 +1500,29 @@ class SessionAnalysis:
         # Load prerequisites first
         cnmf_path = str(row.cnmf.get_output_path())
         params_path = paths.params_file_for_result(cnmf_path)
-        loading_inconsistent_msg = (
-            'Because allow_inconsistent_state is True, the CNMF result will still be loaded, '
-            'but please be aware that the results may not match current values of params '
-            'and re-running anything may not work as expected.')
 
         try:
             loaded_params = cmp.SessionAnalysisParams.from_dict(cmp.read_params_up_to_stage(AnalysisStage.FINAL, params_path))
-        except FileNotFoundError as e:
-            cannot_determine_msg = (
-                'The parameters for prerequisite stages of the selected run could not be determined conclusively. ')
-
-            if allow_inconsistent_state:
-                logging.warning(cannot_determine_msg + loading_inconsistent_msg)
-                loaded_params = None
-            else:
-                raise RuntimeError(
-                    cannot_determine_msg + 
-                    'You can set allow_inconsistent_state=True to load anyway.') from e
-
-        if loaded_params is not None:
-            # save attributes to restore if this fails
             stage_to_invalidate = self.params.get_first_nonmatching_stage(loaded_params, metadata=self.metadata)
-            backup_attrs = self.invalidate_from_stage(stage_to_invalidate)
-            backup_attrs['params'] = self.params
+            self.invalidate_from_stage(stage_to_invalidate)
             self.params = loaded_params
 
-            try:
-                load = None if allow_rerunning_prereqs else True
-                self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load)
+        except FileNotFoundError:
+            # load partial params from CNMF object
+            logging.info('CNMF params file not found - assuming params not specified in the CNMF object match current params.')
+            cnmf_params_dict = infer_params_from_cnmf_run(cnmf_path)
+            self.update_params(cnmf_params_dict)
 
-            except NoMatchingResultError as e:
-                # restore backed-up attributes
-                for k, v in backup_attrs.items():
-                    setattr(self, k, v)
+        # try loading  or running prerequisites to fill in invalidated data
+        try:
+            load = None if allow_rerunning_prereqs else True
+            self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load)
 
-                cannot_load_msg = 'Cannot load prerequisite results of the selected CNMF run. '
-                if allow_inconsistent_state:
-                    logging.warning(cannot_load_msg + loading_inconsistent_msg)
-                else:
-                    raise RuntimeError(
-                        cannot_load_msg +
-                        'You can run select_gridsearch_run with allow_rerunning_prereqs to recalculate them if you want, '
-                        'or set allow_inconsistent_state=True to load CNMF anyway without re-running.'
-                        ) from e
+        except NoMatchingResultError as e:
+            logging.warning(
+                'Cannot load all prerequisite results of the selected CNMF run. '
+                'The CNMF result will still be loaded, but some functionality may not work '
+                'without re-running to get the missing results (see exception info).', exc_info=e)
 
         self.cnmf_fit_filename = cnmf_path
         cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
@@ -2407,7 +2377,7 @@ def identify_marked_rois(cnmf_obj: CNMFExt, cnmf_filename: Optional[str], A_stru
 
     if cnmf_filename is not None:
         cnmf_obj.save(cnmf_filename)
-        load.cache_clear()
+        clear_cnmf_cache()
     else:
         logging.warning('CNMF not saved - no filename')
 

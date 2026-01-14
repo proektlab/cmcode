@@ -42,7 +42,7 @@ from mesmerize_viz._cnmf import CNMFVizContainer, CNMFDataFrameVizExtension, Eva
 
 import cmcode
 from cmcode import caiman_analysis as cma, alignment
-from cmcode.cnmf_ext import CNMFExt, MetricInfo
+from cmcode.cnmf_ext import CNMFExt, MetricInfo, clear_cnmf_cache
 from cmcode.cmcustom import my_get_contours, my_plot_contours, compute_matching_performance
 from cmcode.mcorr import MCResult
 from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_xy,
@@ -480,7 +480,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
     def _save_eval(self, obj):
         super()._save_eval(obj)
-        cma.load.cache_clear()
+        clear_cnmf_cache()
 
     def _row_changed(self, *args):
         super()._row_changed(*args)

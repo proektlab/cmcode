@@ -5,11 +5,11 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Optional
+from typing import Any, Optional, Mapping
 
 import numpy as np
 
-from cmcode import caiman_analysis as cma, caiman_params as cmp
+from cmcode import caiman_analysis as cma, caiman_params as cmp, cnmf_ext
 from cmcode.util.paths import normalize_path, params_file_for_result
 
 from caiman.source_extraction.cnmf.params import CNMFParams
@@ -307,35 +307,37 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
                 sessdata.invalidate_from_stage(cmp.AnalysisStage.CNMF)
         except FileNotFoundError:
             logging.info('Params file not found for CNMF')
-            mesmerize_index = sessdata.get_selected_index()
-            if mesmerize_index is None:
-                logging.info('Not a mesmerize run - assuming saved parameters are correct & writing missing params file')
-                sessdata.write_params_for_result_file(sessdata.cnmf_fit_filename, cmp.AnalysisStage.CNMF)
+            # find params from the CNMF object itself and write missing params file
+            # assume here that any params not saved with CNMF match what is in the object.
+            cnmf_params = infer_params_from_cnmf_run(sessdata.cnmf_fit_filename)
+
+            # write out params for this CNMF run and get stage of mismatch
+            cnmf_run_params, invalid_stage = sessdata.params.change_params_and_get_stage_to_invalidate(
+                cnmf_params, metadata=sessdata.metadata
+            )
+            params_file = params_file_for_result(sessdata.cnmf_fit_filename)
+            logging.info('Writing missing parameters for CNMF')
+            cnmf_run_params.write_params_for_stage(cmp.AnalysisStage.CNMF, params_file)
+
+            if invalid_stage is None:
+                # It matches, we can update our params (only things that don't matter for comparison)
+                logging.info('CNMF batch item was saved with compatible parameters - updating params')
+                sessdata.params = cnmf_run_params
             else:
-                # read CNMF params from batch file and merge with current params, then write.
-                df = sessdata.get_gridsearch_results()
-                saved_params = df.at[mesmerize_index, 'params']
-                cnmf_params = saved_params['main']
-                # blank out fnames to avoid validation issue
-                cnmf_params['data']['fnames'] = None
+                # don't just invalidate this stage, because we're doing something different here:
+                # we know the given stage doesn't match the CNMF results, not our current params.
+                # If we have params files for previous stages, we know those results do match our params,
+                # so we can keep them. But otherwise, it's ambiguous what happened, so
+                # invalidate from where there is a mismatch to be safe.
+                logging.warning('CNMF batch item was saved with incompatible parameters - invalidating')
+                sessdata.invalidate_from_stage(cmp.AnalysisStage(max(invalid_stage, last_validated_stage)))
 
-                # write out params for this CNMF run and get stage of mismatch
-                cnmf_run_params, invalid_stage = sessdata.params.change_params_and_get_stage_to_invalidate(
-                    cnmf_params, metadata=sessdata.metadata
-                )
-                params_file = params_file_for_result(sessdata.cnmf_fit_filename)
-                logging.info('Writing missing parameters for CNMF')
-                cnmf_run_params.write_params_for_stage(cmp.AnalysisStage.CNMF, params_file)
 
-                if invalid_stage is None:
-                    # It matches, we can update our params (only things that don't matter for comparison)
-                    logging.info('CNMF batch item was saved with compatible parameters - updating params')
-                    sessdata.params = cnmf_run_params
-                else:
-                    # don't just invalidate this stage, because we're doing something different here:
-                    # we know the given stage doesn't match the CNMF results, not our current params.
-                    # If we have params files for previous stages, we know those results do match our params,
-                    # so we can keep them. But otherwise, it's ambiguous what happened, so
-                    # invalidate from where there is a mismatch to be safe.
-                    logging.warning('CNMF batch item was saved with incompatible parameters - invalidating')
-                    sessdata.invalidate_from_stage(cmp.AnalysisStage(max(invalid_stage, last_validated_stage)))
+def infer_params_from_cnmf_run(cnmf_filename: str) -> dict[str, dict[str, Any]]:
+    """Find what info we can about the params used to produce a CNMF results file"""
+    # use the params saved with the CNMF object
+    cnmf = cnmf_ext.load_CNMFExt(cnmf_filename)
+    cnmf_params = cnmf.params.to_dict()
+    # blank out fnames to avoid data validation issue
+    cnmf_params['data']['fnames'] = None
+    return cnmf_params
