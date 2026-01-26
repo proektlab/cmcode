@@ -898,22 +898,23 @@ class SessionAnalysis:
         if projection_params is None:
             ind = self.get_selected_index()
             if ind is None:
-                raise RuntimeError('No selected CNMF run; cannot use seed projection')
-
-            item = self.get_gridsearch_results().iloc[ind]
-            output_path: Path = item.cnmf.get_output_path()
-            proj_path = output_path.parent / 'projection_for_seed.npy'
-            if proj_path.exists():
-                full_proj = np.load(proj_path)
-                plane_projs = np.split(full_proj, self.metadata['num_planes'], axis=1)
-                if exclude_border:
-                    cnmf = load_CNMFExt(item.cnmf.get_output_path(), quiet=True)
-                    border = cnmf.params.patch['border_pix']
-                    plane_projs = [plane[BorderSpec.equal(border).slices(plane.shape)] for plane in plane_projs]
-            else:
-                # fall back to recomputing based on seed_params
-                logging.warning(f'projection_for_seed not saved - recomputing with params {self.seed_params}')
+                logging.warning(f'No selected CNMF run; computing with seed params {self.seed_params}')
                 plane_projs = self.get_plane_projections(self.seed_params, exclude_border=exclude_border)
+            else:
+                item = self.get_gridsearch_results().iloc[ind]
+                output_path: Path = item.cnmf.get_output_path()
+                proj_path = output_path.parent / 'projection_for_seed.npy'
+                if proj_path.exists():
+                    full_proj = np.load(proj_path)
+                    plane_projs = np.split(full_proj, self.metadata['num_planes'], axis=1)
+                    if exclude_border:
+                        cnmf = load_CNMFExt(item.cnmf.get_output_path(), quiet=True)
+                        border = cnmf.params.patch['border_pix']
+                        plane_projs = [plane[BorderSpec.equal(border).slices(plane.shape)] for plane in plane_projs]
+                else:
+                    # fall back to recomputing based on seed_params
+                    logging.warning(f'projection_for_seed not saved - recomputing with params {self.seed_params}')
+                    plane_projs = self.get_plane_projections(self.seed_params, exclude_border=exclude_border)
         else:
             plane_projs = self.get_plane_projections(projection_params, exclude_border=exclude_border)
 

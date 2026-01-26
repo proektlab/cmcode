@@ -1,6 +1,6 @@
 # Plotting/image helpers
 from dataclasses import dataclass
-from functools import partialmethod
+from functools import partialmethod, partial, reduce
 from typing import Union, Sequence, Optional, Callable, Literal
 
 import cv2
@@ -92,14 +92,18 @@ class BorderSpec:
         )
 
     @classmethod
-    def max(cls, border1: Union[int, 'BorderSpec'], border2: Union[int, 'BorderSpec']) -> 'BorderSpec':
+    def max(cls, first: Union[int, 'BorderSpec'], *others: Union[int, 'BorderSpec']) -> 'BorderSpec':
         """Make a BorderSpec for the maximum border along each side"""
-        return cls.combine(max, border1, border2)
+        if isinstance(first, int):
+            first = cls.equal(first)
+        return reduce(partial(cls.combine, max), others, first)
 
     @classmethod
-    def min(cls, border1: Union[int, 'BorderSpec'], border2: Union[int, 'BorderSpec']) -> 'BorderSpec':
+    def min(cls, first: Union[int, 'BorderSpec'], *others: Union[int, 'BorderSpec']) -> 'BorderSpec':
         """Make a BorderSpec for the minimum border along each side"""
-        return cls.combine(min, border1, border2)
+        if isinstance(first, int):
+            first = cls.equal(first)
+        return reduce(partial(cls.combine, min), others, first)
     
     def is_center_nonempty(self, shape: tuple[int, int]) -> bool:
         """Whether there are any pixels left in the center, given shape"""
@@ -212,9 +216,20 @@ def make_merge(im1: np.ndarray, im2: np.ndarray,
 
 
 def shift_image(image: np.ndarray, x_shift: float, y_shift: float) -> np.ndarray:
-    """Shfit image by a number of pixels in X and Y"""
+    """Shift image by a number of pixels in X and Y"""
     shifts = (y_shift, x_shift)
     return ndimage.shift(image, shifts)
+
+
+def shift_image_location(image: np.ndarray, start_loc: ScaledDataFrame, end_loc: ScaledDataFrame):
+    """Shift image from start_loc to end_loc (both must have a single row)"""
+    if start_loc.shape[0] != 1 or end_loc.shape[0] != 1:
+        raise ValueError('start_loc and end_loc must both have a single row')
+
+    start_pixels = start_loc.to_pixels().loc[:, ['x', 'y']].to_numpy().ravel()
+    end_pixels = end_loc.to_pixels().loc[:, ['x', 'y']].to_numpy().ravel()
+    x_shift, y_shift = end_pixels - start_pixels
+    return shift_image(image, x_shift=x_shift, y_shift=y_shift)
 
 
 def remap_image(image: np.ndarray, x_remap: Optional[np.ndarray], y_remap: Optional[np.ndarray]):

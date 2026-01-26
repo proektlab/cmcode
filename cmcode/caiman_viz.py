@@ -47,9 +47,10 @@ from cmcode.cmcustom import my_get_contours, my_plot_contours, compute_matching_
 from cmcode.mcorr import MCResult
 from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_xy,
                                     map_footprints, maxproj_per_cell, footprint_interpolator_per_cell)
-from cmcode.util.image import remap_image, make_merge, BorderSpec, preprocess_proj_for_seed
+from cmcode.util.image import remap_image, shift_image_location, make_merge, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files
 from cmcode.util.types import MaybeSparse
+from cmcode.util.scaled import ScaledDataFrame
 
 pn.extension()
 hv.extension('bokeh')  # type: ignore
@@ -867,6 +868,76 @@ def make_rgb_frame_apply(rgb_image: np.ndarray) -> tuple[np.ndarray, Callable[[n
     def rgb_frame_apply(frame: np.ndarray) -> np.ndarray:
         return np.reshape(frame, frame.shape[:-1] + (frame.shape[-1] // n_chan, n_chan), order='C')
     return image_flat, rgb_frame_apply
+
+
+def make_template_registration_gridplot(
+        mouse_id: Union[str, int], sess_ids: Sequence[int], registration_info: Union[None, np.ndarray, ScaledDataFrame],
+        tags: Union[None, Sequence[Optional[str]]] = None, rec_type='learning_ppc',
+        projection_params: Optional[Union[str, dict]] = None, from_color='m', to_color='g'):
+    """
+    Make a grid of Z-max merge images after registration between all pairs of given sessions.
+    
+    registration_info can be:
+        * a len(sess_ids) x len(sess_ids)-1 x ... array of nonrigid remappings,
+          as returned from load_or_compute_remaps_for_sessions
+        * a ScaledDataFrame containing rigid relative x/y locations for each session,
+          as returned from load_offsets_for_sessions or guess_yx_positions_multiple
+        * None to just plot merge images with no registration.
+
+    If projection_params is not provided, there must be a saved seed projection from a CNMF
+    run for each session.
+    """
+    if tags is None:
+        tags = [None] * len(sess_ids)
+
+    # validated registration_info
+    if isinstance(registration_info, np.ndarray):
+        if registration_info.shape[:2] != (len(sess_ids), len(sess_ids) - 1):
+            raise ValueError('registration_info has the wrong leading shape (should be (n_sess, n_sess-1))')
+        corrected_str = 'nonrigid aligned'
+    elif isinstance(registration_info, ScaledDataFrame):
+        corrected_str = 'rigid aligned'
+    else:
+        if registration_info is not None:
+            raise TypeError(f'Unexpected type {type(registration_info)} of registration_info')
+        corrected_str = 'not aligned'
+
+    # load all projections
+    z_projections: list[np.ndarray] = []
+    for sess_id, tag in zip(sess_ids, tags):
+        sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
+        z_projections.append(sessinfo.get_zmax_projection(projection_params))
+    
+    # make each plot
+    with mplstyle.context('dark_background'):
+        fig, axss = plt.subplots(len(sess_ids), len(sess_ids), sharex=True, sharey=True, squeeze=False)
+        fig.suptitle(f'Mouse {mouse_id}, {rec_type}, {corrected_str}')
+        for kFrom, (axs, from_proj) in enumerate(zip(axss, z_projections)):
+            for kTo, (ax, to_proj) in enumerate(zip(axs, z_projections)):
+                if kFrom == kTo:
+                    ax.imshow(from_proj, cmap='gray',
+                              vmin=float(np.percentile(from_proj, 40)),
+                              vmax=float(np.percentile(from_proj, 99.7)))
+                    ax.set_title(f'Session {sess_ids[kFrom]}{tags[kFrom] or ""}')
+                else:
+                    if isinstance(registration_info, np.ndarray):
+                        x_remap, y_remap = registration_info[kFrom, kTo if kTo < kFrom else kTo-1]
+                        from_mapped = remap_image(from_proj, x_remap=x_remap, y_remap=y_remap)
+
+                    elif isinstance(registration_info, ScaledDataFrame):
+                        # shift by the difference between locations in pixels (to - from)
+                        from_mapped = shift_image_location(from_proj, start_loc=registration_info[kFrom], end_loc=registration_info[kTo])
+                        
+                    else:
+                        from_mapped = from_proj
+                    
+                    merge = make_merge(from_mapped, to_proj, color1=from_color, color2=to_color)
+                    ax.imshow(merge)
+                    ax.set_title(f'{sess_ids[kFrom]}{tags[kFrom] or ""} ({from_color}) to '
+                                 f'{sess_ids[kTo]}{tags[kTo] or ""}')
+                ax.set_axis_off()
+    fig.tight_layout()
+    return fig
 
 
 def my_check_register_ROIs(matched1: list[int],

@@ -50,6 +50,7 @@ class MCResult(CustomPathMappable):
     mmap_files: list[str]
     mmap_file_transposed: str
     border_to_0: int
+    border_asym: list[BorderSpec]  # border on each side (old results just repeat border_to_0)
     shifts_rig: list[np.ndarray]
     shifts_els: Optional[list[np.ndarray]] = None
     dims: Optional[tuple[int, int]] = None
@@ -90,6 +91,10 @@ class MCResult(CustomPathMappable):
         for hv_field in ['_shifts_rig_hv', '_shifts_els_hv']:
             if hv_field not in state: 
                 state[hv_field] = None
+
+        if 'border_asym' not in state:
+            state['border_asym'] = [BorderSpec.equal(state['border_to_0'])] * len(state['mmap_files'])
+
         self.__dict__.update(state)
 
     def __setattr__(self, name, val):

@@ -778,7 +778,7 @@ def load_offsets_for_sessions(mouse_id: Union[int, str], sess_ids: Sequence[int]
     # load each SessionAnalysis to figure out how to index the offsets and convert from um to pixels
     rec_dates: list[date] = []
     um_per_pixel = None
-    for i, (sess_id, tag) in enumerate(zip(sess_ids_uniq, tags)):
+    for sess_id, tag in zip(sess_ids_uniq, tags):
         sessinfo = cma.load_latest(mouse_id, sess_id, rec_type=rec_type, tag=tag, quiet=True)
         this_um_per_pixel = {
             'x': sessinfo.metadata['um_per_pixel_x'],
@@ -1058,22 +1058,11 @@ def load_remaps_allpairs(mapping_path: str, sess_names: Sequence[str]) -> tuple[
             file_sess_inds = [file_sess_names.index(name) for name, found in zip(sess_names, b_found) if found]
 
             # rebuild mapping matrix by selectively copying from file
-            all_mappings = []
+            xy_remaps = np.empty_like(mapping_f['xy_remaps'],
+                                      shape=(len(file_sess_inds), len(file_sess_inds)-1) + mapping_f['xy_remaps'].shape[2:])
             for i, ind1 in enumerate(file_sess_inds):
-                mappings: list[Optional[np.ndarray]] = [None] * len(file_sess_inds)
-                for j in range(len(file_sess_inds)):
-                    if i == j:
-                        continue
-
-                    if j > i:
-                        ind2 = file_sess_inds[j-1]
-                    else:
-                        ind2 = file_sess_inds[j]
-
-                    mappings[j] = mapping_f['xy_remaps'][ind1, ind2]
-                mappings.pop(i)  # compress by removing self-mapping
-                all_mappings.append(mappings)
-            xy_remaps = np.array(all_mappings)
+                for j, ind2 in enumerate(file_sess_inds[:i] + file_sess_inds[i+1:]):  # j = index when excluding self-mapping
+                    xy_remaps[i, j, ...] = mapping_f['xy_remaps'][ind1, ind2 if ind2 < ind1 else ind2-1]
 
     return b_found, xy_remaps
 
@@ -1081,7 +1070,9 @@ def load_remaps_allpairs(mapping_path: str, sess_names: Sequence[str]) -> tuple[
 def load_or_compute_remaps_for_sessions(
         mouse_id: Union[int, str], sess_ids: Sequence[int], rec_type='learning_ppc', tags: Union[None, Sequence[Optional[str]]] = None,
         grouptag: Optional[str] = None, use_saved_mappings: Optional[bool] = None,
-        save_mappings_with_grouptag: Optional[bool] = None, rigid_offsets: Optional[ScaledDataFrame] = None) -> tuple[np.ndarray, str]:
+        save_mappings_with_grouptag: Optional[bool] = None, rigid_offsets: Optional[ScaledDataFrame] = None,
+        max_initial_shift=50, max_additional_shift=10, max_deviation_rigid=6,
+        projection_params: Optional[Union[str, dict]] = None) -> tuple[np.ndarray, str]:
     """
     Helper to load nonrigid mappings between sessions for the given sessions (based on sess_ids and tags), or compute them if they
     are not saved. If computing mappings, rigid_offsets will be used for the initial guesses if it is not None.
@@ -1144,20 +1135,24 @@ def load_or_compute_remaps_for_sessions(
     elif use_saved_mappings is None:
         logging.info('Computing mappings for any/all missing sessions')
 
-    logging.info('Loading GCaMP z-stack for each session')
+    logging.info('Loading z-stack for each session')
     templates, borders = get_zmax_templates_and_borders_multisession(
-        mouse_id, sess_ids, rec_type=rec_type, tags=tags)
+        mouse_id, sess_ids, rec_type=rec_type, tags=tags,
+        include_dead_pixel_border=True, projection_params=projection_params)
 
     if rigid_offsets is not None:
         logging.info('Using saved rigid X/Y offsets')
-        yx_position_guesses = rigid_offsets.loc[list(sess_ids), ['y', 'x']].to_pixels().to_numpy()
+        yx_pos_df = rigid_offsets.loc[list(sess_ids), :]
     else:
         logging.info('Estimating rigid X/Y offsets')
-        yx_position_guesses = guess_yx_positions_multiple(templates, borders=borders)
+        yx_pos_df = guess_yx_positions_multiple(templates, borders=borders, max_shift=max_initial_shift)
+        
+    yx_position_guesses = yx_pos_df.loc[:, ['y', 'x']].to_pixels().to_numpy()
 
     # compute every pair
     logging.info('Estimating nonrigid X/Y mappings')
-    align_options = {'max_shifts': (10, 10), 'max_deviation_rigid': 6}
+    align_options = {'max_shifts': (max_additional_shift, max_additional_shift),
+                     'max_deviation_rigid': max_deviation_rigid}
     xy_remaps = align_templates_allpairs(
         templates, borders, align_options=align_options, yx_position_guesses=yx_position_guesses,
         precomputed_remaps=xy_remaps, precomputed_mask=mappings_found)
@@ -1228,7 +1223,7 @@ def align_templates_multisession(
 
 
 def guess_yx_positions_multiple(templates: Sequence[np.ndarray], n_planes=1, max_shift=50,
-                                borders: Optional[Sequence[Union[BorderSpec, int]]] = None) -> np.ndarray:
+                                borders: Optional[Sequence[Union[BorderSpec, int]]] = None) -> ScaledDataFrame:
     """
     Use rigid correction with generous max shift to get an initial estimate of relative X/Y 
     offsets of a sequence of templates. The output is a len(templates) x 2 matrix of relative
@@ -1245,7 +1240,7 @@ def guess_yx_positions_multiple(templates: Sequence[np.ndarray], n_planes=1, max
         # subtract guessed offset of last one relative to next one from position of last one
         pos_guesses.append(pos_guesses[-1] - np.array([y_remap[0, 0], x_remap[0, 0]]))
     
-    return np.stack(pos_guesses)
+    return make_pixel_df(pos_guesses, dim_names=['y', 'x'])
 
 
 @dataclass
@@ -1902,20 +1897,36 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: ArrayLike, s
 
 def get_zmax_templates_and_borders_multisession(
         mouse_id: Union[int, str], sess_ids: Sequence[int], rec_type='learning_ppc',
-        tags: Union[None, Sequence[Optional[str]]] = None) -> tuple[list[np.ndarray], list[int]]:
+        tags: Union[None, Sequence[Optional[str]]] = None, projection_params: Optional[Union[str, dict]] = None,
+        include_dead_pixel_border=False) -> tuple[list[np.ndarray], list[BorderSpec]]:
     """Load max-z templates and borders for a series of sessions (helper for register_ROIS_multisession_3D)"""
     if tags is None:
         tags = [None] * len(sess_ids)
     
     templates: list[np.ndarray] = []
-    borders: list[int] = []
+    borders: list[BorderSpec] = []
     for sess_id, tag in zip(sess_ids, tags):
         sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
-        templates.append(sessinfo.get_zmax_projection())
+        templates.append(sessinfo.get_zmax_projection(projection_params=projection_params))
 
         if sessinfo.mc_result is None:
-            raise RuntimeError('Motion correction not run?') 
-        borders.append(sessinfo.mc_result.border_to_0)
+            raise RuntimeError('Motion correction not run?')
+        
+        plane_borders: list[BorderSpec] = sessinfo.mc_result.border_asym
+        border = BorderSpec.max(*plane_borders)
+
+        if include_dead_pixel_border:
+            # add border on left corresponding to dead pixels
+            ndead = sessinfo.odd_row_ndeads
+            offset = sessinfo.odd_row_offset
+            crop = sessinfo.crop
+
+            ndead_max = 0 if ndead is None else max(ndead)
+            shift_max = 0 if offset is None else math.ceil(abs(offset) / 2)
+            n_to_clip = max(ndead_max + shift_max - crop.left, 0)
+            border = BorderSpec.max(border, BorderSpec(left=n_to_clip))
+
+        borders.append(border)
     return templates, borders
 
 

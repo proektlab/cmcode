@@ -355,7 +355,10 @@ def my_extract_binary_masks_from_structural_channel(Y,
     features_added = 0
 
     for single_gSig in gSig:
-        img = cv2.GaussianBlur(mR, (0, 0), blur_gSig_multiple * single_gSig)
+        if blur_gSig_multiple > 0:
+            img = cv2.GaussianBlur(mR, (0, 0), blur_gSig_multiple * single_gSig)
+        else:
+            img = np.copy(mR)
         img = (img - np.min(img)) / (np.max(img) - np.min(img)) * 255.
         img = img.astype(np.uint8)
 
