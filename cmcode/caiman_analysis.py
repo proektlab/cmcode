@@ -546,13 +546,10 @@ class SessionAnalysis:
                 self.save(save_cnmf=False)
         else:
             try:
-                if not self.cnmf_params.motion['pw_rigid']:
-                    # take left border into account (i.e. exclude it) if applicable
-                    ndead_max = 0 if self.odd_row_ndeads is None else max(self.odd_row_ndeads)
-                    shift_max = 0 if self.odd_row_offset is None else math.ceil(abs(self.odd_row_offset) / 2)
-                    n_to_clip = ndead_max + shift_max
-                else:
-                    n_to_clip = 0  # can't apply piecewise shifts to different-size movie (doesn't make sense)
+                # take left border into account (i.e. exclude it) if applicable
+                ndead_max = 0 if self.odd_row_ndeads is None else max(self.odd_row_ndeads)
+                shift_max = 0 if self.odd_row_offset is None else math.ceil(abs(self.odd_row_offset) / 2)
+                n_to_clip = ndead_max + shift_max
 
                 inds = list(self.cnmf_params.motion['indices'])
                 if n_to_clip > 0:
