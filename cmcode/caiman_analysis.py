@@ -21,6 +21,7 @@ import matplotlib as mpl
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
+import matplotlib.style as mplstyle
 import numpy as np
 import pandas as pd
 from pandas._libs.missing import NAType
@@ -53,10 +54,10 @@ from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
 from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt
 from cmcode.mcorr import PiecewiseMCInfo, MCResult  # to allow unpickling
-from cmcode.util import footprints, paths
+from cmcode.util import footprints, paths, naming
 from cmcode.util.cluster import Cluster
 from cmcode.util.compat import reconstruct_sessdata_obj
-from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed
+from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed, imshow_scaled
 from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_files
 from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
 from cmcode.util.types import NoBatchFileError, MaybeSparse, NoMatchingResultError, MescoreBatch, MescoreSeries
@@ -152,7 +153,7 @@ def get_spatial_seed_name(seed_params: dict) -> str:
     return Ain_name
 
 
-def get_batch_for_session(mouse_id: Union[int, str] = 0, sess_id=0, rec_type='learning_ppc',
+def get_batch_for_session(mouse_id: Union[int, str], sess_id: Union[int, str], rec_type='learning_ppc',
                           tag: Optional[str] = None, data_dir: Optional[str] = None, create=True) -> MescoreBatch:
     """
     Locate directory to save dataframe and make the dataframe with name corresponding to
@@ -163,8 +164,14 @@ def get_batch_for_session(mouse_id: Union[int, str] = 0, sess_id=0, rec_type='le
     if data_dir is None:
         data_dir = paths.get_processed_dir(mouse_id, rec_type=rec_type, create_if_not_found=create)
 
-    tagstr = '_' + tag if tag is not None else ''
-    batch_name = f'{mouse_id}_{sess_id:03d}{tagstr}_batch.pickle'
+    if isinstance(sess_id, str):
+        if tag is not None:
+            raise ValueError('Cannot pass both a string sess_id and a tag')
+        sess_name = naming.format_sess_name(sess_id, underscore=True, zero_padded=True)
+    else:
+        sess_name = naming.make_sess_name(sess_id, tag, underscore=True, zero_padded=True)
+    
+    batch_name = f'{mouse_id}_{sess_name}_batch.pickle'
     batch_path = Path(data_dir) / 'cnmf' / batch_name
     if batch_path.exists():
         return cast(MescoreBatch, mc.load_batch(batch_path))
@@ -206,6 +213,8 @@ class SessionAnalysis:
             if tag == '':
                 logging.warning('Empty string tag is interpreted as no tag (just use None)')
                 tag = None
+            elif tag is not None and (tag[0].isnumeric() or tag[0] == '_'):
+                raise ValueError('Tag cannot start with a digit or underscore due to potential ambiguity')
 
             self.tag_base: Optional[str] = tag
             if downsample_factor is None:
@@ -558,15 +567,17 @@ class SessionAnalysis:
                 shifts: list[np.ndarray] = []
                 shifts_els: Optional[list[np.ndarray]] = []
                 max_b20 = 0
+                borders_asym: list[BorderSpec] = []
         
                 any_new = False
                 for k_plane, plane_tif in enumerate(self.plane_tifs):
                     logging.info(f'Correcting plane {k_plane}')
-                    mmap_file, this_shifts, b20, this_shifts_els, new_result = mcorr.motion_correct_file(
+                    mmap_file, this_shifts, b20, border_asym, this_shifts_els, new_result = mcorr.motion_correct_file(
                         plane_tif, self.cnmf_params, cluster_args=self.cluster_args, force=force)
                     mmap_files.append(mmap_file)
                     shifts.append(this_shifts)
                     max_b20 = max(max_b20, b20)
+                    borders_asym.append(border_asym)
                     if this_shifts_els is not None:
                         shifts_els.append(this_shifts_els)
                     any_new = any_new or new_result
@@ -579,7 +590,7 @@ class SessionAnalysis:
 
                 self.mc_result = MCResult(
                     mmap_files=mmap_files, mmap_file_transposed=mmap_file_transposed,
-                    border_to_0=max_b20, shifts_rig=shifts, shifts_els=shifts_els,
+                    border_to_0=max_b20, border_asym=borders_asym, shifts_rig=shifts, shifts_els=shifts_els,
                     dims=self.plane_size, motion_params=self.cnmf_params.motion)
             except:
                 # remove final result file to ensure we don't erroneously think we're done
@@ -701,20 +712,19 @@ class SessionAnalysis:
         n_planes = self.metadata['num_planes']
         figs: list[Figure] = []
 
-        for proj_type, type_label in zip(('mean', 'corr'), ('mean projection', 'correlation')):
-            fig, axss = plt.subplots(2, n_planes, figsize=(3*n_planes, 6), sharex=True, sharey=True, squeeze=False)
-            tagstr = '/' + self.tag if self.tag else ''
-            fig.suptitle(f'Mouse {self.mouse_id}, session {self.sess_id}{tagstr}, {type_label}')
+        with mplstyle.context('dark_background'):
+            for proj_type, type_label in zip(('mean', 'corr'), ('mean projection', 'correlation')):
+                fig, axss = plt.subplots(2, n_planes, figsize=(3*n_planes, 6), sharex=True, sharey=True, squeeze=False)
+                tagstr = '/' + self.tag if self.tag else ''
+                fig.suptitle(f'Mouse {self.mouse_id}, session {self.sess_id}{tagstr}, {type_label}')
 
-            for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
-                plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected)
+                for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
+                    plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected)
 
-                for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
-                        ax.imshow(plane_proj, cmap='viridis',
-                                    vmin=np.percentile(np.ravel(plane_proj), 50), 
-                                    vmax=np.percentile(np.ravel(plane_proj), 99.5))
+                    for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
+                        imshow_scaled(ax, plane_proj)
                         ax.set_title(f'Plane {k_plane} ({corrected_label})')
-            figs.append(fig)
+                figs.append(fig)
         return figs[0], figs[1]
 
 
@@ -1353,7 +1363,7 @@ class SessionAnalysis:
 
         # make CSC matrix and save
         n_rois = len(rois.rois)
-        masks_lil = sparse.lil_array((n_rois, corr_concat.size), dtype=bool)
+        masks_lil = sparse.lil_array((n_rois, corr_concat.size), dtype=np.bool_)
         b_keep = np.ones(n_rois, dtype=bool)  # for excluding empty masks
         for i, roi in enumerate(rois.rois.values()):
             mask = roi.get_mask(corr_concat).ravel(order='F')
@@ -2197,12 +2207,19 @@ class SessionAnalysis:
         return save_paths
 
 
-def get_session_analysis_file_pattern(mouse_id: Union[str, int], sess_id: int,
+def get_session_analysis_file_pattern(mouse_id: Union[str, int], sess_id: Union[int, str],
                                       tag: Optional[str], downsample_factor: Optional[int] = None) -> str:
-    tagstr = '_' + tag if tag else ''
+    if isinstance(sess_id, str):
+        if tag is not None:
+            raise ValueError('Cannot pass both a string sess_id and a tag')
+        sess_name = naming.format_sess_name(sess_id, underscore=True, zero_padded=True)
+    else:
+        sess_name = naming.make_sess_name(sess_id, tag, underscore=True, zero_padded=True)
+
     if downsample_factor is not None:
-        tagstr = tagstr + f'_ds{downsample_factor}'
-    return f'{mouse_id}_{sess_id:03d}{tagstr}_%dt.pkl'
+        sess_name = sess_name + f'_ds{downsample_factor}'
+
+    return f'{mouse_id}_{sess_name}_%dt.pkl'
 
 
 @lru_cache  # must clear cache when new CNMF results are saved!
@@ -2242,7 +2259,7 @@ def load_cnmf(cnmf_filename: str, metadata: dict, quiet=True) -> Optional[CNMFEx
         return cnmf_obj
 
 
-def load_latest(mouse_id: Union[int, str], sess_id: int, rec_type: str = 'learning_ppc',
+def load_latest(mouse_id: Union[int, str], sess_id: Union[int, str], rec_type: str = 'learning_ppc',
                 tag: Optional[str] = None, downsample_factor: Optional[int] = None,
                 quiet=True, lazy=True) -> SessionAnalysis:
     """Load latest saved analysis for given mouse/session/tag"""

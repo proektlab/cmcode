@@ -11,7 +11,7 @@ import os
 import psutil
 import re
 import shutil
-from typing import Optional, Generator, ParamSpec
+from typing import Optional, Generator, ParamSpec, cast
 
 import caiman as cm
 from caiman.base.movies import get_file_size
@@ -271,13 +271,26 @@ def set_output_location(output_path: str) -> Generator[None, None, None]:
             del os.environ['CAIMAN_TEMP']
 
 
+def compute_border_asym(shifts: np.ndarray) -> BorderSpec:
+    """
+    Given shifts array with dimension along the first axis, compute asymmetric border
+    (max border on each side, rounding up to the nearest integer).
+    """
+    max_top = max(0, int(np.ceil(np.max(shifts[0]))))
+    max_bottom = max(0, -int(np.ceil(np.max(-shifts[0]))))
+    max_left = max(0, int(np.ceil(np.max(shifts[1]))))
+    max_right = max(0, -int(np.ceil(np.max(-shifts[1]))))
+    return BorderSpec(top=max_top, bottom=max_bottom, left=max_left, right=max_right)
+
+
 def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optional[dict] = None, force: bool = False
-                         ) -> tuple[str, np.ndarray, int, Optional[np.ndarray], bool]:
+                         ) -> tuple[str, np.ndarray, int, BorderSpec, Optional[np.ndarray], bool]:
     """
     Runs motion correction on the given file and returns:
         - path(s) to the mmap file(s),
         - rigid shifts
         - border pixels
+        - BorderSpec for border on each side (border_asym)
         - nonrigid shifts (if doing pw_rigid)
         - whether a new result was computed (always True if force is True)
     """
@@ -299,7 +312,17 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
                 shifts_els = piecewise_info.shifts_els if piecewise_info is not None else None
             else:
                 shifts_els = None
-        return expected_file, shifts_rig, border_to_0, shifts_els, False
+
+            if 'border_asym' in info:
+                border_asym = cast(BorderSpec, info['border_asym'].item())
+            else:
+                # compute from shifts
+                if shifts_els is None:
+                    border_asym = compute_border_asym(shifts_rig)
+                else:
+                    border_asym = compute_border_asym(shifts_els)              
+
+        return expected_file, shifts_rig, border_to_0, border_asym, shifts_els, False
     
     if parent_process() is None and cluster_args is not None:
         cma.cluster.start(**cluster_args)
@@ -326,13 +349,15 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
         if hasattr(mcorr_obj, 'z_shifts_els'):
             shifts.append(mcorr_obj.z_shifts_els)
         shifts_els = np.array(shifts)
+        border_asym = compute_border_asym(shifts_els)
     else:
         shifts_els = None
+        border_asym = compute_border_asym(shifts_rig)
     
     np.savez(expected_info_file, shifts_rig=shifts_rig, border_to_0=mcorr_obj.border_to_0,
-             shifts_els=np.array(shifts_els))
+             shifts_els=np.array(shifts_els), border_asym=np.array(border_asym))
 
-    return expected_file, shifts_rig, int(mcorr_obj.border_to_0), shifts_els, True
+    return expected_file, shifts_rig, int(mcorr_obj.border_to_0),  border_asym, shifts_els, True
 
 
 def apply_mcorr_to_file(mcorr_obj: MotionCorrect, input_file: str) -> str:

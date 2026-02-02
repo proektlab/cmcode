@@ -12,6 +12,7 @@ dependencies:
 - nest-asyncio
 - ipympl
 - pip
+- scipy-typed
 - pip:
   - mesmerize-viz
   - roipoly

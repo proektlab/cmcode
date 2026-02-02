@@ -4,6 +4,8 @@ from functools import partialmethod, partial, reduce
 from typing import Union, Sequence, Optional, Callable, Literal
 
 import cv2
+from matplotlib.axes import Axes
+import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import ArrayLike
 import pandas as pd
@@ -173,7 +175,8 @@ class BorderSpec:
         return mask.ravel(order=order)
 
 
-def colorize(im: np.ndarray, color: Union[Sequence[float], str], clip_percentile=0.1) -> np.ndarray:
+def colorize(im: np.ndarray, color: Union[Sequence[float], str],
+             clip_percentile: Union[float, tuple[float, float]] = (40, 99.7)) -> np.ndarray:
     """
     Helper function to create an RGB image from a single-channel image using a 
     specific color.
@@ -192,9 +195,12 @@ def colorize(im: np.ndarray, color: Union[Sequence[float], str], clip_percentile
     else:
         color_seq = color
 
+    if not isinstance(clip_percentile, Sequence):
+        clip_percentile = (clip_percentile, 100-clip_percentile)
+
     # Rescale the image according to how we want to display it
-    im_scaled = im.astype(np.float32) - np.percentile(im, clip_percentile)
-    im_scaled = im_scaled / np.percentile(im_scaled, 100 - clip_percentile)
+    im_scaled = im.astype(np.float32) - np.percentile(im, clip_percentile[0])
+    im_scaled = im_scaled / np.percentile(im_scaled, clip_percentile[1])
     im_scaled = np.clip(im_scaled, 0, 1)
     
     # Need to make sure we have a channels dimension for the multiplication to work
@@ -208,7 +214,7 @@ def colorize(im: np.ndarray, color: Union[Sequence[float], str], clip_percentile
 def make_merge(im1: np.ndarray, im2: np.ndarray,
                color1: Union[Sequence[float], str] = 'g',
                color2: Union[Sequence[float], str] = 'r',
-               clip_percentile=0.1) -> np.ndarray:
+               clip_percentile: Union[float, tuple[float, float]] = (40, 99.7)) -> np.ndarray:
     # colorize 2 images and merge them
     rgb1 = colorize(im1, color1, clip_percentile=clip_percentile)
     rgb2 = colorize(im2, color2, clip_percentile=clip_percentile)
@@ -362,3 +368,30 @@ def preprocess_proj_for_seed(mean_img: np.ndarray, med_w: int = 25,
         plane_corrected[center_slices] = mean_frac_img
         mean_frac_img_planes.append(plane_corrected)
     return np.concatenate(mean_frac_img_planes, axis=1)
+
+
+def calc_weighted_median(data: np.ndarray, weights: np.ndarray, axis=0):
+    """See: https://github.com/nudomarinero/wquantiles/blob/master/wquantiles.py"""
+    ind_sorted = np.argsort(data, axis=axis)
+    data_sorted = np.take_along_axis(data, ind_sorted, axis=axis)
+    weights_sorted = weights[ind_sorted]
+
+    Sn = np.cumsum(weights_sorted, axis=axis)
+    Pn = (Sn - 0.5 * weights_sorted) / np.take(Sn, -1, axis=axis)
+
+    # loop to use np.interp on vectors
+    Ni, Nj = data.shape[:axis], data.shape[axis+1:]
+    res = np.empty(Ni + Nj)
+    for ii in np.ndindex(Ni):
+        for jj in np.ndindex(Nj):
+            res[ii + jj] = np.interp(0.5, Pn[ii + (slice(None),) + jj], data_sorted[ii + (slice(None),) + jj])
+
+    return res
+
+
+def imshow_scaled(ax: Axes, image: ArrayLike, vmin_pct=40., vmax_pct=99.7, axes_off=True, **kwargs):
+    """Convenience function b/c I'm tired of typing np.percentile"""
+    vmin, vmax = np.percentile(np.ravel(image), [vmin_pct, vmax_pct])
+    ax.imshow(image, vmin=vmin, vmax=vmax, **kwargs)
+    if axes_off:
+        ax.set_axis_off()

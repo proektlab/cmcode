@@ -56,7 +56,7 @@ def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', t
     else:
         if method != 'nrg':
             raise ValueError(f'Unrecogized thresholding method {thr}')
-        A_binarized = sparse.lil_matrix(A.T.shape, dtype=bool)  # construct transposed
+        A_binarized = sparse.lil_matrix(A.T.shape, dtype=np.bool_)  # construct transposed
         for c in nonempty_filter:
             patch_data = A.data[A.indptr[c]:A.indptr[c+1]]
             if len(patch_data) == 0:
