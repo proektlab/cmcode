@@ -1,4 +1,4 @@
-from typing import Union, Sequence, Literal, Optional, Type, Iterable, Hashable, Mapping, Any
+from typing import Union, Sequence, Literal, Optional, Type, Iterable, Hashable, Mapping
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
@@ -246,18 +246,18 @@ class ScaledDataFrame(pd.DataFrame):
             dtypes.append(dtype)
         return dtypes
 
-    def __getitem__(self, index):
+    def __getitem__(self, key):
         """Override default behavior to select the row as a dataframe when indexing by a single int"""
-        if isinstance(index, int):
-            return self.iloc[[index]]
-        return super().__getitem__(index)
+        if isinstance(key, int):
+            return self.iloc[[key]]
+        return super().__getitem__(key)
 
     def iterpoints(self) -> 'Iterable[tuple[Hashable, ScaledDataFrame]]':
         """Iterate over points in the dataframe (i.e., rows) without collapsing them into Series"""
         for ind in self.index:
             yield ind, self.loc[[ind]]
 
-    def to_numpy(self, dtype: Optional[np.dtype] = None, copy=False, na_value=ScaledOffsetDtype._na_value) -> np.ndarray:
+    def to_numpy(self, dtype: Optional[npt.DTypeLike] = None, copy=False, na_value=ScaledOffsetDtype._na_value) -> np.ndarray:
         # set a default dtype for converting to array to get around https://github.com/pandas-dev/pandas/issues/22791
         if dtype is None and self.shape[1] > 0:
             for col_dtype in self.dtypes:
@@ -312,7 +312,7 @@ class ScaledDataFrame(pd.DataFrame):
 def make_scaled_df(
         data: Union[Mapping[str, npt.ArrayLike], pd.DataFrame, npt.ArrayLike], unit: Literal['pixels', 'um'],
         dim_names: Optional[Sequence[str]] = None, index=None,
-        pixel_size: Union[Mapping[str, Optional[float]], Sequence, pd.Series, float, None] = None) -> ScaledDataFrame:
+        pixel_size: Union[Mapping[str, Optional[float]], Sequence[Optional[float]], pd.Series, float, None] = None) -> ScaledDataFrame:
     """Construct a ScaledDataFrame with the given data and potentially different pixel sizes"""
     # convert what was passed into a mapping of names to (data, Series)
     # first we need to be able to iterate over the columns and column names
@@ -320,7 +320,8 @@ def make_scaled_df(
         if dim_names is not None:
             raise TypeError('dim_names not expected for mapping or dataframe types')
         if isinstance(data, Mapping):
-            dim_names = list(data.keys())
+            data = data
+            dim_names = [str(k) for k in data.keys()]
             columns = (np.asarray(v) for v in data.values())
         else:
             dim_names = list(data.columns)
@@ -334,7 +335,7 @@ def make_scaled_df(
         if dim_names is None:
             # try to grab variables from pixel_size
             if isinstance(pixel_size, Mapping) and len(pixel_size) == array.shape[1]:
-                dim_names = list(pixel_size.keys())
+                dim_names = [str(k) for k in pixel_size.keys()]
             elif isinstance(pixel_size, pd.Series) and len(pixel_size) == array.shape[1]:
                 dim_names = list(pixel_size.index)
             else:
@@ -354,6 +355,8 @@ def make_scaled_df(
                 this_umpp = pixel_size.loc[dim_name]
         else:
             this_umpp = pixel_size
+        
+        assert isinstance(this_umpp, (type(None), float)), 'pixel_size should be None or a float'
         dtype = ScaledOffsetDtype(unit=unit, um_per_pixel=this_umpp, dtype=column.dtype)
         df_builder[dim_name] = pd.Series(column, dtype=dtype)
     df = ScaledDataFrame(df_builder)

@@ -3,7 +3,7 @@ from collections import Counter
 from copy import copy, deepcopy
 from datetime import date
 from functools import lru_cache
-from itertools import product, accumulate, pairwise
+from itertools import accumulate, pairwise
 import json
 import logging
 import math
@@ -30,7 +30,6 @@ from scipy import sparse
 from scipy.spatial import KDTree
 from scipy.stats import mode
 from tifffile import memmap as tiff_memmap
-from trycast import isassignable
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
@@ -416,6 +415,10 @@ class SessionAnalysis:
         widget = caiman_viz.RawDataPreviewContainer(self.sbx_files, frames=frames_to_average, curr_offset=self.odd_row_offset,
                                                     offset_save_callback=save_callback, channel=channel, title=title)
         return widget.show()
+    
+
+    def compute_frames_per_trial(self) -> np.ndarray:
+        return np.array([sbx_utils.sbx_shape(fn)[-1] for fn in self.sbx_files])
 
 
     def convert_to_tif(self, to3D=False, force=False, channel=0, **convert_kwargs):
@@ -449,7 +452,7 @@ class SessionAnalysis:
             if self.frames_per_trial is None:
                 # do not care about downsampling for frames per trial
                 logging.debug('Frames per file is missing; inferring') 
-                self.frames_per_trial = np.array([sbx_utils.sbx_shape(fn)[-1] for fn in self.sbx_files])
+                self.frames_per_trial = self.compute_frames_per_trial()
                 self.save(save_cnmf=False)
             assert self.frames_per_trial is not None
 
@@ -534,7 +537,7 @@ class SessionAnalysis:
         """
         if self.plane_tifs is None:
             self.convert_to_tif(channel=0)
-            assert self.plane_tifs is not None
+        assert self.plane_tifs is not None
 
         if (not force and self.mc_result is not None and
             all(os.path.exists(f) for f in self.mc_result.mmap_files)):
@@ -1105,7 +1108,10 @@ class SessionAnalysis:
         self.make_df_over_f()
 
         if self.downsample_factor is not None:
-            assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
+            if self.frames_per_trial is None:
+                logging.info('frames_per_trial is missing; inferring.')
+                self.frames_per_trial = self.compute_frames_per_trial()
+
             assert self.cnmf_fit is not None, 'CNMF not successful?'
             logging.info(f'Upsampling (interpolating) results by a factor of {self.downsample_factor}')
             self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)

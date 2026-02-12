@@ -169,9 +169,9 @@ class MCResult(CustomPathMappable):
     def apply_path_mapper(self, path_mapper: PathMapper[P], *args: P.args, **kwargs: P.kwargs) -> 'MCResult':
         """Implements CustomPathMappable by normalizing paths to memmap files"""
         res_norm = deepcopy(self)
-        for field in ['mmap_files', 'mmap_file_transposed']:
-            norm_path = path_mapper(getattr(res_norm, field), *args, **kwargs)
-            setattr(res_norm, field, norm_path)  # type: ignore
+        for path_field in ['mmap_files', 'mmap_file_transposed']:
+            norm_path = path_mapper(getattr(res_norm, path_field), *args, **kwargs)
+            setattr(res_norm, path_field, norm_path)
         return res_norm
 
     def has_same_shifts_as(self, other: 'MCResult') -> bool:
@@ -342,7 +342,7 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
 
     # extract shifts
     shifts_rig = np.array(mcorr_obj.shifts_rig).T  # transpose to dims x frames
-    if params.motion["pw_rigid"] == True:
+    if params.motion["pw_rigid"]:
         x_shifts = mcorr_obj.x_shifts_els
         y_shifts = mcorr_obj.y_shifts_els
         shifts = [x_shifts, y_shifts]

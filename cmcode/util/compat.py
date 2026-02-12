@@ -19,11 +19,11 @@ def reconstruct_sessdata_obj(sessdata: 'cma.SessionAnalysis', loaded_info: dict[
     if 'cnmf_params' not in loaded_info:
         raise ValueError('Cannot load SessionAnalysis without saved params')
     _set_fields(sessdata, loaded_info)
+    _fix_cnmf_fields_on_load(sessdata)  # required before _populate_missing_fields
     _populate_missing_fields(sessdata)
     _fix_field_types(sessdata)
     _fix_tif_field_on_load(sessdata)
     _fix_mc_field_on_load(sessdata)
-    _fix_cnmf_fields_on_load(sessdata)
 
 
 def _set_fields(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
@@ -61,6 +61,9 @@ def _populate_missing_fields(sessdata: 'cma.SessionAnalysis'):
     if not hasattr(sessdata, 'snr_type') and sessdata.cnmf_fit is not None:
         # set snr type based on whether gamma SNR values are populated
         sessdata.snr_type = 'normal' if sessdata.cnmf_fit.estimates.snr_gamma_vals is None else 'gamma'
+
+    if not hasattr(sessdata, 'tag'):
+        sessdata.tag = None
     
     if not hasattr(sessdata, 'tag_base'):
         sessdata.tag_base = sessdata.tag
@@ -73,6 +76,26 @@ def _populate_missing_fields(sessdata: 'cma.SessionAnalysis'):
 
     if not hasattr(sessdata, 'crop'):
         sessdata.crop = BorderSpec()
+
+    if not hasattr(sessdata, 'highpass_cutoff'):
+        sessdata.highpass_cutoff = 0
+    
+    if not hasattr(sessdata, 'frames_per_trial'):
+        try:
+            sessdata.frames_per_trial = sessdata.compute_frames_per_trial()
+        except FileNotFoundError:
+            logging.warning('Could not load SBX files - leaving frames_per_trial as None.')
+            sessdata.frames_per_trial = None
+        
+    if not hasattr(sessdata, 'plane_tifs'):
+        sessdata.plane_tifs = None
+    
+    # remove old 3D tif which we won't use
+    if hasattr(sessdata, 'tif_file'):
+        delattr(sessdata, 'tif_file')
+    
+    if not hasattr(sessdata, 'mc_result'):
+        sessdata.mc_result = None
 
 
 def _fix_field_types(sessdata: 'cma.SessionAnalysis'):
