@@ -4,7 +4,7 @@ import asyncio
 import asyncssh
 import logging
 import os
-from pathlib import PurePosixPath, PureWindowsPath, PurePath
+from pathlib import PurePosixPath, PureWindowsPath, PurePath, Path
 import sys
 import tempfile
 import time
@@ -12,10 +12,12 @@ from typing import Optional, Union
 from urllib.parse import urlparse, ParseResult
 import webbrowser
 
-from cmcode import datadir_path_win, datadir_path_unix, setup_logging
+from caiman.paths import caiman_datadir
+
+from cmcode import setup_logging
 from cmcode.remote import remoteops
-from cmcode.remote.host_info import WorkerContext, HostInfo
-from cmcode.remote.private.local_host_info import network_hosts as network
+from cmcode.remote.host_info import WorkerContext, HostInfo, get_network_hosts
+from cmcode.util.paths import normalize_path
 
 
 async def get_path_from_host(host_spec: Union[str, WorkerContext], python_code: str, timeout: int = 45,
@@ -26,6 +28,7 @@ async def get_path_from_host(host_spec: Union[str, WorkerContext], python_code: 
     timeout: seconds to wait before giving up
     """
     if isinstance(host_spec, str):
+        network = get_network_hosts()
         host_spec = network.get(host_spec)
     host_info = host_spec.host
 
@@ -45,13 +48,14 @@ async def get_jupyterlab_servers(host_spec: Union[str, WorkerContext], notebook_
                                  connection: Optional[asyncssh.SSHClientConnection] = None) -> set[ParseResult]:
     """Get a set of urls for existing jupyter-lab servers with given notebook path"""
     if isinstance(host_spec, str):
+        network = get_network_hosts()
         host_spec = network.get(host_spec)
 
     output = await remoteops.get_output_from_command('jupyter-lab list', host_spec, timeout=timeout, no_slurm=no_slurm,
                                                      slurm_args=slurm_args, connection=connection)
-    logging.info(f'jupyter-lab list output:\n' + output)
+    logging.info('jupyter-lab list output:\n' + output)
 
-    server_entries = [l.split(' :: ') for l in output.splitlines() if ' :: ' in l]
+    server_entries = [line.split(' :: ') for line in output.splitlines() if ' :: ' in line]
     server_entries = [p for p in server_entries if len(p) == 2]  # filter out invalid lines
     server_urls = [url for (url, path) in server_entries if type(notebook_path)(path) == notebook_path]
     return {urlparse(url) for url in server_urls}
@@ -154,13 +158,15 @@ async def launch(host_spec: Union[str, WorkerContext], force_new: bool = False, 
         slurm_args = ''
 
     if isinstance(host_spec, str):
+        network = get_network_hosts()
         host_spec = network.get(host_spec)
     host_info = host_spec.host
 
     if root_path is not None:
         root_purepath = PureWindowsPath(root_path) if host_info.is_pc else PurePosixPath(root_path)
     else:
-        root_purepath = datadir_path_win if host_info.is_pc else datadir_path_unix
+        local_datadir = Path(caiman_datadir())
+        root_purepath = normalize_path(local_datadir, for_host=host_info)
 
     # look for an existing server
     async with asyncssh.connect(host_info.ssh_name, username=host_info.ssh_user if host_info.ssh_user is not None else ()) as conn:
