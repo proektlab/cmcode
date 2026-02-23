@@ -286,12 +286,12 @@ def set_output_location(output_path: str) -> Generator[None, None, None]:
 def compute_border_asym(shifts: np.ndarray) -> BorderSpec:
     """
     Given shifts array with dimension along the first axis, compute asymmetric border
-    (max border on each side, rounding up to the nearest integer).
+    (max border on each side).
     """
-    max_top = max(0, int(np.ceil(np.max(shifts[0]))))
-    max_bottom = max(0, -int(np.ceil(np.max(-shifts[0]))))
-    max_left = max(0, int(np.ceil(np.max(shifts[1]))))
-    max_right = max(0, -int(np.ceil(np.max(-shifts[1]))))
+    max_top = max(0, np.max(shifts[0]))
+    max_bottom = max(0, -np.max(-shifts[0]))
+    max_left = max(0, np.max(shifts[1]))
+    max_right = max(0, -np.max(-shifts[1]))
     return BorderSpec(top=max_top, bottom=max_bottom, left=max_left, right=max_right)
 
 

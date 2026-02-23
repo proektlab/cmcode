@@ -2254,7 +2254,7 @@ def load_cnmf(cnmf_filename: str, metadata: dict, quiet=True) -> Optional[CNMFEx
     try:
         cnmf_obj = load_CNMFExt(cnmf_filename, dview=cluster.dview, quiet=quiet)
     except FileNotFoundError:
-        logging.warning(f'CNMF file could not be found; not loaded')
+        logging.warning('CNMF file could not be found; not loaded')
         return None
     else:
         # set n_processes since refit reads from it and passing this to load_CNMF doesn't actually do anything

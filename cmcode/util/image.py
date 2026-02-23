@@ -2,7 +2,7 @@
 from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
-from typing import Union, Sequence, Optional, Callable, Literal, Any
+from typing import Union, Sequence, Optional, Callable, Any
 
 import cv2
 from matplotlib.axes import Axes
@@ -215,26 +215,87 @@ class BorderSpec:
         return (max(shape[0] - self.top_subpix - self.bottom_subpix, 0),
                 max(shape[1] - self.left_subpix - self.right_subpix, 0))
 
-    def flatmask(self, shape: tuple[int, ...], order: Literal['C', 'F'] = 'F') -> np.ndarray:
+    def flatmask(self, shape: tuple[int, ...], order: onp.OrderKACF = 'F') -> np.ndarray:
         """Make a boolean vector for masking a flattened array within these borders."""
         mask = np.zeros(shape, dtype=bool)
         mask[self.slices(shape)] = True
         return mask.ravel(order=order)
 
+@dataclass(frozen=True)
+class BorderedImage:
+    """Image that also keeps track of some border through shifts and remaps"""
+    image: np.ndarray
+    border: BorderSpec
 
-# class BorderedImage:
-#     def __init__(self, image: onp.ToFloat2D, border: Union[int, BorderSpec]):
-#         """Image that also keeps track of some border through shifts and remaps"""
-#         if not isinstance(border, BorderSpec):
-#             border = BorderSpec.equal(border)
-        
-#         self.image = image
-#         self.border = border
+    def __post_init__(self):
+        if not isinstance(self.image, np.ndarray):
+            object.__setattr__(self, 'image', np.asarray(self.image))
+
+        if isinstance(self.border, CanFloat):
+            object.__setattr__(self, 'border', BorderSpec.equal(float(self.border)))
+
+    # for convenience, provide shape directly to BorderSpec methods
+    @property
+    def plane_shape(self) -> tuple[int, int]:
+        return (self.image.shape[0], self.image.shape[1]) 
     
-#     def shifted(self, x_shift: float, y_shift: float) -> 'BorderedImage':
-#         """Shift image and also adjust border"""
+    @property
+    def center_shape(self) -> tuple[int, int]:
+        return self.border.center_shape(self.plane_shape)
+    
+    @property
+    def center_shape_subpix(self) -> tuple[float, float]:
+        return self.border.center_shape_subpix(self.plane_shape)
+    
+    @property
+    def center(self) -> np.ndarray:
+        """View into the center of this image (according to border)"""
+        slices = self.border.slices(self.plane_shape)
+        return self.image[slices]
+    
 
+    def shifted(self, x_shift: float, y_shift: float) -> 'BorderedImage':
+        """Shift image and also adjust border"""
+        shifted_image = shift_image(self.image, x_shift=x_shift, y_shift=y_shift)
+        
+        max_y, max_x = self.image.shape
+        new_left = np.clip(self.border.left_subpix + x_shift, 0, max_x)
+        new_right = np.clip(self.border.right_subpix - x_shift, 0, max_x)
+        new_top = np.clip(self.border.top_subpix + y_shift, 0, max_y)
+        new_bottom = np.clip(self.border.bottom_subpix - y_shift, 0, max_y)
+        shifted_border = BorderSpec(left=new_left, right=new_right, top=new_top, bottom=new_bottom)
+        
+        return BorderedImage(image=shifted_image, border=shifted_border)
+    
 
+    def remapped(self, x_remap: Optional[onp.Array2D[np.floating]], y_remap: Optional[onp.Array2D[np.floating]]) -> 'BorderedImage':
+        """Nonrigidly remap image and also adjust border"""
+        remapped_image = remap_image(self.image, x_remap=x_remap, y_remap=y_remap)
+        if x_remap is None:
+            assert y_remap is None  # should be checked in remap_image
+            return BorderedImage(image=remapped_image, border=self.border)
+        assert y_remap is not None # should be checked in remap_image
+
+        # infer new borders to fully contain shifted image
+        # first get a boolean mask of where in the new image corresponds to valid pixels of the old image
+        sz_y, sz_x = self.image.shape
+        x_remap = np.asarray(x_remap)
+        y_remap = np.asarray(y_remap)
+        within_borders_x = (x_remap >= self.border.left_subpix) & (x_remap <= sz_x - 1 - self.border.right_subpix)
+        within_borders_y = (y_remap >= self.border.top_subpix) & (y_remap <= sz_y - 1 - self.border.bottom_subpix)
+        within_borders = within_borders_x & within_borders_y
+
+        # then collapse along x and y and make new borders
+        inds_within_x = np.flatnonzero(np.any(within_borders, axis=0))
+        new_left = np.min(inds_within_x, initial=sz_x)
+        new_right = np.min(sz_x - 1 - inds_within_x, initial=sz_x)
+
+        inds_within_y = np.flatnonzero(np.any(within_borders, axis=1))
+        new_top = np.min(inds_within_y, initial=sz_y)
+        new_bottom = np.min(sz_y - 1 - inds_within_y, initial=sz_y)
+
+        remapped_border = BorderSpec(left=new_left, right=new_right, top=new_top, bottom=new_bottom)
+        return BorderedImage(image=remapped_image, border=remapped_border)
 
 
 def colorize(im: np.ndarray, color: Union[Sequence[float], str],
@@ -289,7 +350,7 @@ def shift_image(image: onp.ToFloat2D, x_shift: float, y_shift: float) -> np.ndar
     return ndimage.shift(image, shifts)
 
 
-def shift_image_location(image: np.ndarray, start_loc: ScaledDataFrame, end_loc: ScaledDataFrame):
+def shift_image_location(image: onp.ToFloat2D, start_loc: ScaledDataFrame, end_loc: ScaledDataFrame):
     """Shift image from start_loc to end_loc (both must have a single row)"""
     if start_loc.shape[0] != 1 or end_loc.shape[0] != 1:
         raise ValueError('start_loc and end_loc must both have a single row')
@@ -300,7 +361,7 @@ def shift_image_location(image: np.ndarray, start_loc: ScaledDataFrame, end_loc:
     return shift_image(image, x_shift=x_shift, y_shift=y_shift)
 
 
-def remap_image(image: np.ndarray, x_remap: Optional[np.ndarray], y_remap: Optional[np.ndarray]):
+def remap_image(image: np.ndarray, x_remap: Optional[onp.Array2D[np.floating]], y_remap: Optional[onp.Array2D[np.floating]]):
     """Use CV2 to remap an image according to remap function as returned from register_ROIs"""
     if x_remap is None or y_remap is None:
         if y_remap is not None or x_remap is not None:
@@ -309,7 +370,10 @@ def remap_image(image: np.ndarray, x_remap: Optional[np.ndarray], y_remap: Optio
     return cv2.remap(image.astype(np.float32), x_remap, y_remap, cv2.INTER_CUBIC)
 
 
-def invert_mapping(x_remap: np.ndarray, y_remap: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def invert_mapping(x_remap: onp.Array2D[np.floating], y_remap: onp.Array2D[np.floating]
+                   ) -> tuple[onp.Array2D[np.floating], onp.Array2D[np.floating]]:
+    y_grid: onp.Array2D[np.floating]
+    x_grid: onp.Array2D[np.floating]
     y_grid, x_grid = np.meshgrid(
         np.arange(x_remap.shape[0], dtype=x_remap.dtype),
         np.arange(x_remap.shape[1], dtype=x_remap.dtype), indexing='ij')
