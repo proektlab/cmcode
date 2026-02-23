@@ -16,7 +16,7 @@ from typing import Optional, Generator, ParamSpec, cast
 import caiman as cm
 from caiman.base.movies import get_file_size
 from caiman.motion_correction import MotionCorrect, get_patch_centers
-from caiman.paths import decode_mmap_filename_dict, memmap_frames_filename, fn_relocated
+from caiman.paths import decode_mmap_filename_dict, memmap_frames_filename
 from caiman.source_extraction.cnmf.params import CNMFParams
 import cv2
 import holoviews as hv
@@ -132,10 +132,22 @@ class MCResult(CustomPathMappable):
                 raise RuntimeError('Must set dims and motion_params before getting shifts_els as HoloView dataset')
 
             # find patch locations
-            patch_centers_y, patch_centers_x = get_patch_centers(
-                self.dims, strides=self.motion_params['strides'], overlaps=self.motion_params['overlaps'],
+            indices = cast(tuple[slice, ...], self.motion_params['indices'])
+            effective_dims = tuple(len(range(d)[dim_inds]) for d, dim_inds in zip(self.dims, indices))
+
+            patch_centers_orig = get_patch_centers(
+                effective_dims, strides=self.motion_params['strides'], overlaps=self.motion_params['overlaps'],
                 upsample_factor_grid=self.motion_params['upsample_factor_grid'], shifts_opencv=self.motion_params['shifts_opencv'])
+
+            # if only a portion of the original image was used, offset/multiply patch centers to now apply to the whole movie
+            # compute one dimension at a time. Copied from caiman.motion_correction.apply_shifts_movie.
+            patch_centers = tuple([] for _ in patch_centers_orig)
+            for dim_inds, dim_centers_orig, dim_centers in zip(indices, patch_centers_orig, patch_centers):
+                start = dim_inds.start if dim_inds.start is not None else 0
+                step = dim_inds.step if dim_inds.step is not None else 1
+                dim_centers.extend([start + step * center for center in dim_centers_orig])
             
+            patch_centers_y, patch_centers_x = patch_centers
             npatch_y = len(patch_centers_y)
             npatch_x = len(patch_centers_x)
 
@@ -296,39 +308,49 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
     """
     expected_file = _build_motion_correct_filename(tif_file, params.motion['pw_rigid'])
     expected_info_file = re.sub(r'.mmap$', '.npz', expected_file)
+    requested_indices = cast(tuple[slice, ...], params.motion['indices'])
+
+    # whether to first fit to subwindow and then apply to whole movie
+    use_apply = any(s != slice(None) for s in requested_indices)
 
     if not force and os.path.exists(expected_file) and os.path.exists(expected_info_file):
         logging.info('Using existing motion correction results from ' + expected_file)
         with np.load(expected_info_file, allow_pickle=True) as info:
-            shifts_rig = info['shifts_rig']
-            border_to_0 = int(info['border_to_0'].item())
-            if 'shifts_els' in info:
-                shifts_els = info['shifts_els']
-                if shifts_els.ndim == 0:
-                    shifts_els = shifts_els.item()
-            elif 'piecewise_info' in info:
-                logging.warning('PiecewiseMCInfo will be removed soon, making this field un-unpicklable')
-                piecewise_info: Optional[PiecewiseMCInfo] = info['piecewise_info'].item()
-                shifts_els = piecewise_info.shifts_els if piecewise_info is not None else None
+            if 'indices' in info:
+                indices_match = info['indices'].item() == requested_indices
             else:
-                shifts_els = None
+                logging.warning('No indices information - assuming it is from the whole FOV.')
+                indices_match = not use_apply
 
-            if 'border_asym' in info:
-                border_asym = cast(BorderSpec, info['border_asym'].item())
+            if not indices_match:  # TODO in new version, it will be possible to save multiple versions
+                logging.info('Indices (FOV) from saved data do not match - re-running')
             else:
-                # compute from shifts
-                if shifts_els is None:
-                    border_asym = compute_border_asym(shifts_rig)
+                shifts_rig = info['shifts_rig']
+                border_to_0 = int(info['border_to_0'].item())
+                if 'shifts_els' in info:
+                    shifts_els = info['shifts_els']
+                    if shifts_els.ndim == 0:
+                        shifts_els = shifts_els.item()
+                elif 'piecewise_info' in info:
+                    logging.warning('PiecewiseMCInfo will be removed soon, making this field un-unpicklable')
+                    piecewise_info: Optional[PiecewiseMCInfo] = info['piecewise_info'].item()
+                    shifts_els = piecewise_info.shifts_els if piecewise_info is not None else None
                 else:
-                    border_asym = compute_border_asym(shifts_els)              
+                    shifts_els = None
 
-        return expected_file, shifts_rig, border_to_0, border_asym, shifts_els, False
+                if 'border_asym' in info:
+                    border_asym = cast(BorderSpec, info['border_asym'].item())
+                else:
+                    # compute from shifts
+                    if shifts_els is None:
+                        border_asym = compute_border_asym(shifts_rig)
+                    else:
+                        border_asym = compute_border_asym(shifts_els)
+
+                return expected_file, shifts_rig, border_to_0, border_asym, shifts_els, False
     
     if parent_process() is None and cluster_args is not None:
         cma.cluster.start(**cluster_args)
-
-    # whether to first fit to subwindow and then apply to whole movie
-    use_apply = any(s != slice(None) for s in params.motion['indices'])
 
     params.change_params({'data': {'fnames': [tif_file]}})
 
@@ -355,7 +377,8 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
         border_asym = compute_border_asym(shifts_rig)
     
     np.savez(expected_info_file, shifts_rig=shifts_rig, border_to_0=mcorr_obj.border_to_0,
-             shifts_els=np.array(shifts_els), border_asym=np.array(border_asym))
+             shifts_els=np.array(shifts_els), border_asym=np.array(border_asym),
+             indices=np.array(requested_indices))
 
     return expected_file, shifts_rig, int(mcorr_obj.border_to_0),  border_asym, shifts_els, True
 
@@ -364,9 +387,7 @@ def apply_mcorr_to_file(mcorr_obj: MotionCorrect, input_file: str) -> str:
     """Apply shifts from a MotionCorrect object to the given input file (returns output filename)"""
     expected_file = _build_motion_correct_filename(input_file, mcorr_obj.pw_rigid)
     with set_output_location(expected_file):
-        base_name_temp = fn_relocated('MC')
-        saved_file = mcorr_obj.apply_shifts_movie(
-            input_file, save_memmap=True, save_base_name=base_name_temp, remove_min=False)
+        saved_file = mcorr_obj.apply_shifts_movie(input_file, save_memmap=True, remove_min=False)
     assert isinstance(saved_file, str), 'path returned when save_memmap is true'
     if os.path.exists(expected_file):
         os.remove(expected_file)

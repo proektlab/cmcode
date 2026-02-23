@@ -7,10 +7,11 @@ dependencies:
 - dask
 - distributed
 - hdf5storage
+- ipympl
 - mesmerize-core
 - mslex
 - nest-asyncio
-- ipympl
+- optype
 - pip
 - scipy-typed
 - pip:

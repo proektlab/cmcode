@@ -6,7 +6,7 @@ import logging
 import math
 import os
 import pickle
-from typing import Optional, Sequence, Literal, Union, cast
+from typing import Optional, Sequence, Iterable, Literal, Union, cast
 
 import caiman as cm
 from caiman.base.rois import com, distance_masks, find_matches
@@ -17,7 +17,7 @@ from caiman.utils import sbx_utils
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.typing import ArrayLike
+import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 from scipy import sparse, ndimage, signal, optimize, stats
@@ -1103,7 +1103,7 @@ def load_or_compute_remaps_for_sessions(
     xy_remaps = None
     loaded_from_untagged = False
     mapping_load_path = None
-    if use_saved_mappings == False:
+    if use_saved_mappings is False:
         logging.info('Not trying to load mappings since use_saved_mappings is false')
     elif not os.path.exists(alignment_dir):
         logging.info('Alignment dir not found; creating')
@@ -1501,7 +1501,7 @@ def register_ROIs_multiple(
         matched_session = reg_results.matched1
         matched_union = reg_results.matched2
         nonmatch_session = reg_results.unmatched1
-        nonmatch_union = reg_results.unmatched2
+        _nonmatch_union = reg_results.unmatched2
         performance = reg_results.performance
         A2 = reg_results.A2
         xy_remaps_out.append((reg_results.x_remap, reg_results.y_remap))
@@ -1511,8 +1511,9 @@ def register_ROIs_multiple(
         all_performance.append(performance)
 
         A_union = deepcopy(A2)
-        A_union[:, matched_union] = A[sess][:, matched_session]
-        A_union = sparse.csc_array(sparse.hstack((A_union, A[sess][:, nonmatch_session])))
+        A_sess = sparse.csc_matrix(A[sess])
+        A_union[:, matched_union] = A_sess[:, matched_session]
+        A_union = sparse.csc_array(sparse.hstack((A_union, A_sess[:, nonmatch_session])))
         new_match = np.zeros(A[sess].shape[-1], dtype=int)
         new_match[matched_session] = matched_union
         new_match[nonmatch_session] = range(A2.shape[-1], A_union.shape[-1])
@@ -1666,25 +1667,25 @@ def register_ROIs_multisession(
     else:
         accepted = np.stack([np.in1d(assn, acc) for assn, acc in zip(assignments.T, accepted_inds)], axis=1)        
 
-    save_data = {
-        'mouse_id': mouse_id,
-        'included_rois': included_rois,
-        'rec_type': rec_type,
-        'processed_sess_ids': np.array(processed_sess_ids),
-        'processed_tags': [tag if tag else '' for tag in processed_tags],
-        'cnmf_uuids': cnmf_uuids,
-        'grouptag': grouptag if grouptag else '',
-        'spatial_union': spatial_union,
-        'assignments': assignments,
-        'accepted': accepted,
-        'matchings': matchings,
-        'all_performance': all_performance,
-        'xy_remappings': xy_remappings,
-        'cell_subset_name': 'accepted' if use_accepted_only else '',
-        'center_of_mass': coms,
-        'dates': rec_dates
-    }
-    save_data = tabularize_multisession_data(**save_data)
+    save_data = tabularize_multisession_data(
+        mouse_id=mouse_id,
+        included_rois=included_rois,
+        rec_type=rec_type,
+        processed_sess_ids=np.array(processed_sess_ids),
+        processed_tags=[tag if tag else '' for tag in processed_tags],
+        cnmf_uuids=cnmf_uuids,
+        grouptag=grouptag if grouptag else '',
+        spatial_union=spatial_union,
+        assignments=assignments,
+        accepted=accepted,
+        matchings=matchings,
+        all_performance=all_performance,
+        xy_remappings=xy_remappings,
+        cell_subset_name='accepted' if use_accepted_only else '',
+        center_of_mass=coms,
+        dates=rec_dates
+    )
+
     save_multisession(save_data)
     return save_data
 
@@ -1708,7 +1709,7 @@ def save_multisession(save_data: dict) -> str:
     return filepath
 
 
-def tabularize_multisession_data(*, mouse_id: int, processed_sess_ids: Sequence[int], processed_tags: Sequence[Optional[str]],
+def tabularize_multisession_data(*, mouse_id: int, processed_sess_ids: Iterable[Union[int, np.integer]], processed_tags: Sequence[Optional[str]],
                                  included_rois: list[np.ndarray], accepted: np.ndarray, cnmf_uuids: list[str],
                                  assignments: np.ndarray, matchings: list[np.ndarray], center_of_mass: Optional[np.ndarray] = None,
                                  dates: list[date], **other_data) -> dict:
@@ -1843,7 +1844,7 @@ def load_latest_multisession(mouse_id: Union[int, str], rec_type: str = 'learnin
     return load_multisession(latest_file)    
 
 
-def save_matched_thumbnails(multisession_res: dict, union_cell_ids: ArrayLike, session_names: Optional[Sequence[str]] = None,
+def save_matched_thumbnails(multisession_res: dict, union_cell_ids: onp.ToJustInt1D, session_names: Optional[Sequence[str]] = None,
                             **save_roi_thumbnails_opts) -> list[tuple[Optional[str], ...]]:
     """
     Save thumbnail images of given cells from given sessions (box_size x box_size pixels) in png format to files
@@ -1889,7 +1890,7 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: ArrayLike, s
         saved_paths = sessinfo.save_roi_thumbnails(sess_cell_ids, **save_roi_thumbnails_opts)
 
         # fill in paths for indices that were saved
-        this_save_paths: list[Optional[str]] = [None] * np.size(union_cell_ids)
+        this_save_paths: list[Optional[str]] = [None] * len(union_cell_ids)
         for valid_ind, path in zip(np.flatnonzero(matched), saved_paths):
             this_save_paths[valid_ind] = path
         
@@ -2351,9 +2352,9 @@ def register_ROIs_multisession_3D(
         
         # Only consider cells that were actually mapped
         com_union = com_union[cells_to_map, :] / comp_weights_union[cells_to_map, np.newaxis]
-        A_union = sparse.csc_array(A_union[:, cells_to_map])
+        A_union = A_union[:, cells_to_map]
         # normalize to be unit vectors
-        A_union = A_union / A_union.power(2).sum()
+        A_union = sparse.csc_array(A_union / A_union.power(2).sum())
 
         # now find matchings to this session's ROIs using register_ROIs
         D_pow = 1 + n_matched_weight * (n_matched[cells_to_map] - 1)  # weigh components by n_matched
@@ -2454,7 +2455,7 @@ def rebuild_session_mapping_data_and_footprints(
         this_matchings = matchings.union_cell_id[matchings.sess_name == sess_name].to_numpy()
 
         this_session_data = SessionMappingData(
-            mouse_id=mouse_id, sess_id=sess_id, tag=tag, remaps_to_others=remap_dict,
+            mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remap_dict,
             rec_type=rec_type, session_cell_ids=session_cell_ids
         )
         this_session_data.matchings = this_matchings

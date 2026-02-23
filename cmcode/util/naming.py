@@ -1,21 +1,26 @@
 import re
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Union, Iterable
 
-def make_sess_name(sess_id: int, tag: Optional[str], underscore=True, zero_padded=False) -> str:
+import numpy as np
+
+
+def make_sess_name(sess_id: Union[int, np.integer], tag: Optional[str], underscore=True, zero_padded=False) -> str:
     """Create session name in given format"""
     sess_str = f'{sess_id:03d}' if zero_padded else str(sess_id)
     tag_str = ('_' if underscore else '') + tag if tag else ''
     return sess_str + tag_str
 
-def make_sess_names(sess_ids: Sequence[Union[int, str]], tags: Optional[Sequence[Optional[str]]] = None,
-                    underscore=True, zero_padded=False) -> list[str]:
+def make_sess_names(
+    sess_ids: Iterable[Union[str, int, np.integer]], tags: Optional[Sequence[Optional[str]]] = None,
+    underscore=True, zero_padded=False) -> list[str]:
+
     if tags is None:
-        tags = [None] * len(sess_ids)
+        tags = [None for _ in sess_ids]
 
     sess_names: list[str] = []
     for sess_id, tag in zip(sess_ids, tags):
-        if isinstance(sess_id, int):
-            sess_names.append(make_sess_name(sess_id, tag))
+        if isinstance(sess_id, (int, np.integer)):
+            sess_names.append(make_sess_name(sess_id, tag, underscore=underscore, zero_padded=zero_padded))
         else:
             if tag is not None:
                 raise ValueError('Cannot pass both string sess_id and tag')

@@ -10,6 +10,7 @@ install_requires = [
     "mesmerize-viz",
     "mslex",
     "nest-asyncio",
+    "optype",
     "roipoly",
 ]
 

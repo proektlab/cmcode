@@ -1711,7 +1711,7 @@ class SessionAnalysis:
             filename_data = filename_base + f'_activity{format}'
         else:
             filename_data = filename_base + f'_estimates{format}'
-        filename_meta = filename_base + f'_metadata.pkl'
+        filename_meta = filename_base + '_metadata.pkl'
         
         # collect data that will be saved
         est_data_fields = ['C', 'F_dff', 'F_dff_denoised', 'S', 'YrA']
@@ -1982,6 +1982,7 @@ class SessionAnalysis:
         if force_reload_cnmf or self.cnmf_fit is None:
             # reload from disk (e.g. to sync changes from mesmerize_viz)
             self.cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
+        assert self.cnmf_fit is not None
 
         est = self.cnmf_fit.estimates
         assert isinstance(est.dims, tuple) and len(est.dims) == 2, 'should be 2D CNMF'
