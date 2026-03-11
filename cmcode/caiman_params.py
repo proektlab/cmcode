@@ -1,18 +1,20 @@
-from copy import copy, deepcopy
+from copy import deepcopy
 from datetime import date
 from enum import IntEnum
+from functools import cache
 from itertools import pairwise
+import json
 import os
 from pathlib import Path
+from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar
+import warnings
 
-from typing import (Iterable, Sequence, Optional, Literal, overload, cast,
-                    Union, Any, Type, TypedDict, Mapping, TypeVar)
-
-import msgspec
-from msgspec.structs import fields, replace
-import numpy as np
 from caiman.source_extraction.cnmf import params
-from mesmerize_core.utils import get_params_diffs
+from caiman.source_extraction.cnmf.utilities import all_same
+import numpy as np
+from pydantic import BaseModel, ConfigDict, TypeAdapter, Field, PrivateAttr, computed_field, model_validator
+from pydantic.dataclasses import dataclass
+from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 
 from cmcode.util.image import BorderSpec
 
@@ -31,49 +33,35 @@ EXCLUDE_FROM_DIFFS = [
 ]
 
 
-# for parameter serialization:
-
-def enc_hook(obj: Any) -> Any:
-    """
-    Extend msgspec encoding to work with additional types
-    Based on caiman.source_extraction.cnmf.params.CNMFParams.to_json.NumpyEncoder,
-    so it should produce json files compatible with the caiman functions.
-    """
-    if isinstance(obj, np.ndarray):
-        return obj.tolist()
-    elif isinstance(obj, np.integer):
-        return int(obj)
-    elif isinstance(obj, np.floating):
-        return float(obj)
-    elif isinstance(obj, slice):
-        return [obj.start, obj.stop, obj.step]
-    else:
-        raise NotImplementedError(f'Encoding objects of type {type(obj)} is not supported')
-
-def dec_hook(decl_type: Type, obj: Any) -> Any:
-    """Extend msgspec decoding to work with additional types"""
-    if decl_type is np.ndarray:
-        return np.array(obj)
-    elif issubclass(decl_type, np.integer) or issubclass(decl_type, np.floating):
-        return decl_type(obj)
-    elif decl_type is slice:
-        start, stop, step = obj
-        return slice(start, stop, step)
-    else:
-        raise NotImplementedError(f'Decoding objects of type {decl_type} is not supported')
-
-param_encoder = msgspec.json.Encoder(enc_hook=enc_hook)
-
-
 Self = TypeVar('Self', bound='StageParams')
 
-class StageParams(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
-    """
-    msgspec.Struct holding params for a particular analysis stage (abstract)
-    This is like a dataclass, but it is faster to use with msgspec, and also
-    has the feature forbid_unknown_fields which raises an error if we try to 
-    deserialize an instance with unknonwn param names (like due to typos)
-    """
+@dataclass(kw_only=True, frozen=True)
+class StageParams:
+    """Params for a particular analysis stage (abstract base class)"""
+    __pydantic_config__ = ConfigDict(extra='forbid', serialize_by_alias=True)
+
+    @classmethod
+    @cache
+    def input_params(cls) -> set[str]:
+        """Param names that can be used in constructor etc. (excludes purely computed fields)"""
+        ta = TypeAdapter(cls)
+        # we don't care if some defaults aren't serializable
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=PydanticJsonSchemaWarning, message='Default value')
+            return set(ta.json_schema(mode='validation')['properties'].keys())
+    
+    @classmethod
+    @cache
+    def params(cls) -> set[str]:
+        """Parameters available to read from this group"""
+        # Use the JSON schema to ensure we respect excluded fields, etc
+        ta = TypeAdapter(cls)
+        # we don't care if some defaults aren't serializable
+        with warnings.catch_warnings():
+            warnings.filterwarnings('ignore', category=PydanticJsonSchemaWarning, message='Default value')
+            return set(ta.json_schema(mode='serialization')['properties'].keys())
+
+
     def get_differing_params(self: Self, other: Self, metadata: dict[str, Any]) -> Iterable[str]:
         yield from ()
         """Find names of parameters that are different between self and other"""
@@ -82,20 +70,25 @@ class StageParams(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
         """Find whether any parameters differ between self and other"""
         return not any(self.get_differing_params(other, metadata=metadata))
     
-    def replace(self: Self, replacements: Mapping[str, Any]) -> Self:
+    def replace(self: Self, **replacements) -> Self:
         """Make copy with replacements; like dataclasses.replace but recursing on other StageParams"""
-        new_args: dict[str, Any] = {}
+        ta = TypeAdapter(type(self))
+        param_dict = ta.dump_python(self, round_trip=True)
+
+        # update the dict while recursing into other StageParams instances
         for key, val in replacements.items():
             if not hasattr(self, key):
                 raise KeyError(f'Cannot replace unknown key {key}')
 
             my_val = getattr(self, key)
             if isinstance(my_val, StageParams) and isinstance(val, Mapping):
-                new_args[key] = my_val.replace(val)
-            else:
-                # possibly do delayed conversion from dict format
-                new_args[key] = msgspec.convert(val, type=self.__annotations__[key], dec_hook=dec_hook)
-        return replace(self, **new_args)
+                val = my_val.replace(**val)
+            param_dict[key] = val
+        
+        return ta.validate_python(param_dict)
+
+    # support copy.replace (for 3.13 and above)
+    __replace__ = replace
 
 
 # note: in the below params classes, defaults reflect the original values of each parameter/the
@@ -105,7 +98,8 @@ class StageParams(msgspec.Struct, frozen=True, forbid_unknown_fields=True):
 # TODO: add stage params for file discovery (START stage) including trials_to_exclude, raw_dir, etc.
 
 
-class ConversionParams(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class ConversionParams(StageParams):
     """Settings for convert_to_tif"""
     crop: BorderSpec = BorderSpec()           # borders to crop out of image
     downsample_factor: Optional[int] = None
@@ -159,32 +153,54 @@ class ConversionParams(StageParams, frozen=True):
         if self_offset is not None and other_offset is not None and self_offset != other_offset:
             yield 'odd_row_offset'
 
-        for field in fields(other):
-            if field.name in irrelevant_fields:
+        for param in other.params():
+            if param in irrelevant_fields:
                 continue
 
-            # use array_equal to compare without caring about e.g. the sequence type
-            if not np.array_equal(getattr(other, field.name), getattr(self, field.name)):
-                yield field.name
+            # use all_same to compare without caring about e.g. the sequence type
+            if not all_same(getattr(other, param), getattr(self, param)):
+                yield param
 
 
-class McorrParamsExtra(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class McorrParamsExtra(StageParams):
     """Extra params for the motion correction step"""
+    # reference to SessionAnalysisParams to compute indices_exclude_fringe
+    _mcorr_params: 'SkipJsonSchema[Optional[McorrParamStruct]]' = Field(
+        default=None, init=False, exclude=True, repr=False
+    )
+
     # whether to automatically adjust indices to take odd_row_ndead, odd_row_offset and crop into account
-    auto_adjust_indices: bool = True
-    # flag that is set when indices are adjusted and unset when parames affecting them are changed
+    # default = only for rigid motion correction.
+    _indices_exclude_fringe: Optional[bool] = Field(default=None, alias='indices_exclude_fringe')
+    # flag that is set when indices are adjusted and unset when params affecting them are changed
     _indices_are_adjusted: bool = False
+
+    @computed_field
+    @property
+    def indices_exclude_fringe(self) -> bool:
+        """Determine indices_exclude_fringe from pw_rigid if None"""
+        if self._indices_exclude_fringe is not None:
+            return self._indices_exclude_fringe
+        
+        if self._mcorr_params is None:
+            raise RuntimeError('Cannot compute indices_exclude_fringe without reference to mcorr params')
+        
+        return not self._mcorr_params.motion.pw_rigid
+
 
     def get_differing_params(self, other: 'McorrParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
         # only care about auto_adjust_indices if indices are out of date, meaning that
         # matching motion.indices can't be trusted.
-        if self.auto_adjust_indices and not other.auto_adjust_indices and not self._indices_are_adjusted:
+
+        if self.indices_exclude_fringe and not other.indices_exclude_fringe and not self._indices_are_adjusted:
             yield 'auto_adjust_indices'
-        elif other.auto_adjust_indices and not self.auto_adjust_indices and not other._indices_are_adjusted:
+        elif other.indices_exclude_fringe and not self.indices_exclude_fringe and not other._indices_are_adjusted:
             yield 'auto_adjust_indices'
 
 
-class TranspositionParams(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class TranspositionParams(StageParams):
     """Settings for transpose/concat planes"""
     highpass_cutoff: float = 0
     highpass_order: int = 4
@@ -199,16 +215,16 @@ class TranspositionParams(StageParams, frozen=True):
         if self.highpass_cutoff == 0:
             irrelevant_fields.append('highpass_order')
 
-        for field in fields(self):
-            if field.name in irrelevant_fields:
+        for param in self.params():
+            if param in irrelevant_fields:
                 continue
 
-            # use array_equal to compare without caring about e.g. the sequence type
-            if not np.array_equal(getattr(other, field.name), getattr(self, field.name)):
-                yield field.name
+            if not all_same(getattr(other, param), getattr(self, param)):
+                yield param
 
 
-class SeedParams(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class SeedParams(StageParams):
     """Params for producing spatial seed"""
     type: str = 'none' # e.g. "mean", "skew"; "none" means don't use a seed at all
     norm_medw: Optional[int] = None
@@ -263,21 +279,22 @@ class SeedParams(StageParams, frozen=True):
 
     def get_differing_params(self, other: 'SeedParams', metadata: dict[str, Any]) -> Iterable[str]:
         if self.type != 'none' or other.type != 'none':
-            for field in fields(self):
-                val1 = getattr(self, field.name)
-                val2 = getattr(other, field.name)
+            for param in self.params():
+                val1 = getattr(self, param)
+                val2 = getattr(other, param)
 
-                if field.name == 'gSig':
+                if param == 'gSig':
                     # treat 1-element sequences the same as scalars
                     val1 = np.atleast_1d(val1)
                     val2 = np.atleast_1d(val2)
                     
                 # need to use array_equal because there is an ndarray
-                if not np.array_equal(val1, val2):
-                    yield field.name
+                if not all_same(val1, val2):
+                    yield param
 
 
-class CNMFParamsExtra(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class CNMFParamsExtra(StageParams):
     """Extra parameters for operations associated with CNMF"""
     seed_params: SeedParams = SeedParams()
     crossplane_merge_thr: Optional[float] = None
@@ -290,7 +307,8 @@ class CNMFParamsExtra(StageParams, frozen=True):
             yield 'crossplane_merge_thr'
 
 
-class EvalParamsExtra(StageParams, frozen=True):
+@dataclass(kw_only=True, frozen=True)
+class EvalParamsExtra(StageParams):
     """Extra parameters for CNMF evaluation (do not require redoing CNMF)"""
     snr_type: Literal['normal', 'gamma'] = 'normal'
 
@@ -327,188 +345,179 @@ class AnalysisStage(IntEnum):
             ][self]
 
 
-# recursive typeddicts for serializing/deserializing parameters for each stage
-class ConvertParamDict(TypedDict):
+# recursive models for serializing/deserializing parameters for each stage
+SelfPS = TypeVar('SelfPS', bound='ParamStruct')
+
+class ParamStruct(BaseModel):
+    @classmethod
+    def read_from_file(cls: Type[SelfPS], path: Union[str, Path]) -> SelfPS:
+        with open(path, mode='r') as file:
+            data = file.read()
+        return cls.model_validate_json(data)
+    
+    def serialize_params(self, stage: Optional[AnalysisStage] = None, pretty=True) -> str:
+        """Convert a group of params to JSON, optionally specifying the subset of params to serialize using params_type."""
+        if stage is None:
+            encoded = self.model_dump(mode='json', round_trip=True)
+        else:
+            # use TypeAdapter to serialize only params relevant for the stage
+            ta = TypeAdapter(stage_cumulative_params[stage])
+            encoded = ta.dump_python(self, mode='json', round_trip=True)
+
+        # use json library for dumping b/c it allows nans and infs
+        return json.dumps(encoded, indent=4 if pretty else None)
+
+    def write_params(self, path: Union[str, Path], stage: Optional[AnalysisStage] = None, pretty=True):
+        data = self.serialize_params(stage=stage, pretty=pretty)
+        with open(path, mode='w') as file:
+            file.write(data)
+
+    
+    def get_differing_params(
+            self, other: 'ParamStruct', metadata: dict[str, Any], stage: Optional[AnalysisStage] = None,
+            include_different_toplevel=False, ignore_prereq_stages=False) -> Iterable[str]:
+        """
+        Return flattened names of params that differ between first and second
+        include_different_toplevel: include top-level keys if one is present and the other is not.
+            By default, only compares top-level keys that are present in both dicts.
+        """
+        # infer whether CNMF is seeded because in this case we don't care about patch.rf and patch.only_init
+        seeded = True
+        for struct in self, other:
+            if not isinstance(struct, CNMFParamStruct) or struct.cnmf_extra.seed_params.type == 'none':
+                seeded = False
+
+        first_fields = type(self).model_fields.keys()
+        second_fields = type(other).model_fields.keys()
+        if stage is not None:
+            if ignore_prereq_stages:
+                # subset to fields for this stage
+                stage_fields = stage_only_params[stage].model_fields.keys()
+            else:
+                # subset to fields used up to this stage
+                stage_fields = stage_cumulative_params[stage].model_fields.keys()
+            first_fields &= stage_fields
+            second_fields &= stage_fields
+
+        for key in first_fields | second_fields:
+            if key in EXCLUDE_FROM_DIFFS:
+                continue
+
+            if (key not in first_fields or key not in second_fields) and include_different_toplevel:
+                yield key
+            else:
+                val1, val2 = getattr(self, key), getattr(other, key)
+                if isinstance(val1, params.GroupParams):
+                    assert isinstance(val2, type(val1)),  'same key should contain same types'
+                    for param, _, _ in val1.get_differing_params(val2):
+                        # skip ones that we don't care about
+                        param_flat = key + '.' + param
+                        if param_flat in EXCLUDE_FROM_DIFFS:
+                            continue
+
+                        # ignore rf and only_init if we are using seeded CNMF
+                        if seeded and key == 'patch' and param in ['rf', 'only_init']:
+                            continue
+
+                        yield param_flat
+                else:
+                    assert isinstance(val1, StageParams), 'params dict should only contain subdicts and StageParams objects'
+                    assert isinstance(val2, type(val1)),  'same key should contain same types'
+                    for param in val1.get_differing_params(val2, metadata=metadata):
+                        yield key + '.' + param
+        
+    def do_params_match(self, other: 'ParamStruct', metadata: dict[str, Any],
+                        stage: Optional[AnalysisStage] = None, ignore_prereq_stages=False) -> bool:
+        return not any(self.get_differing_params(other, metadata=metadata, stage=stage, ignore_prereq_stages=ignore_prereq_stages))
+
+    
+    def get_differing_params_from_file(
+            self, path: Union[str, Path], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None) -> Iterable[str]:
+        if stage is None:
+            other_params = type(self).read_from_file(path)
+        else:
+            other_params = stage_cumulative_params[stage].read_from_file(path)
+        return self.get_differing_params(other_params, metadata=metadata, stage=stage)
+    
+    def does_params_file_match(self, path: Union[str, Path], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None) -> bool:
+        return not any(self.get_differing_params_from_file(path, metadata=metadata, stage=stage))
+
+
+class ConvertParamStruct(ParamStruct):
     conversion: ConversionParams
 
-UpToConvertParamDict = ConvertParamDict
+UpToConvertParamStruct = ConvertParamStruct
 
-class McorrParamDict(TypedDict):
-    motion: dict[str, Any]
+class McorrParamStruct(ParamStruct):
+    motion: params.MotionParams
     mcorr_extra: McorrParamsExtra
 
-class UpToMcorrParamDict(UpToConvertParamDict, McorrParamDict):
+    @model_validator(mode='after')
+    def _set_ref(self):
+        """Set reference to full params struct"""
+        object.__setattr__(self.mcorr_extra, '_mcorr_params', self)
+        return self
+
+class UpToMcorrParamStruct(UpToConvertParamStruct, McorrParamStruct):
     pass
 
-class TransposeParamDict(TypedDict):
+class TransposeParamStruct(ParamStruct):
     transposition: TranspositionParams
 
-class UpToTransposeParamDict(UpToMcorrParamDict, TransposeParamDict):
+class UpToTransposeParamStruct(UpToMcorrParamStruct, TransposeParamStruct):
     pass
 
-class CNMFParamDict(TypedDict):
-    data: dict[str, Any]
-    patch: dict[str, Any]
-    preprocess: dict[str, Any]
-    init: dict[str, Any]
-    spatial: dict[str, Any]
-    temporal: dict[str, Any]
-    merging: dict[str, Any]
-    online: dict[str, Any]
-    ring_CNN: dict[str, Any]
+class CNMFParamStruct(ParamStruct):
+    data: params.DataParams
+    patch: params.PatchParams
+    preprocess: params.PreprocessParams
+    init: params.InitParams
+    spatial: params.SpatialParams
+    temporal: params.TemporalParams
+    merging: params.MergingParams
+    online: params.OnlineParams
+    ring_CNN: params.RingCNNParams
     cnmf_extra: CNMFParamsExtra
 
-class UpToCNMFParamDict(UpToTransposeParamDict, CNMFParamDict):
+class UpToCNMFParamStruct(UpToTransposeParamStruct, CNMFParamStruct):
     pass
 
-class EvalParamDict(TypedDict):
-    quality: dict[str, Any]
+class EvalParamStruct(ParamStruct):
+    quality: params.QualityParams
     eval_extra: EvalParamsExtra
 
-class UpToEvalParamDict(UpToCNMFParamDict, EvalParamDict):
+class UpToEvalParamStruct(UpToCNMFParamStruct, EvalParamStruct):
     pass
 
-FullParamDict = UpToEvalParamDict
 
-
-# general serialization, deserialization, and comparison logic
-def serialize_params(params: Mapping[str, Any], pretty=True) -> bytes:
-    enc_bytes = param_encoder.encode(params)
-    if pretty:
-        enc_bytes = msgspec.json.format(enc_bytes)
-    return enc_bytes
-
-def write_params(params: Mapping[str, Any], path: Union[str, Path], pretty=True):
-    data = serialize_params(params, pretty=pretty)
-    with open(path, mode='wb') as file:
-        file.write(data)
-
-
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.START], data: bytes) -> Mapping[str, Any]:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.CONVERT], data: bytes) -> UpToConvertParamDict:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.MCORR], data: bytes) -> UpToMcorrParamDict:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.TRANSPOSE], data: bytes) -> UpToTransposeParamDict:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.CNMF], data: bytes) -> UpToCNMFParamDict:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.EVAL], data: bytes) -> UpToEvalParamDict:
-    ...
-@overload
-def deserialize_params_up_to_stage(stage: Literal[AnalysisStage.FINAL], data: bytes) -> FullParamDict:
-    ...
-
-def deserialize_params_up_to_stage(stage: AnalysisStage, data: bytes) -> Mapping[str, Any]:
-    """Attempt to decode data representing params for a given stage into one of the TypedDict types"""
-    match stage:
-        case AnalysisStage.START:
-            return {}
-        case AnalysisStage.CONVERT:
-            deser_type = UpToConvertParamDict
-        case AnalysisStage.MCORR:
-            deser_type = UpToMcorrParamDict
-        case AnalysisStage.TRANSPOSE:
-            deser_type = UpToTransposeParamDict
-        case AnalysisStage.CNMF:
-            deser_type = UpToCNMFParamDict
-        case AnalysisStage.EVAL:
-            deser_type = UpToEvalParamDict
-        case AnalysisStage.FINAL:
-            deser_type = FullParamDict  
-    return msgspec.json.decode(data, type=deser_type, dec_hook=dec_hook)
-
-
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.START], path: Union[str, Path]) -> Mapping[str, Any]:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.CONVERT], path: Union[str, Path]) -> UpToConvertParamDict:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.MCORR], path: Union[str, Path]) -> UpToMcorrParamDict:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.TRANSPOSE], path: Union[str, Path]) -> UpToTransposeParamDict:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.CNMF], path: Union[str, Path]) -> UpToCNMFParamDict:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.EVAL], path: Union[str, Path]) -> UpToEvalParamDict:
-    ...
-@overload
-def read_params_up_to_stage(stage: Literal[AnalysisStage.FINAL], path: Union[str, Path]) -> FullParamDict:
-    ...
-    
-def read_params_up_to_stage(stage: AnalysisStage, path: Union[str, Path]) -> Mapping[str, Any]:
-    """Attempt to read params for a given stage from a file"""
-    with open(path, mode='rb') as file:
-        data = file.read()
-    return deserialize_params_up_to_stage(stage, data)
-
-
-def get_differing_params(first: Mapping[str, Any], second: Mapping[str, Any], metadata: dict[str, Any],
-                         include_different_toplevel=False) -> Iterable[str]:
-    """
-    Return flattened names of params that differ between first and second
-    include_different_toplevel: include top-level keys if one is present and the other is not.
-        By default, only compares top-level keys that are present in both dicts.
-    """
-    # infer whether CNMF is seeded because in this case we don't care about patch.rf and patch.only_init
-    seeded = True
-    for mapping in [first, second]:
-        if 'cnmf_extra' not in mapping or mapping['cnmf_extra'].seed_params.type == 'none':
-            seeded = False
-
-    for key in set(first.keys()) | set(second.keys()):
-        if key in EXCLUDE_FROM_DIFFS:
-            continue
-
-        if (key not in first or key not in second) and include_different_toplevel:
-            yield key
-        else:
-            val1, val2 = first[key], second[key]
-            if isinstance(val1, dict):
-                assert isinstance(val2, dict),  'same key should contain same types'
-                diff_subkeys = get_params_diffs([val1, val2])[0].keys()
-                for subkey in diff_subkeys:
-                    # skip ones that we don't care about
-                    subkey_flat = key + '.' + subkey
-                    if subkey_flat in EXCLUDE_FROM_DIFFS:
-                        continue
-
-                    # ignore rf and only_init if we are using seeded CNMF
-                    if seeded and key == 'patch' and subkey in ['rf', 'only_init']:
-                        continue
-
-                    yield subkey_flat
-            else:
-                # annoyingly it seems like Mapping[str, Union[dict, StageParams]] doesn't work due to @dataclass
-                assert isinstance(val1, StageParams), 'params dict should only contain subdicts and StageParams objects'
-                assert isinstance(val2, type(val1)),  'same key should contain same types'
-                for param in val1.get_differing_params(val2, metadata=metadata):
-                    yield key + '.' + param
-    
-def do_params_match(first: Mapping[str, Any], second: Mapping[str, Any], metadata: dict[str, Any]) -> bool:
-    return not any(get_differing_params(first, second, metadata=metadata))
-
-
-class SessionAnalysisParams:
+class SessionAnalysisParams(UpToEvalParamStruct):
     """
     Object that contains CNMFParams as well as other parameters used in the SessionAnalysis pipeline.
     These params should not be modified directly; SessionAnalysis fields must be
     invalidated depending on what is changed. Instead, use the SessionAnalysis.update_params method.
-    To read params, the SessionAnalysis.read_params method can be used.
     """
-    def __init__(self,
+    _cnmf: params.CNMFParams = PrivateAttr()
+
+    def model_post_init(self, context: Any) -> None:
+        """Make CNMFParams object to manage changes to these params"""
+        super().model_post_init(context)
+        
+        self._cnmf = params.CNMFParams(
+            data=self.data,
+            patch=self.patch,
+            preprocess=self.preprocess,
+            init=self.init,
+            spatial=self.spatial,
+            temporal=self.temporal,
+            merging=self.merging,
+            online=self.online,
+            motion=self.motion,
+            ring_CNN=self.ring_CNN,
+            quality=self.quality
+        )
+
+    @classmethod
+    def from_cnmf_params(cls,
         cnmf: params.CNMFParams,
         conversion: ConversionParams = ConversionParams(),
         mcorr_extra: McorrParamsExtra = McorrParamsExtra(),
@@ -516,47 +525,26 @@ class SessionAnalysisParams:
         cnmf_extra: CNMFParamsExtra = CNMFParamsExtra(),
         eval_extra: EvalParamsExtra = EvalParamsExtra()
         ):
-        self._cnmf = cnmf
-        self._conversion = conversion
-        self._mcorr_extra = mcorr_extra
-        self._transposition = transposition
-        self._cnmf_extra = cnmf_extra
-        self._eval_extra = eval_extra
 
-    @classmethod
-    def from_dict(cls, input_dict: FullParamDict) -> 'SessionAnalysisParams':
-        """Construct from deserialized or updated dict (like returned from read_all())"""
-        # remove nb from spatial and temporal so caiman doesn't complain
-        spatial_dict = copy(input_dict['spatial'])
-        spatial_dict.pop('nb', None)
-        temporal_dict = copy(input_dict['temporal'])
-        temporal_dict.pop('nb', None)
-
-        cnmf_params = params.CNMFParams(params_dict={
-            'data': input_dict['data'],
-            'patch': input_dict['patch'],
-            'preprocess': input_dict['preprocess'],
-            'init': input_dict['init'],
-            'spatial': spatial_dict,
-            'temporal': temporal_dict,
-            'merging': input_dict['merging'],
-            'online': input_dict['online'],
-            'motion': input_dict['motion'],
-            'ring_CNN': input_dict['ring_CNN']
-        })
-
-        obj = cls(
-            cnmf=cnmf_params,
-            conversion=input_dict['conversion'],
-            mcorr_extra=input_dict['mcorr_extra'],
-            transposition=input_dict['transposition'],
-            cnmf_extra=input_dict['cnmf_extra'],
-            eval_extra=input_dict['eval_extra']
+        return cls(
+            conversion=conversion,
+            motion=cnmf.motion,
+            mcorr_extra=mcorr_extra,
+            transposition=transposition,
+            data=cnmf.data,
+            patch=cnmf.patch,
+            preprocess=cnmf.preprocess,
+            init=cnmf.init,
+            spatial=cnmf.spatial,
+            temporal=cnmf.temporal,
+            merging=cnmf.merging,
+            online=cnmf.online,
+            ring_CNN=cnmf.ring_CNN,
+            cnmf_extra=cnmf_extra,
+            quality=cnmf.quality,
+            eval_extra=eval_extra
         )
 
-        return obj
-
-    
     @classmethod
     def from_metadata(
         cls, metadata: dict, dims: int, tif_file: Optional[str] = None, channel=0, odd_row_offset: Optional[int] = None,
@@ -574,7 +562,7 @@ class SessionAnalysisParams:
         else:
             seed = SeedParams(**seed_params)
 
-        return cls(
+        return cls.from_cnmf_params(
             conversion=ConversionParams(
                 channel=channel, odd_row_offset=odd_row_offset, odd_row_ndead=odd_row_ndead, crop=crop,
                 downsample_factor=downsample_factor, **extra_conversion_params),
@@ -586,127 +574,12 @@ class SessionAnalysisParams:
         )
 
 
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.START]) -> Mapping[str, Any]:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.CONVERT]) -> ConvertParamDict:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.MCORR]) -> McorrParamDict:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.TRANSPOSE]) -> TransposeParamDict:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.CNMF]) -> CNMFParamDict:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.EVAL]) -> EvalParamDict:
-        ...
-    @overload
-    def get_params_for_stage(self, stage: Literal[AnalysisStage.FINAL]) -> Mapping[str, Any]:
-        ...
-
-    def get_params_for_stage(self, stage: AnalysisStage) -> Mapping[str, Any]:
-        """Get copy of only params that relate to this specific stage"""
-        match stage:
-            case AnalysisStage.START:
-                return {}
-            case AnalysisStage.CONVERT:
-                return ConvertParamDict(conversion=deepcopy(self._conversion))
-            case AnalysisStage.MCORR:
-                return McorrParamDict(motion=deepcopy(self._cnmf.motion), mcorr_extra=deepcopy(self._mcorr_extra))
-            case AnalysisStage.TRANSPOSE:
-                return TransposeParamDict(transposition=deepcopy(self._transposition))
-            case AnalysisStage.CNMF:
-                # make cnmf_params dict with motion and quality fields removed
-                cnmf_params_dict = deepcopy(self._cnmf.to_dict())
-                del cnmf_params_dict['motion']
-                del cnmf_params_dict['quality']
-                return CNMFParamDict(**cnmf_params_dict, cnmf_extra=deepcopy(self._cnmf_extra))
-            case AnalysisStage.EVAL:
-                return EvalParamDict(
-                    quality=deepcopy(self._cnmf.quality),
-                    eval_extra=deepcopy(self._eval_extra))
-            case AnalysisStage.FINAL:
-                return {}
-
-
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.START]) -> Mapping[str, Any]:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.CONVERT]) -> UpToConvertParamDict:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.MCORR]) -> UpToMcorrParamDict:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.TRANSPOSE]) -> UpToTransposeParamDict:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.CNMF]) -> UpToCNMFParamDict:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.EVAL]) -> UpToEvalParamDict:
-        ...
-    @overload
-    def get_params_up_to_stage(self, stage: Literal[AnalysisStage.FINAL]) -> FullParamDict:
-        ...
-
-    def get_params_up_to_stage(self, stage: AnalysisStage) -> Mapping[str, Any]:
-        """
-        Read params as a dict, including all information that could be used to invalidate the given stage.
-        """
-        curr_stage = AnalysisStage.START
-        params = cast(dict, self.get_params_for_stage(curr_stage))
-
-        while curr_stage < stage:
-            curr_stage = AnalysisStage(curr_stage + 1)
-            params.update(self.get_params_for_stage(curr_stage))
-        
-        return params
-
-
-    def read_all(self) -> FullParamDict:
-        return self.get_params_up_to_stage(AnalysisStage.FINAL)
-
-
-    # Serialization
-    def write_params_for_stage(self, stage: AnalysisStage, path: Union[str, Path], pretty=True):
-        """Write JSON of params for a given stage to file"""
-        write_params(self.get_params_up_to_stage(stage), path=path, pretty=pretty)
-    
-    def write_json_file(self, path: Union[str, Path], pretty=True):
-        self.write_params_for_stage(AnalysisStage.FINAL, path=path, pretty=pretty)
-
-
-    # Param comparison
-    def get_differing_params(self, stage: AnalysisStage, other_params: Mapping[str, Any],
-                             metadata: dict[str, Any]) -> Iterable[str]:
-        this_params = self.get_params_up_to_stage(stage)
-        return get_differing_params(this_params, other_params, metadata=metadata)
-
-    def get_differing_params_from_file(self, stage: AnalysisStage, path: Union[str, Path],
-                                       metadata: dict[str, Any]) -> Iterable[str]:
-        other_params = read_params_up_to_stage(stage, path)
-        return self.get_differing_params(stage, other_params, metadata=metadata)
-    
-    def does_params_file_match(self, stage: AnalysisStage, path: Union[str, Path],
-                               metadata: dict[str, Any]) -> bool:
-        return not any(self.get_differing_params_from_file(stage, path, metadata=metadata))
-
-
-    def get_first_nonmatching_stage(self, other: 'SessionAnalysisParams',
-                                    metadata: dict[str, Any]) -> AnalysisStage:
+    def get_first_nonmatching_stage(self, other: 'SessionAnalysisParams', metadata: dict[str, Any]) -> AnalysisStage:
         """Just identify the first invalid/nonmatching stage compared to another params object"""
-        for last_valid in range(int(AnalysisStage.START) + 1, int(AnalysisStage.FINAL)):
-            curr_stage = AnalysisStage(last_valid)
-            this_stage_params = self.get_params_for_stage(curr_stage)
-            other_stage_params = other.get_params_for_stage(curr_stage)
+        for stage_num in range(int(AnalysisStage.START) + 1, int(AnalysisStage.FINAL)):
+            curr_stage = AnalysisStage(stage_num)
 
-            if not do_params_match(this_stage_params, other_stage_params, metadata=metadata):
+            if not self.do_params_match(other, metadata=metadata, stage=curr_stage, ignore_prereq_stages=True):
                 return curr_stage
 
         return AnalysisStage.FINAL
@@ -725,55 +598,39 @@ class SessionAnalysisParams:
         # and test whether that stage needs to be invalidated.
         # Once a stage to be invalidated has been found, the rest of the tests can be skipped.
         stage = AnalysisStage.START
-        new_params = cast(dict, self.get_params_for_stage(stage))
+        new_params = deepcopy(self)
         invalid_stage: Optional[AnalysisStage] = None
         changes = dict(changes)
 
         while stage < AnalysisStage.FINAL:
             stage = AnalysisStage(stage + 1)
-            curr_stage_params = self.get_params_for_stage(stage)
-            new_stage_params = dict(curr_stage_params)
-            for key, subparams in new_stage_params.items():
-                if key in changes:
-                    change_subparams = changes.pop(key)
-                    if isinstance(subparams, dict):
-                        if key in ('spatial', 'temporal') and 'nb' in change_subparams:
-                            raise ValueError('Cannot set nb under "spatial" or "temporal" - use init.nb instead.')
 
-                        # set to an updated copy
-                        new_subparams = copy(subparams)
-                        for subkey, change_subval in change_subparams.items():
-                            if subkey not in subparams:
-                                raise ValueError(f'Cannot set unknown parameter {key}.{subkey}')
-                            new_subparams[subkey] = change_subval
-                        new_stage_params[key] = new_subparams
-                    else:
-                        assert isinstance(subparams, StageParams), 'Unexpected params type'
-                        assert isinstance(change_subparams, Mapping), \
-                             'Changes should always be dicts to avoid replacing non-specified params'
-                        new_stage_params[key] = subparams.replace(change_subparams)
+            for key in stage_only_params[stage].model_fields.keys() & changes.keys():
+                change_subparams = changes.pop(key)
+                if not isinstance(change_subparams, Mapping):
+                        raise TypeError('Changes should always be dicts to avoid replacing non-specified params')
 
-            new_params.update(new_stage_params)
+                # set new_params attribute to an updated copy
+                curr_subparams: Union[params.GroupParams, StageParams] = getattr(new_params, key)
+                new_subparams = curr_subparams.replace(**change_subparams)
+                setattr(new_params, key, new_subparams)
 
-            if invalid_stage is None and not do_params_match(curr_stage_params, new_stage_params, metadata):
-                invalid_stage = stage
-
-                # unset _indices_are_adjusted flag if necessary
-                if 'conversion' in curr_stage_params:
-                    assert isinstance(curr_stage_params['conversion'], ConversionParams)
-                    assert isinstance(new_stage_params['conversion'], ConversionParams)
-                    for differing_param in curr_stage_params['conversion'].get_differing_params(
-                        new_stage_params['conversion'], metadata
-                    ):
+                # special case: unset _indices_are_adjusted flag if necessary
+                if isinstance(curr_subparams, ConversionParams):
+                    assert isinstance(new_subparams, ConversionParams)
+                    for differing_param in curr_subparams.get_differing_params(new_subparams, metadata=metadata):
                         if differing_param in ['crop', 'odd_row_offset', 'odd_row_ndead']:
+                            # add to mcorr_extra changes to apply in future loop iteration
                             if 'mcorr_extra' not in changes:
                                 changes['mcorr_extra'] = {'_indices_are_adjusted': False}
-                            else:
+                            else:  # note we make a new dict since the value is not guaranteed to be mutable
                                 changes['mcorr_extra'] = {**changes['mcorr_extra'], '_indices_are_adjusted': False}
                             break
-        
-        new_params = FullParamDict(**new_params)
-        return SessionAnalysisParams.from_dict(new_params), invalid_stage
+
+            if invalid_stage is None and not self.do_params_match(new_params, metadata=metadata, stage=stage, ignore_prereq_stages=True):
+                invalid_stage = stage
+
+        return new_params, invalid_stage
 
     
     def read_cnmf_params(self) -> params.CNMFParams:
@@ -792,21 +649,38 @@ class SessionAnalysisParams:
         }
 
         # fix rf and only_init depending on whether we are doing seeded CNMF
-        if self._cnmf_extra.seed_params.type != 'none':
+        if self.cnmf_extra.seed_params.type != 'none':
             updates['patch']['rf'] = None
             updates['patch']['only_init'] = False
 
         run_params = deepcopy(self._cnmf)
         run_params.change_params(updates)
         return run_params
+    
 
-    
-    def __repr__(self) -> str:
-        dict_rep = self.read_all()
-        return f'SessionAnalysisParams.from_dict({repr(dict_rep)})'
-    
-    def __str__(self) -> str:
-        return repr(self)
+# convenience mappings to find params container for a given analysis stage
+# (however, it is not useful for type checking/generics)
+stage_only_params: dict[AnalysisStage, Type[ParamStruct]] = {
+    AnalysisStage.START: ParamStruct,
+    AnalysisStage.CONVERT: ConvertParamStruct,
+    AnalysisStage.MCORR: McorrParamStruct,
+    AnalysisStage.TRANSPOSE: TransposeParamStruct,
+    AnalysisStage.CNMF: CNMFParamStruct,
+    AnalysisStage.EVAL: EvalParamStruct,
+    AnalysisStage.FINAL: ParamStruct
+}
+
+
+stage_cumulative_params: dict[AnalysisStage, Type[ParamStruct]] = {
+    AnalysisStage.START: ParamStruct,
+    AnalysisStage.CONVERT: UpToConvertParamStruct,
+    AnalysisStage.MCORR: UpToMcorrParamStruct,
+    AnalysisStage.TRANSPOSE: UpToTransposeParamStruct,
+    AnalysisStage.CNMF: UpToCNMFParamStruct,
+    AnalysisStage.EVAL: UpToEvalParamStruct,
+    AnalysisStage.FINAL: SessionAnalysisParams
+}
+
 
 quality_params = {
     'normal': {
@@ -864,7 +738,8 @@ def make_cnmf_params(metadata: dict, dims: int, tif_file: Optional[str] = None,
             'pw_rigid': True,                   # flag for performing non-rigid motion correction
             'is3D': dims == 3,
             'indices': (slice(None),) * dims,
-            'border_nan': 'copy'
+            'border_nan': 'copy',
+            'shifts_interpolate': True
         },
         
         'preprocess': {

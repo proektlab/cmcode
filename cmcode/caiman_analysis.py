@@ -1,5 +1,6 @@
 import asyncio
 from collections import Counter
+from copy import copy
 from dataclasses import asdict
 from datetime import date, datetime
 from functools import lru_cache
@@ -12,15 +13,15 @@ import pickle
 import re
 import shutil
 from subprocess import CalledProcessError
-from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, Mapping
+from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, overload
 
 import cv2
 from hdf5storage import savemat
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 from matplotlib.figure import Figure
-from msgspec.structs import asdict as struct2dict
 import numpy as np
+import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 from scipy import sparse
@@ -40,7 +41,7 @@ from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, 
 from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
-from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt, clear_cnmf_cache
+from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt, clear_cnmf_cache  # noqa: F401
 # from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
 from cmcode.util import footprints, paths
 from cmcode.util.cluster import Cluster
@@ -83,9 +84,8 @@ def get_mouse_params(mouse_id: Union[int, str]) -> dict[str, dict[str, Any]]:
 
 def save_contour_plot_as_pdf(fig: Figure, filename):
     """Save contour plot figure to a high-resolution PDF"""
-    w, h = fig.get_size_inches()
-    fig.set_figwidth(w * 15)
-    fig.set_figheight(h * 15)
+    fig.set_figwidth(fig.get_figwidth() * 15)
+    fig.set_figheight(fig.get_figheight() * 15)
     fig.savefig(filename)
 
 
@@ -217,21 +217,18 @@ class SessionAnalysis:
             else:
                 raise RuntimeError(NO_FILES_MSG)
 
-            meta = sbx_utils.sbx_meta_data(self.sbx_files[0])
-            logging.info('Shape of first file: ' + 
-                         f'({meta["num_frames"]}, {meta["frame_size"][0]}, {meta["frame_size"][1]}, {meta["num_planes"]})')
-            self.metadata = meta
+            self.read_metadata()
 
             self.params = SessionAnalysisParams.from_metadata(
-                metadata=meta, dims=2, downsample_factor=downsample_factor, channel=channel,
+                metadata=self.metadata, dims=2, downsample_factor=downsample_factor, channel=channel,
                 snr_type=snr_type, highpass_cutoff=highpass_cutoff
             )
 
             # now apply overrides on top of defaults (can ignore invalidation info since we're at the START stage already)
             if mouse_params:
-                self.params = self.params.change_params_and_get_stage_to_invalidate(mouse_params, meta)[0]
+                self.params = self.params.change_params_and_get_stage_to_invalidate(mouse_params, self.metadata)[0]
             if param_overrides:
-                self.params = self.params.change_params_and_get_stage_to_invalidate(param_overrides, meta)[0]
+                self.params = self.params.change_params_and_get_stage_to_invalidate(param_overrides, self.metadata)[0]
         else:
             # use dict to reconstruct object
             reconstruct_sessdata_obj(self, loaded_info)
@@ -246,6 +243,10 @@ class SessionAnalysis:
             # apply any specific overrides
             if param_overrides is not None:
                 self.update_params(param_overrides)
+            
+            if 'ended_time' not in self.metadata:
+                # re-read metadata
+                self.read_metadata()
 
     @property
     def trial_numbers(self) -> np.ndarray:
@@ -326,11 +327,11 @@ class SessionAnalysis:
     # add read-only properties just for non-mutable params, so there's no confusion about whether they can be changed
     @property
     def downsample_factor(self) -> Optional[int]:
-        return self.params._conversion.downsample_factor
+        return self.params.conversion.downsample_factor
 
     @property
     def crop(self) -> BorderSpec:
-        return self.params._conversion.crop
+        return self.params.conversion.crop
     
     @property
     def plane_size(self) -> tuple[int, int]:
@@ -342,15 +343,15 @@ class SessionAnalysis:
     
     @property
     def snr_type(self) -> Literal['normal', 'gamma']:
-        return self.params._eval_extra.snr_type
+        return self.params.eval_extra.snr_type
     
     @property
     def crossplane_merge_thr(self) -> Optional[float]:
-        return self.params._cnmf_extra.crossplane_merge_thr
+        return self.params.cnmf_extra.crossplane_merge_thr
     
     @property
     def highpass_cutoff(self) -> float:
-        return self.params._transposition.highpass_cutoff
+        return self.params.transposition.highpass_cutoff
     
 
     #--------------------------- PARAMS/STAGE/DATA FILE MANAGEMENT-----------------------------#
@@ -368,6 +369,17 @@ class SessionAnalysis:
         if self.cnmf_fit.estimates.idx_components_eval is None:
             return AnalysisStage.CNMF
         return AnalysisStage.EVAL
+    
+
+    def read_metadata(self, file_ind=0):
+        """Create or replace metadata field with SBX metadata read from the nth file"""
+        meta = sbx_utils.sbx_meta_data(self.sbx_files[file_ind])
+        if meta['ended_time'] is None:
+            logging.warning("Ended time is missing from at least the first SBX file's metadata. Inferring from modified time instead.")
+
+        logging.info(f'Shape of SBX file #{file_ind}: ' + 
+                     f'({meta["num_frames"]}, {meta["frame_size"][0]}, {meta["frame_size"][1]}, {meta["num_planes"]})')
+        self.metadata = meta
 
 
     def invalidate_from_stage(self, stage: AnalysisStage) -> dict[str, Any]:
@@ -423,7 +435,7 @@ class SessionAnalysis:
             case AnalysisStage.CNMF:
                 self.do_cnmf(load=load)
             case AnalysisStage.EVAL:
-                self.do_cnmf_evaluation(recalc=(load == False))
+                self.do_cnmf_evaluation(recalc=(load is False))
             case AnalysisStage.FINAL:
                 pass
 
@@ -438,6 +450,13 @@ class SessionAnalysis:
         self.process_up_to_stage(AnalysisStage.FINAL)
 
 
+    def get_nonmatching_params_for_result_file(
+            self, file_path: Union[str, Path], stage: AnalysisStage) -> Iterable[str]:
+        """Get a string for the first param that does not match the result file, if any"""
+        params_path = paths.params_file_for_result(file_path)
+        yield from self.params.get_differing_params_from_file(params_path, metadata=self.metadata, stage=stage)
+
+
     def result_file_matches_params(self, file_path: Union[str, Path], stage: AnalysisStage,
                                    raise_on_missing_params=False) -> bool:
         """
@@ -450,9 +469,8 @@ class SessionAnalysis:
             return False
 
         # check whether saved params match
-        params_path = paths.params_file_for_result(file_path)
         try:
-            return self.params.does_params_file_match(stage, params_path, metadata=self.metadata)
+            return not any(self.get_nonmatching_params_for_result_file(file_path, stage))
         except FileNotFoundError:
             if raise_on_missing_params:
                 raise
@@ -463,7 +481,7 @@ class SessionAnalysis:
     def write_params_for_result_file(self, file_path: Union[str, Path], stage: AnalysisStage):
         """Write params file for a newly-produced result file"""
         params_path = paths.params_file_for_result(file_path)
-        self.params.write_params_for_stage(stage, path=params_path)
+        self.params.write_params(path=params_path, stage=stage)
 
 
     def update_params(self, param_changes: dict[str, dict[str, Any]]) -> dict[str, Any]:
@@ -485,11 +503,6 @@ class SessionAnalysis:
             return self.invalidate_from_stage(invalid_stage)
         else:
             return {}
-
-    
-    def read_params(self) -> Mapping[str, Any]:
-        """Return all parameters as a dict, making it clear that this is only for reading"""
-        return self.params.read_all()
 
 
     def save(self, save_cnmf: Optional[bool] = None):
@@ -516,7 +529,7 @@ class SessionAnalysis:
         
         # also save params file
         params_filename = os.path.splitext(self.sess_filename)[0] + '.json'
-        self.params.write_json_file(params_filename)
+        self.params.write_params(params_filename)
 
         if save_cnmf and self.cnmf_fit is not None and self.cnmf_fit_filename is not None:
             logging.info(f'Saving CNMF to {self.cnmf_fit_filename}')
@@ -539,8 +552,7 @@ class SessionAnalysis:
             self.update_params({'conversion': {'odd_row_offset': new_offset}})
             self.save(save_cnmf=False)
 
-        convert_params = self.params.get_params_for_stage(AnalysisStage.CONVERT)
-        curr_offset = convert_params['conversion'].odd_row_offset
+        curr_offset = self.params.conversion.odd_row_offset
 
         widget = caiman_viz.RawDataPreviewContainer(
             self.sbx_files, frames=frames_to_average, subinds_spatial=self.crop_slices,
@@ -562,18 +574,16 @@ class SessionAnalysis:
         """
         # first update with passed-in params
         self.update_params({'conversion': convert_kwargs})
-        convert_params = self.params.get_params_for_stage(AnalysisStage.CONVERT)['conversion']
 
         # estimate ndead explicitly if needed so we can use it later
-        if convert_params.odd_row_ndead is None and (
-            self.metadata['scanning_mode'] == 'bidirectional' or convert_params.force_estim_ndead_offset):
+        if self.params.conversion.odd_row_ndead is None and (
+            self.metadata['scanning_mode'] == 'bidirectional' or self.params.conversion.force_estim_ndead_offset):
                 odd_row_ndead = [sbx_utils.get_odd_row_ndead(f) for f in self.sbx_files]
-                convert_params = convert_params.replace({'odd_row_ndead': odd_row_ndead})
                 self.update_params({'conversion': {'odd_row_ndead': odd_row_ndead}})
 
         # deal with downsampling
-        if convert_params.downsample_factor is not None:
-            subindices = (slice(None, None, convert_params.downsample_factor),) + self.crop_slices
+        if (ds := self.params.conversion.downsample_factor) is not None:
+            subindices = (slice(None, None, ds),) + self.crop_slices
         else:
             subindices = (slice(None),) + self.crop_slices
 
@@ -581,7 +591,7 @@ class SessionAnalysis:
             """Convert a single plane. If downsample_factor is not None, also downsample."""
             plane_prefix = f'Plane {plane}: ' if plane is not None else ''  # for logging
 
-            if load != False and os.path.isfile(filename):
+            if load is not False and os.path.isfile(filename):
                 # check whether saved params match
                 if self.result_file_matches_params(filename, AnalysisStage.CONVERT):
                     if load is None:
@@ -595,7 +605,7 @@ class SessionAnalysis:
 
             logging.info(plane_prefix + f'converting {len(self.sbx_files)} .sbx file(s) into one .tif file...')
 
-            param_dict = asdict(convert_params)
+            param_dict = asdict(self.params.conversion)
             # remove items that are not arguments to sbx_chain_to_tif
             for other_param in ['crop', 'downsample_factor', 'keep_3d']:
                 del param_dict[other_param]
@@ -608,7 +618,7 @@ class SessionAnalysis:
         os.makedirs(conversion_dir, exist_ok=True)
         tagstr = '_' + self.tag if self.tag is not None else ''
 
-        if convert_params.keep_3d:
+        if self.params.conversion.keep_3d:
             tif_filename = os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}.tif')
             convert_one(tif_filename, plane=None)
             tif_filenames = [tif_filename]
@@ -644,26 +654,22 @@ class SessionAnalysis:
             raise RuntimeError('Must convert to TIF before doing motion correction')
 
         plane_results: list[mcorr.PlaneMcorrResult] = []
-        params_for_mcorr = self.params.get_params_up_to_stage(AnalysisStage.MCORR)
+        is_piecewise = self.params.motion.pw_rigid
 
         for k_plane, tif_path in enumerate(self.plane_tifs):
             plane_prefix = f'Plane {k_plane}: ' if len(self.plane_tifs) > 1 else ''
 
             # update indices if necessary
-            mcorr_extra = params_for_mcorr['mcorr_extra']
-            if mcorr_extra.auto_adjust_indices and not mcorr_extra._indices_are_adjusted:
-                new_indices = mcorr.compute_adjusted_indices(params_for_mcorr)
+            if self.params.mcorr_extra.indices_exclude_fringe and not self.params.mcorr_extra._indices_are_adjusted:
+                new_indices = mcorr.compute_adjusted_indices(self.params)
                 param_updates: dict[str, dict[str, Any]] = {'mcorr_extra': {'_indices_are_adjusted': True}}
                 if new_indices is not None:
                     logging.info(f'Changing indices to {new_indices} to avoid dead pixels')
-                    params_for_mcorr['motion']['indices'] = new_indices
                     param_updates['motion'] = {'indices': new_indices}
                 
-                mcorr_extra.replace({'_indices_are_adjusted': True})
                 self.update_params(param_updates)
 
-            if load != False:  # try to load existing results
-                is_piecewise = params_for_mcorr['motion']['pw_rigid']
+            if load is not False:  # try to load existing results
                 candidate_files = mcorr.get_candidate_mcorr_result_files(tif_path, is_piecewise)
                 found_result = None
                 for path in candidate_files:
@@ -686,14 +692,13 @@ class SessionAnalysis:
             # we are doing mcorr for this plane
             logging.info(plane_prefix + 'doing motion correction.')
 
-            plane_result = mcorr.motion_correct_file(
-                tif_path, motion_params=params_for_mcorr['motion'], dview=cluster.dview)
+            plane_result = mcorr.motion_correct_file(tif_path, motion_params=self.params.motion, dview=cluster.dview)
             plane_results.append(plane_result)
             self.write_params_for_result_file(plane_result['mmap_path'], AnalysisStage.MCORR)
         
         # build MCResult from list of PlaneMcorrResults
         shifts_els: Optional[list[np.ndarray]] = None
-        if params_for_mcorr['motion']['pw_rigid']:
+        if self.params.motion.pw_rigid:
             shifts_els = []
             for res in plane_results:
                 assert res['shifts_els'] is not None, 'Should have piecewise shifts in results'
@@ -706,7 +711,7 @@ class SessionAnalysis:
             shifts_rig=[res['shifts_rig'] for res in plane_results],
             shifts_els=shifts_els,
             dims=self.plane_size,
-            motion_params=params_for_mcorr['motion']
+            motion_params=self.params.motion
         )
 
         self.save(save_cnmf=False)
@@ -722,7 +727,7 @@ class SessionAnalysis:
             False: recompute results even if they already exist.
         """
         # do motion correction if necessary
-        if self.mc_result is None or load == False:
+        if self.mc_result is None or load is False:
             self.do_mcorr_only(load=load)
             assert self.mc_result is not None
 
@@ -858,11 +863,12 @@ class SessionAnalysis:
             for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
                 plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected)
 
-                for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
-                        ax.imshow(plane_proj, cmap='viridis',
-                                    vmin=np.percentile(np.ravel(plane_proj), 50), 
-                                    vmax=np.percentile(np.ravel(plane_proj), 99.5))
-                        ax.set_title(f'Plane {k_plane} ({corrected_label})')
+                for k_plane, plane_proj in enumerate(plane_projs):
+                    ax: Axes = axs[k_plane]
+                    ax.imshow(plane_proj, cmap='viridis',
+                              vmin=np.percentile(np.ravel(plane_proj), 50), 
+                              vmax=np.percentile(np.ravel(plane_proj), 99.5))
+                    ax.set_title(f'Plane {k_plane} ({corrected_label})')
             figs.append(fig)
         return figs[0], figs[1]
 
@@ -896,11 +902,9 @@ class SessionAnalysis:
         """
         if self.mc_result is None:
             raise RuntimeError('Must do motion correction before concatenating/transposing planes')
-        
-        params = self.params.get_params_up_to_stage(AnalysisStage.TRANSPOSE)
-        
+          
         self.mmap_file_transposed = mcorr.do_or_load_transpose(
-            self.mc_result, params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview, load=load
+            self.mc_result, self.params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview, load=load
         )
         self.save(save_cnmf=False)
 
@@ -919,8 +923,7 @@ class SessionAnalysis:
             if self.mc_result is None:
                 raise RuntimeError('Motion correction not run')
             
-            params = self.params.get_params_up_to_stage(AnalysisStage.TRANSPOSE)
-            curr_trans_params = params['transposition']
+            curr_trans_params = self.params.transposition
             if blur_kernel_size is None:
                 blur_kernel_size = curr_trans_params.blur_kernel_size
 
@@ -936,16 +939,18 @@ class SessionAnalysis:
                 mov_or_filename = self.mmap_file_transposed
 
             else:  # do a one-off transposition for this call
-                trans_params = curr_trans_params.replace({'blur_kernel_size': blur_kernel_size})
-                params['transposition'] = trans_params
+                trans_params = curr_trans_params.replace(blur_kernel_size=blur_kernel_size)
+                params_copy = copy(self.params)
+                params_copy.transposition = trans_params
+
                 mov_or_filename = mcorr.do_or_load_transpose(
-                    self.mc_result, params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview
+                    self.mc_result, params_copy, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview
                 )                
 
             if proj_type == 'corr':
                 proj = make_correlation_parallel(mov_or_filename, cluster.dview)
             else:
-                ignore_nan = params['motion']['border_nan'] == True
+                ignore_nan = self.params.motion.border_nan is True
                 proj = make_projection_parallel(mov_or_filename, proj_type, cluster.dview, ignore_nan=ignore_nan)
         else:
             if self.plane_tifs is None:
@@ -1006,7 +1011,7 @@ class SessionAnalysis:
         if proj_type == 'corr':
             return completed_row.caiman.get_corr_image(), completed_row
         else:
-            uuid = completed_row.at['uuid']
+            uuid = str(completed_row.at['uuid'])
             batch_path = completed_row.paths.get_batch_path()
             proj_path = batch_path.parent / uuid / f'{uuid}_{proj_type}_projection.npy'
             return np.load(proj_path), completed_row
@@ -1092,7 +1097,7 @@ class SessionAnalysis:
                     plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
             else:
                 # fall back to recomputing based on seed_params
-                seed_params = struct2dict(self.params.get_params_for_stage(AnalysisStage.CNMF)['cnmf_extra'].seed_params)
+                seed_params = asdict(self.params.cnmf_extra.seed_params)
                 logging.warning(f'projection_for_seed not saved - recomputing with params {seed_params}')
                 plane_projs = self.get_plane_projections(seed_params, exclude_border=exclude_border)
         else:
@@ -1106,9 +1111,21 @@ class SessionAnalysis:
 
     def check_patch_params(self, ax=None):
         """Use view_quilt to check the current CNMF patch parameters"""
-        patch_params = self.params.get_params_for_stage(AnalysisStage.CNMF)['patch']
-        patch_width = patch_params['rf'] * 2 + 1
-        patch_overlap = patch_params['stride'] + 1
+        rf = self.params.patch.rf
+        if rf is None:
+            raise RuntimeError('rf is None - movie will not be processed in patches.')
+        
+        if isinstance(rf, Sequence):
+            raise NotImplementedError('check_patch_params is only supported for square patches')
+        
+        stride = self.params.patch.stride
+        if stride is None:
+            stride = int(rf * 2 * .1)
+        elif isinstance(stride, Sequence):
+            raise NotImplementedError('check_patch_params is only supported for square patches')
+
+        patch_width = rf * 2 + 1
+        patch_overlap = stride + 1
         patch_stride = patch_width - patch_overlap
         print(f'Patch width: {patch_width}, stride: {patch_stride}, overlap: {patch_overlap}')
 
@@ -1151,9 +1168,8 @@ class SessionAnalysis:
         """        
         # Get params to pass to mescore
         batch = self.get_gridsearch_results(allow_create=True)
-        params_to_cnmf = self.params.get_params_up_to_stage(AnalysisStage.CNMF)
         
-        if load != False:  # try loading existing
+        if load is not False:  # try loading existing
             completed_runs = batch.loc[[out is not None and out['success'] for out in batch.outputs], :]
             for _, row in completed_runs.iterrows():
                 row = cast(MescoreSeries, row)
@@ -1163,17 +1179,17 @@ class SessionAnalysis:
                 output_path = row.cnmf.get_output_path()
                 params_path = paths.params_file_for_result(output_path)
                 try:
-                    saved_params = cmp.read_params_up_to_stage(AnalysisStage.EVAL, params_path)
+                    saved_params = cmp.UpToEvalParamStruct.read_from_file(params_path)
                 except FileNotFoundError:
                     continue
                 
-                if cmp.do_params_match(params_to_cnmf, saved_params, metadata=self.metadata):
+                if self.params.do_params_match(saved_params, metadata=self.metadata, stage=cmp.AnalysisStage.CNMF):
                     uuid = str(row.at['uuid'])
                     logging.info(f'Found matching CNMF run with uuid {uuid}')
                     return uuid, DummyProcess()
             
             # no matching run found
-            if load == True:
+            if load is True:
                 raise RuntimeError('No CNMF run found matching current parameters')
             else:
                 logging.info('No previous matching CNMF run found - starting process')
@@ -1195,7 +1211,7 @@ class SessionAnalysis:
         })
 
         # infer name of spatial seed, if using
-        seed_params = params_to_cnmf['cnmf_extra'].seed_params
+        seed_params = self.params.cnmf_extra.seed_params
         if seed_params.type != 'none':
             Ain_name = get_spatial_seed_name(seed_params)
         else:
@@ -1220,10 +1236,10 @@ class SessionAnalysis:
             output_dir = batch.paths.get_batch_path().parent.joinpath(uuid).resolve()
             output_dir.mkdir(parents=True, exist_ok=True)
 
-            seed_param_dict = struct2dict(seed_params)
+            seed_param_dict = asdict(seed_params)
             # fill in default value of gSig
             if seed_param_dict['gSig'] is None:
-                seed_param_dict['gSig'] = params_obj.init['gSig'][0]
+                seed_param_dict['gSig'] = params_obj.init.gSig[0]
 
             proj, seed_params_extra = self.get_projection_for_seed(**seed_param_dict)
             np.save(output_dir / 'projection_for_seed.npy', proj)
@@ -1381,26 +1397,24 @@ class SessionAnalysis:
         if self.cnmf_fit_filename is None:
             raise RuntimeError('CNMF fit not found')
         
-        eval_params = self.params.get_params_for_stage(AnalysisStage.EVAL)
-
         if not recalc:  # if the eval params match, no need to redo.
             params_file = paths.params_file_for_result(self.cnmf_fit_filename)
             try:
-                old_eval_params = cmp.read_params_up_to_stage(AnalysisStage.EVAL, params_file)
+                old_eval_params = cmp.UpToEvalParamStruct.read_from_file(params_file)
             except FileNotFoundError:
                 pass
             else:
-                if cmp.do_params_match(eval_params, old_eval_params, self.metadata):
+                if self.params.do_params_match(old_eval_params, self.metadata, stage=cmp.AnalysisStage.EVAL):
                     logging.info('Eval params have not changed - skipping evaluation')
                     return
 
-        new_quality_params = eval_params['quality']
-        snr_type = eval_params['eval_extra'].snr_type
+        new_quality_params = self.params.quality
+        snr_type = self.params.eval_extra.snr_type
 
         logging.info('Doing CNMF component evaluation')
         assert (cnmf_fit := self.cnmf_fit) is not None
         evaluate_cnmf(cnmf_fit, self.mmap_file_transposed, snr_type=snr_type,
-                      new_quality_params=new_quality_params, recalc=recalc, dview=cluster.dview)
+                      new_quality_params=new_quality_params.copy(), recalc=recalc, dview=cluster.dview)
 
         # re-save cnmf object with evaluation data added
         logging.info('Re-saving CNMF object with evaluation data')
@@ -1436,7 +1450,7 @@ class SessionAnalysis:
         else:
             df = batch.reset_index(drop=True)
         
-        df_diffs = df.caiman.get_params_diffs('cnmf', df.item_name.iat[0])
+        df_diffs = df.caiman.get_params_diffs('cnmf', str(df.item_name.iat[0]))
 
         # filter out unimportant parameters (in case they aren't fixed by get_cnmf_run_params)
         df_diffs = df_diffs.loc[:, ~np.isin(df_diffs.columns, cmp.EXCLUDE_FROM_DIFFS)]
@@ -1505,7 +1519,7 @@ class SessionAnalysis:
         params_path = paths.params_file_for_result(cnmf_path)
 
         try:
-            loaded_params = cmp.SessionAnalysisParams.from_dict(cmp.read_params_up_to_stage(AnalysisStage.FINAL, params_path))
+            loaded_params = cmp.SessionAnalysisParams.read_from_file(params_path)
             stage_to_invalidate = self.params.get_first_nonmatching_stage(loaded_params, metadata=self.metadata)
             self.invalidate_from_stage(stage_to_invalidate)
             self.params = loaded_params
@@ -1554,7 +1568,7 @@ class SessionAnalysis:
         # find cnmf_fit_filename in batch
         selected_filename = os.path.split(self.cnmf_fit_filename)[1]
         for ind, row in batch.iterrows():
-            outputs: dict = row.at['outputs']
+            outputs = cast(Optional[dict], row.at['outputs'])
             if outputs is None or not outputs['success']:
                 continue
 
@@ -1567,7 +1581,7 @@ class SessionAnalysis:
         index = self.get_selected_index()
         if index is not None:
             batch = self.get_gridsearch_results()
-            return batch.at[index, 'uuid']
+            return batch[index].uuid
         return None
     
 
@@ -1635,10 +1649,18 @@ class SessionAnalysis:
         return coms_df.to_unit(unit)
 
 
-    def get_xy_footprints(self, normalize=True, binarize=False, **binarize_kwargs) -> sparse.csc_matrix:
+    @overload
+    def get_xy_footprints(self, binarize: Literal[True], normalize: Literal[False], **binarize_kwargs) -> sparse.csc_matrix[np.bool_]:
+        ...
+
+    @overload
+    def get_xy_footprints(self, binarize: Literal[False] = ..., normalize: bool = ..., **binarize_kwargs) -> sparse.csc_matrix[np.floating]:
+        ...
+    
+    def get_xy_footprints(self, binarize=False, normalize=True, **binarize_kwargs) -> sparse.csc_matrix:
         """
         Get footprints (A) of selected CNMF run compressed to just X/Y coordinates
-        added across the z dimension and normalized).
+        added across the z dimension and normalized.
         """
         if normalize and binarize:
             logging.warning('normalize has no effect when binarize is true')
@@ -1651,13 +1673,24 @@ class SessionAnalysis:
 
         A = sparse.csc_matrix(est.A)
         n_planes = self.metadata['num_planes']
-        xy_footprints = footprints.collapse_footprints_to_xy(A, n_planes, binarize=binarize, **binarize_kwargs)
-        if normalize and not binarize:
-            xy_footprints = footprints.normalize_footprints(xy_footprints)
+        if binarize:
+            xy_footprints = footprints.collapse_footprints_to_xy(A, n_planes, binarize=True, **binarize_kwargs)
+        else:
+            xy_footprints = footprints.collapse_footprints_to_xy(A, n_planes, binarize=False, **binarize_kwargs)
+            if normalize:
+                xy_footprints = footprints.normalize_footprints(xy_footprints)
         return xy_footprints
     
 
-    def get_footprints_per_plane(self, normalize=False, binarize=False, **binarize_kwargs) -> list[sparse.csc_matrix]:
+    @overload
+    def get_footprints_per_plane(self, binarize: Literal[False] = ..., normalize: bool = ..., **binarize_kwargs) -> list[sparse.csc_matrix[np.floating]]:
+        ...
+    
+    @overload
+    def get_footprints_per_plane(self, binarize: Literal[True], normalize: Literal[False] = ..., **binarize_kwargs) -> list[sparse.csc_matrix[np.bool_]]:
+        ...    
+
+    def get_footprints_per_plane(self, binarize=False, normalize=False, **binarize_kwargs) -> list[sparse.csc_matrix]:
         """
         Get masks (A) of selected CNMF run for each plane separately,
         normalized so that each nonempty mask is a unit vector (if normalize is true)
@@ -1679,7 +1712,7 @@ class SessionAnalysis:
 
         xy_footprints_each: list[sparse.csc_matrix] = []
         for k_plane in range(n_planes):
-            submat = A[pix_per_plane*k_plane:pix_per_plane*(k_plane+1), :]
+            submat = A[pix_per_plane*k_plane:pix_per_plane*(k_plane+1), :]  # type: ignore
             if binarize:
                 submat = footprints.binarize_footprints(submat, **binarize_kwargs)
             elif normalize:
@@ -1721,7 +1754,7 @@ class SessionAnalysis:
             filename_data = filename_base + f'_activity{format}'
         else:
             filename_data = filename_base + f'_estimates{format}'
-        filename_meta = filename_base + f'_metadata.pkl'
+        filename_meta = filename_base + '_metadata.pkl'
         
         # collect data that will be saved
         est_data_fields = ['C', 'F_dff', 'F_dff_denoised', 'S', 'YrA']
@@ -1859,7 +1892,7 @@ class SessionAnalysis:
         # restrict to single plane if requested
         if k_plane is not None:
             plane_pixels = int(np.prod(self.plane_size))
-            A = A[k_plane*plane_pixels:(k_plane+1)*plane_pixels, :]
+            A = A[k_plane*plane_pixels:(k_plane+1)*plane_pixels, :]  # type: ignore
             idx_used = np.flatnonzero(A.getnnz(axis=0) > 0)
             bg_proj = bg_proj[:, k_plane*self.plane_size[1]:(k_plane+1)*self.plane_size[1]]
         else:
@@ -1875,11 +1908,11 @@ class SessionAnalysis:
         # plot background and contours
         if marked_color is not None:
             idx_marked = np.intersect1d(idx_used, idx_marked)
-            cmcustom.my_vis_plot_contours(A[:, idx_marked], bg_proj, display_numbers=False,
+            cmcustom.my_vis_plot_contours(A[:, idx_marked], bg_proj, display_numbers=False,  # type: ignore
                                           cmap=cmap, colors=marked_color)
         if unmarked_color is not None:
             idx_unmarked = np.intersect1d(idx_used, idx_unmarked)
-            cmcustom.my_vis_plot_contours(A[:, idx_unmarked], bg_proj, display_numbers=False,
+            cmcustom.my_vis_plot_contours(A[:, idx_unmarked], bg_proj, display_numbers=False,  # type: ignore
                                           cmap=cmap, colors=unmarked_color)
         if remove_border:
             assert self.mc_result is not None, 'No mcorr results?'
@@ -1946,7 +1979,7 @@ class SessionAnalysis:
         gs = fig.add_gridspec(2 * n_comps, 1, height_ratios=[3, 1] * n_comps)
         image_dims = self.cnmf_fit.dims
 
-        for i, (comp_s, comp_t) in enumerate(zip(est.b.T, est.f)):
+        for i, (comp_s, comp_t) in enumerate(zip(est.b.T, est.f)):  # type: ignore
             im_ax = fig.add_subplot(gs[2*i, 0])
             im_ax.imshow(
                 comp_s.reshape(image_dims, order='F'), cmap='gray',
@@ -2177,8 +2210,8 @@ class SessionAnalysis:
 
         # get centers of mass
         dims = cast(tuple[int, int], est.dims)
-        A = sparse.csc_array(est.A) if not isinstance(est.A, MaybeSparse) else est.A
-        coms = rois.com(A[:, roi_ids], *dims)
+        A = sparse.csc_array(est.A)
+        coms: onp.Array2D[np.floating] = rois.com(A[:, roi_ids], *dims)  # type: ignore
 
         # get projection
         if isinstance(proj_type, str):
@@ -2252,7 +2285,7 @@ def load_cnmf(cnmf_filename: str, quiet=True) -> Optional[CNMFExt]:
     try:
         cnmf_obj = load_CNMFExt(cnmf_filename, dview=cluster.dview, quiet=quiet)
     except FileNotFoundError:
-        logging.warning(f'CNMF file could not be found; not loaded')
+        logging.warning('CNMF file could not be found; not loaded')
         return None
     else:
         # set n_processes since refit reads from it and passing this to load_CNMF doesn't actually do anything
@@ -2366,7 +2399,7 @@ def identify_marked_rois(cnmf_obj: CNMFExt, cnmf_filename: Optional[str], A_stru
         raise RuntimeError(f'Subset {subset} not valid')
     
     if isinstance(est.A, (sparse.sparray, sparse.spmatrix)):
-        A_functional = sparse.csc_matrix(est.A)[:, used_comps]
+        A_functional = sparse.csc_matrix(est.A)[:, used_comps]  # type: ignore
     else:
         A_functional = est.A[:, used_comps]
 
@@ -2404,9 +2437,9 @@ def calc_df_over_f(est: Estimates, use_residuals=True, roi_subset: Optional[Sequ
     if roi_subset is not None:
         # index to just the component(s) requested
         if isinstance(est.A, (sparse.coo_matrix, sparse.coo_array)):
-            A = sparse.csc_matrix(est.A)[:, roi_subset]
+            A = sparse.csc_matrix(est.A)[:, roi_subset]  # type: ignore
         else:
-            A = est.A[:, roi_subset]
+            A = est.A[:, roi_subset]  # type: ignore
 
         C = est.C[roi_subset]
         YrA = est.YrA[roi_subset]

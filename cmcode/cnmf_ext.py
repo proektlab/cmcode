@@ -11,12 +11,13 @@ from typing import Optional, Literal, Union
 
 import numpy as np
 from numpy.typing import NDArray
+import optype.numpy as onp
 from pandas import NA
 from scipy import sparse
 from scipy.interpolate import PchipInterpolator, interp1d
 from caiman.source_extraction.cnmf import cnmf, params, merging
 
-from cmcode import alignment, caiman_analysis as cma, caiman_params as cmp
+from cmcode import alignment, caiman_params as cmp
 from cmcode.cmcustom import compute_snr_gamma
 from cmcode.util import paths
 
@@ -46,8 +47,8 @@ class EstimatesExt(cnmf.Estimates):
         if hasattr(base_obj, 'Cn'):
             logging.info('Ignoring saved correlation image (deprecated)')
 
-        self.accepted_list = getattr(base_obj, 'accepted_list', np.array([], dtype=int))
-        self.rejected_list = getattr(base_obj, 'rejected_list', np.array([], dtype=int))
+        self.accepted_list: onp.Array1D[np.integer] = getattr(base_obj, 'accepted_list', np.array([], dtype=int))
+        self.rejected_list: onp.Array1D[np.integer] = getattr(base_obj, 'rejected_list', np.array([], dtype=int))
         self.structural_reg_res: Optional[alignment.RegisterROIsResults] = getattr(base_obj, 'structural_reg_res', None)
         self.F_dff_denoised: Optional[np.ndarray] = getattr(base_obj, 'F_dff_denoised', None)
         self.snr_type: Literal['normal', 'gamma'] = getattr(base_obj, 'snr_type', 'normal')
@@ -259,7 +260,7 @@ class EstimatesExt(cnmf.Estimates):
         split_indices_ds = np.cumsum(frames_per_trial_ds[:-1])
         
         # create replacement for each variable with time dimension
-        def interpolate_each_trial(var: np.ndarray, method: str, axis=1) -> np.ndarray:
+        def interpolate_each_trial(var: onp.Array2D[np.floating], method, axis=1) -> onp.Array2D[np.floating]:
             var_out = np.empty((var.shape[0], total_frames), dtype=var.dtype)
             var_trials = np.split(var, split_indices_ds, axis=axis)
             var_out_trials = np.split(var_out, split_indices, axis=axis)
@@ -456,11 +457,11 @@ def _load_CNMFExt(filename: str) -> CNMFExt:
     if hasattr(cnmf_obj, 'estimates_ext') and 'crossplane_merge_thr_used' not in getattr(cnmf_obj, 'estimates_ext'):
         params_path = paths.params_file_for_result(filename)
         try:
-            saved_params = cmp.read_params_up_to_stage(cmp.AnalysisStage.EVAL, params_path)
+            saved_params = cmp.UpToEvalParamStruct.read_from_file(params_path)
         except FileNotFoundError:
             pass
         else:
-            cnmf_obj_ext.estimates.crossplane_merge_thr_used = saved_params['cnmf_extra'].crossplane_merge_thr
+            cnmf_obj_ext.estimates.crossplane_merge_thr_used = saved_params.cnmf_extra.crossplane_merge_thr
 
     return cnmf_obj_ext
 

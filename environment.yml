@@ -8,11 +8,11 @@ dependencies:
 - distributed
 - hdf5storage
 - mesmerize-core
-- msgspec
 - mslex
 - nest-asyncio
 - ipympl
 - pip
+- pydantic
+- scipy-stubs
 - pip:
   - mesmerize-viz
-  - trycast

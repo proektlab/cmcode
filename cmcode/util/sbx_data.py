@@ -120,15 +120,15 @@ def find_sess_sbx_files(mouse_id: Union[int, str], sess_id: int, trials_to_inclu
 
     # apply trials_to_include
     if trials_to_include is not None:
-        b_include = np.in1d(trial_numbers, trials_to_include)
+        b_include = np.isin(trial_numbers, trials_to_include)
     else:
         b_include = np.ones(trial_numbers.shape, dtype=bool)
 
     if trials_to_exclude is not None:
-        b_include = b_include & ~np.in1d(trial_numbers, trials_to_exclude)
+        b_include = b_include & ~np.isin(trial_numbers, trials_to_exclude)
 
     trial_numbers = trial_numbers[b_include]
-    if trials_to_include is not None and any(~np.in1d(trials_to_include, trial_numbers)):
+    if trials_to_include is not None and any(~np.isin(trials_to_include, trial_numbers)):
         logging.warning('Not all requested trials were found')
     sbx_files = [f for f, bi in zip(sbx_files, b_include) if bi]
 

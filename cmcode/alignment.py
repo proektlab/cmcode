@@ -18,6 +18,7 @@ import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import ArrayLike
+import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 from scipy import sparse, ndimage, signal, optimize
@@ -250,7 +251,7 @@ def fix_offset(offset: ScaledDataFrame, skip_odd_y: bool, accounted_for_z_offset
         if z_unit is None:
             raise RuntimeError('Z has heterogneous units - cannot correct')
 
-        offset.z = (z_orig.to_um() - accounted_for_z_offset).to_unit(z_unit)
+        offset.z = (z_orig.to_um() - accounted_for_z_offset).to_unit(z_unit) # type: ignore
 
     if skip_odd_y:
         # in original movie pixel density is 2x along y axis
@@ -260,7 +261,7 @@ def fix_offset(offset: ScaledDataFrame, skip_odd_y: bool, accounted_for_z_offset
 
         y_um = y_orig.to_um()
         y_um.um_per_pixel = umpp_orig / 2
-        offset.y = y_um.to_unit(y_orig.unit)
+        offset.y = y_um.to_unit(y_orig.unit) # type: ignore
     return offset
 
 
@@ -456,8 +457,8 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
         xcorr_best = xcorr[:, :, max_z]
     else:
         xy_offset_pix = xy_offset.to_pixels()
-        x_shift = round(xy_offset_pix.at[0, 'x'])
-        y_shift = round(xy_offset_pix.at[0, 'y'])
+        x_shift = round(xy_offset_pix.at[0, 'x'])  # type: ignore
+        y_shift = round(xy_offset_pix.at[0, 'y'])  # type: ignore
         xcorr_best = max_x = max_y = None
     
     # shift matrices 
@@ -1108,7 +1109,7 @@ def load_or_compute_remaps_for_sessions(
     xy_remaps = None
     loaded_from_untagged = False
     mapping_load_path = None
-    if use_saved_mappings == False:
+    if use_saved_mappings is False:
         logging.info('Not trying to load mappings since use_saved_mappings is false')
     else:
         # find latest tagged or untagged saved file
@@ -1267,7 +1268,7 @@ def threshold_masks(A: sparse.csc_matrix, max_thr: float):
     remove_rows = np.array([], dtype=np.int32)
     remove_cols = np.array([], dtype=np.int32)
     for k in range(A.shape[1]):
-        roi = A[:, [k]].toarray()
+        roi = A[:, [k]].toarray()  # type: ignore
         below_thr = np.flatnonzero(np.squeeze(roi) < roi.max() * max_thr)
         remove_rows = np.concatenate((remove_rows, below_thr))
         remove_cols = np.concatenate((remove_cols, np.repeat(k, len(below_thr))))
@@ -1500,7 +1501,7 @@ def register_ROIs_multiple(
         matched_session = reg_results.matched1
         matched_union = reg_results.matched2
         nonmatch_session = reg_results.unmatched1
-        nonmatch_union = reg_results.unmatched2
+        nonmatch_union = reg_results.unmatched2  # noqa: F841
         performance = reg_results.performance
         A2 = reg_results.A2
         xy_remaps_out.append((reg_results.x_remap, reg_results.y_remap))
@@ -1509,9 +1510,10 @@ def register_ROIs_multiple(
 
         all_performance.append(performance)
 
-        A_union = deepcopy(A2)
-        A_union[:, matched_union] = A[sess][:, matched_session]
-        A_union = sparse.csc_array(sparse.hstack((A_union, A[sess][:, nonmatch_session])))
+        A_union = sparse.csc_array(A2, copy=True)
+        A_union[:, matched_union] = A[sess][:, matched_session]  # type: ignore
+        A_nonmatch = sparse.csc_array(A[sess][:, nonmatch_session])  # type: ignore
+        A_union = sparse.csc_array(sparse.hstack((A_union, A_nonmatch)))
         new_match = np.zeros(A[sess].shape[-1], dtype=int)
         new_match[matched_session] = matched_union
         new_match[nonmatch_session] = range(A2.shape[-1], A_union.shape[-1])
@@ -1663,7 +1665,7 @@ def register_ROIs_multisession(
     if use_accepted_only:
         accepted = ~np.isnan(assignments)  # shortcut b/c we know these are all accepted
     else:
-        accepted = np.stack([np.in1d(assn, acc) for assn, acc in zip(assignments.T, accepted_inds)], axis=1)        
+        accepted = np.stack([np.isin(assn, acc) for assn, acc in zip(assignments.T, accepted_inds)], axis=1)        
 
     save_data = {
         'mouse_id': mouse_id,
@@ -1879,8 +1881,10 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: ArrayLike, s
         
         # load session and select correct CNMF run
         sess_id = session_table.at[sess_ind, 'sess_id']
+        assert isinstance(sess_id, int)
         tag = session_table.at[sess_ind, 'tag']
-        uuid = session_table.at[sess_ind, 'cnmf_uuid']
+        assert isinstance(tag, (str, type(None)))
+        uuid = str(session_table.at[sess_ind, 'cnmf_uuid'])
         sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
         sessinfo.select_gridsearch_run(uuid=uuid, force_reload=False)
 
@@ -1919,11 +1923,11 @@ def get_zmax_templates_and_borders_multisession(
 @dataclass(init=False)
 class SessionMappingData:
     """Stores info about ROIs in a session and mappings to other sessions"""
-    xy_mappings_to_others: dict[str, np.ndarray]  # maps other session names to X/Y remappings
-    accepted: np.ndarray  # idx_components
+    xy_mappings_to_others: dict[str, onp.Array3D[np.floating]]  # maps other session names to X/Y remappings
+    accepted: onp.Array1D[np.integer]  # idx_components
     uuid: str  # UUID of the CNMF run
-    matchings: np.ndarray  # union cell IDs of matched components
-    session_cell_ids: np.ndarray  # same length as matchings with the session cell IDs (defaults to all, in order)
+    matchings: onp.Array1D[np.integer]  # union cell IDs of matched components
+    session_cell_ids: onp.Array1D[np.integer]  # same length as matchings with the session cell IDs (defaults to all, in order)
     scan_date: date  # scan day
 
     def __init__(self, mouse_id: Union[int, str], sess_id: int, tag: Optional[str],
@@ -1971,7 +1975,7 @@ class SessionMappingData:
 class SessionMappingDataWithFlatFootprints(SessionMappingData):
     """SessionMappingData plus masks flattened in the Z axis"""
     dims: tuple[int, int]  # Y, X dimensions of each plane
-    xy_footprints: sparse.csc_matrix  # footprints flattened across the Z axis
+    xy_footprints: sparse.csc_matrix[np.floating]  # footprints flattened across the Z axis
     com: ScaledDataFrame  # x, y, plane coordinates of each ROI, in um
     weights: np.ndarray  # sum of masks for each component
 
@@ -2095,7 +2099,11 @@ def register_ROIs_multisession_3D(
     for i, (sess_id, tag, remaps_to_others) in enumerate(zip(sess_ids, tags, xy_remaps)):
         (other_names := sess_names.copy()).pop(i)
         remap_dict = {name: remap for name, remap in zip(other_names, remaps_to_others)}
-        session_z_offset_um = None if daily_offsets_um is None else daily_offsets_um.iloc[i].at['z']
+        if daily_offsets_um is None:
+            session_z_offset_um = None
+        else:
+            session_z_offset_um = daily_offsets_um.iloc[i].at['z']
+            assert isinstance(session_z_offset_um, float)
 
         this_session_data = SessionMappingDataWithFlatFootprints(
             mouse_id=mouse_id, sess_id=sess_id, tag=tag, remaps_to_others=remap_dict, rec_type=rec_type,
@@ -2124,10 +2132,11 @@ def register_ROIs_multisession_3D(
                 continue
             
             # map ROIs
-            map_mask = np.in1d(other_session.matchings, cells_to_map)
+            map_mask: onp.Array1D[np.bool_] = np.isin(other_session.matchings, cells_to_map)
             mapped_cell_ids = other_session.matchings[map_mask]
             xy_mapping = other_session.xy_mappings_to_others[session.sess_name]
-            A_mapped = footprints.map_footprints(other_session.xy_footprints[:, map_mask], tuple(xy_mapping))
+            A_mapped = footprints.map_footprints(other_session.xy_footprints[:, map_mask],  # type: ignore
+                                                 (xy_mapping[0], xy_mapping[1]))
             A_union[:, mapped_cell_ids] += A_mapped.multiply(other_session.weights[map_mask])
             coms_mapped = remap_points_from_df(other_session.com.loc[map_mask, :], *xy_mapping)
             coms_weighted = coms_mapped.to_numpy() * other_session.weights[map_mask, np.newaxis]
@@ -2137,7 +2146,7 @@ def register_ROIs_multisession_3D(
         com_union = com_union[cells_to_map, :] / comp_weights_union[cells_to_map, np.newaxis]
         A_union = sparse.csc_array(A_union[:, cells_to_map])
         # normalize to be unit vectors
-        A_union = A_union / A_union.power(2).sum()
+        A_union = A_union / np.float32(A_union.power(2).sum())
 
         # now find matchings to this session's ROIs using register_ROIs
         D_pow = 1 + n_matched_weight * (n_matched[cells_to_map] - 1)  # weigh components by n_matched
@@ -2170,7 +2179,7 @@ def register_ROIs_multisession_3D(
         this_included_rois = sess.session_cell_ids
         included_rois.append(this_included_rois)
         assgn_col[sess.matchings] = this_included_rois
-        accept_col[sess.matchings] = np.in1d(this_included_rois, sess.accepted)
+        accept_col[sess.matchings] = np.isin(this_included_rois, sess.accepted)
     
     save_data = {
         'mouse_id': mouse_id,

@@ -7,6 +7,7 @@ import cv2
 import matplotlib.pyplot as plt
 from matplotlib.axes import Axes
 import numpy as np
+import optype.numpy as onp
 from scipy.ndimage import label
 from scipy.sparse import csc_array, csc_matrix, lil_array
 from scipy.stats import gamma, norm, loggamma
@@ -75,14 +76,14 @@ def my_plot_contours(est: cnmf.Estimates, img=None, idx=None, thr_method='max',
         coor_g = [est.coordinates[cr] for cr in idx]
         bad = list(set(range(len(est.coordinates))) - set(idx))
         coor_b = [est.coordinates[cr] for cr in bad]
-        my_vis_plot_contours(A[:, idx], img,
+        my_vis_plot_contours(A[:, idx], img,    # type: ignore
                              coordinates=coor_g,
                              display_numbers=display_numbers,
                              inds_for_numbers=idx,
                              colors=accept_color,
                              cmap=cmap, vmin=vmin, vmax=vmax)
 
-        my_vis_plot_contours(A[:, bad], img,
+        my_vis_plot_contours(A[:, bad], img,    # type: ignore
                              coordinates=coor_b,
                              display_numbers=display_numbers,
                              inds_for_numbers=bad,
@@ -304,14 +305,14 @@ def compute_matching_performance(n1: int, n2: int, n_matched: int) -> dict[str, 
     return performance
 
 
-def my_extract_binary_masks_from_structural_channel(Y,
+def my_extract_binary_masks_from_structural_channel(Y: Union[onp.Array2D[np.floating], onp.Array3D[np.floating]],
                                                     blur_type: Literal['box', 'gaussian'] = 'gaussian',
                                                     blur_gSig_multiple: Optional[float] = None,
                                                     min_area_size: int = 30,
                                                     min_hole_size: int = 15,
                                                     gSig: Union[int, Sequence[int]] = 5,
                                                     expand_method: str = 'closing',
-                                                    selem: np.ndarray = np.ones((3, 3))) -> tuple[csc_array, np.ndarray]:
+                                                    selem: np.ndarray = np.ones((3, 3))) -> tuple[csc_array[np.bool_], np.ndarray]:
     """
     Extract binary masks by using adaptive thresholding on a structural channel
     My version allows using multiple gSigs, where each subsequent iteration only considers areas not included in
@@ -355,29 +356,33 @@ def my_extract_binary_masks_from_structural_channel(Y,
     if blur_gSig_multiple is None:
         blur_gSig_multiple = 1 if blur_type == 'box' else 0.75
 
-    mR = Y.mean(axis=0) if Y.ndim == 3 else Y
-    n_pix = np.prod(mR.shape)
+    if onp.is_array_3d(Y):
+        mR = np.mean(Y, axis=0)
+    else:
+        mR = Y
+
+    n_pix = np.prod(mR.shape).item()
     occupied = np.zeros(n_pix, dtype=bool)
     A = lil_array((0, n_pix), dtype=bool)
     features_added = 0
 
     for single_gSig in gSig:
         blur_sig = blur_gSig_multiple * single_gSig
+        img = np.empty_like(mR)
         if blur_type == 'box':
             blur_sig = round(blur_sig)
-            img = cv2.blur(mR, (blur_sig, blur_sig))
+            cv2.blur(mR, (blur_sig, blur_sig), dst=img)
         else:
-            img = cv2.GaussianBlur(mR, (0, 0), blur_sig)
+            cv2.GaussianBlur(mR, (0, 0), blur_sig, dst=img)
+
         img = (img - np.min(img)) / (np.max(img) - np.min(img)) * 255.
         img = img.astype(np.uint8)
 
-        th = cv2.adaptiveThreshold(img, np.max(img), cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, single_gSig, 0)
+        th = np.empty_like(img)
+        cv2.adaptiveThreshold(img, np.max(img), cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, single_gSig, 0, dst=th)
         th = remove_small_holes(th > 0, area_threshold=min_hole_size)
-        th = remove_small_objects(th, min_size=min_area_size)
-        label_res = label(th)
-
-        assert isinstance(label_res, tuple)  # stupid non-type-stable scipy function
-        labeled_array, num_features = label_res            
+        th: onp.Array2D[np.uint8] = remove_small_objects(th, min_size=min_area_size)
+        labeled_array, num_features = label(th)
 
         for i in range(num_features):
             temp = (labeled_array == i + 1)
@@ -390,14 +395,14 @@ def my_extract_binary_masks_from_structural_channel(Y,
             # only add if these pixels are not already occuied by another feature
             if not np.any(occupied[temp_flat]):
                 occupied[temp_flat] = True
-                A.resize((features_added + 1, n_pix))
-                A.getrowview(features_added)[:] = temp_flat
+                A.resize(features_added + 1, n_pix)
+                A.getrowview(features_added)[:] = temp_flat  # type: ignore
                 features_added += 1
 
     return A.tocsr().T, mR
 
 
-def compute_snr_gamma(C: np.ndarray, YrA: np.ndarray, use_loggamma=True,
+def compute_snr_gamma(C: onp.Array2D, YrA: onp.Array2D, use_loggamma=True,
                       remove_baseline=True, N=5, sigma_factor=3., dview=None) -> np.ndarray:
     """
     Compute an SNR measure based on fitting a gamma distribution to the residuals (YrA)

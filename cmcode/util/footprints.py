@@ -3,13 +3,14 @@ from dataclasses import dataclass
 from functools import cache
 import logging
 import math
-from typing import Any, Literal, Union, Sequence, Callable, Optional, Mapping
+from typing import Any, Literal, Union, Sequence, Callable, Optional, Mapping, overload
 from warnings import warn
 
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
 from numpy.typing import ArrayLike
+import optype.numpy as onp
 from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import gaussian_filter
 from scipy import sparse
@@ -20,35 +21,39 @@ from cmcode import caiman_analysis as cma, cmcustom
 from cmcode.cmcustom import my_get_contours
 from cmcode.util.image import make_merge, BorderSpec
 from cmcode.util.naming import make_sess_name
-from cmcode.util.types import MaybeSparse
+from cmcode.util.types import MaybeSparse, ST
 
 
-def normalize_footprints(A: MaybeSparse) -> sparse.csc_matrix:
+def normalize_footprints(A: MaybeSparse[np.floating]) -> sparse.csc_matrix[np.floating]:
+    """Make a copy with each column normalized"""
     A = sparse.csc_matrix(A, copy=True)
-    norms = np.squeeze(A.power(2).sum(axis=0).sqrt())
+    norms = np.sqrt(A.power(2).sum(axis=0))
     nonempty = norms != 0
-    A[:, nonempty] /= norms[nonempty]
+    A[:, nonempty] /= norms[nonempty]  # type: ignore
     return A
 
 
 def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9,
-                        nonempty_filter: Optional[np.ndarray] = None) -> sparse.csc_matrix:
+                        nonempty_filter: Optional[onp.Array1D[Union[np.bool_, np.integer]]] = None
+                        ) -> sparse.csc_matrix[np.bool_]:
     """
     Binarize pixels in each column of A using thresholding method
     Pass nonempty_filter as a list of indices or binary mask to indicate which columns should be processed.
     """
     A = sparse.csc_matrix(A)
-    if A.dtype == bool:
+    if A.dtype == np.bool_:
         # don't re-binarize
         return A
 
     if nonempty_filter is None:
         nonempty_filter = np.arange(A.shape[1])
-    elif nonempty_filter.dtype == bool:
+
+    if onp.is_array_1d(nonempty_filter, np.bool_):
         if nonempty_filter.size != A.shape[1]:
             raise ValueError('Boolean nonempty_filter must be a mask with length equal to number of components')
         nonempty_filter = np.flatnonzero(nonempty_filter)
-    assert nonempty_filter is not None
+    elif not onp.is_array_1d(nonempty_filter, np.integer):
+        raise TypeError('nonempty_filter must be a 1D array of ints or bools')
 
     if method == 'max':
         max_vals = A.max(axis=0)
@@ -56,7 +61,7 @@ def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', t
     else:
         if method != 'nrg':
             raise ValueError(f'Unrecogized thresholding method {thr}')
-        A_binarized = sparse.lil_matrix(A.T.shape, dtype=bool)  # construct transposed
+        A_binarized = sparse.lil_matrix(A.T.shape, dtype=np.bool_)  # construct transposed
         for c in nonempty_filter:
             patch_data = A.data[A.indptr[c]:A.indptr[c+1]]
             if len(patch_data) == 0:
@@ -71,11 +76,11 @@ def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', t
         return A_binarized.tocsr().T
 
 
-def count_pixels(A: sparse.csc_matrix, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9) -> np.ndarray:
+def count_pixels(A: sparse.csc_matrix, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9) -> onp.Array1D[np.integer]:
     """Just count pixels for each component in A after applying energy or max threshold"""
     if method == 'max' or A.dtype == bool:
         A_binarized = binarize_footprints(A, method, thr)
-        return A_binarized.sum(axis=0)
+        return np.asarray(A_binarized.sum(axis=0))[0]
     else:
         if method != 'nrg':
             raise ValueError(f'Unrecogized thresholding method {thr}')
@@ -88,29 +93,55 @@ def count_pixels(A: sparse.csc_matrix, method: Literal['nrg', 'max'] = 'nrg', th
         return n_pix
 
 
-def collapse_footprints_to_xy(A: MaybeSparse, n_planes: int, binarize=False, **binarize_kwargs
-                              ) -> sparse.csc_matrix:
+def binarize_and_collapse_to_xy(A: MaybeSparse, n_planes: int, **binarize_kwargs) -> sparse.csc_matrix[np.bool_]:
+    """
+    Convert X/Y/Z ROIs to X/Y ROIs by binarizing each plane separately and taking the intersection.
+    """
+    xy_size = A.shape[0] // n_planes
+    xy_mask = sparse.csc_matrix((xy_size, A.shape[1]), dtype=bool)
+
+    for k_plane in range(n_planes):
+        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]  # type: ignore
+        plane_mask = binarize_footprints(plane_footprints, **binarize_kwargs)
+        xy_mask = xy_mask + plane_mask
+
+    return xy_mask
+    
+
+@overload
+def collapse_footprints_to_xy(A: MaybeSparse[ST], n_planes: int, binarize: Literal[False], **binarize_kwargs) -> sparse.csc_matrix[ST]:
+    ...
+
+@overload
+def collapse_footprints_to_xy(A: MaybeSparse, n_planes: int, binarize: Literal[True], **binarize_kwargs) -> sparse.csc_matrix[np.bool_]:
+    ...
+
+def collapse_footprints_to_xy(A: MaybeSparse, n_planes: int, binarize=False, **binarize_kwargs) -> sparse.csc_matrix:
     """
     Convert X/Y/Z ROIs to X/Y ROIs by summing over z.
     If binarize is true, binarizes each plane separately, to avoid weird effects of 
     components from different planes being jointly normalized.
     """
+    if binarize:
+        return binarize_and_collapse_to_xy(A, n_planes, **binarize_kwargs)
+
     xy_size = A.shape[0] // n_planes
-    xy_footprints = sparse.csc_matrix((xy_size, A.shape[1]), dtype=bool if binarize else float)
+    xy_footprints = sparse.csc_matrix((xy_size, A.shape[1]), dtype=A.dtype)
+
     for k_plane in range(n_planes):
-        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]
-        if binarize:
-            plane_footprints = binarize_footprints(plane_footprints, **binarize_kwargs)
+        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]  # type: ignore
         xy_footprints += plane_footprints
-    return xy_footprints
+
+    return sparse.csc_matrix(xy_footprints)
 
 
-def get_bboxes(A: MaybeSparse, dims: tuple[int, int], nonempty_filter: Optional[np.ndarray] = None,
-               expand_radius=0) -> list[BorderSpec]:
+def get_bboxes(
+        A: MaybeSparse, dims: tuple[int, int], nonempty_filter: Optional[onp.Array1D[Union[np.bool_, np.integer]]] = None,
+        expand_radius=0) -> list[BorderSpec]:
     """For 2D footprints, find the bounding boxes of nonempty pixels"""
     if nonempty_filter is None:
         b_nonempty = np.ones(A.shape[1], dtype=bool)
-    elif nonempty_filter.dtype != bool:
+    elif not onp.is_array_1d(nonempty_filter, np.bool_):
         b_nonempty = np.zeros(A.shape[1], dtype=bool)
         b_nonempty[nonempty_filter] = True
     else:
@@ -144,9 +175,10 @@ def get_bboxes(A: MaybeSparse, dims: tuple[int, int], nonempty_filter: Optional[
     return bboxes
 
 
-def smooth_footprints(A: MaybeSparse, dims: tuple[int, int], sigma: float, truncate_sigmas=4.,
-                      nonempty_filter: Optional[np.ndarray] = None, bboxes: Optional[list[BorderSpec]] = None
-                      ) -> sparse.csc_matrix:
+def smooth_footprints(
+        A: MaybeSparse[np.floating], dims: tuple[int, int], sigma: float, truncate_sigmas=4.,
+        nonempty_filter: Optional[onp.Array1D[Union[np.bool_, np.integer]]] = None,
+        bboxes: Optional[list[BorderSpec]] = None) -> sparse.csc_matrix[np.floating]:
     """
     Smooth footprints with a Gaussian kernel.
         dims: spatial dimensions of each footprint
@@ -156,16 +188,17 @@ def smooth_footprints(A: MaybeSparse, dims: tuple[int, int], sigma: float, trunc
         bboxes: list of BorderSpecs reflecting bounding boxes of nonempty pixels, for efficient filtering.
             If not None, will be UPDATED with new bounding boxes after smoothing.
     """
+    if bboxes is None:
+        bboxes = get_bboxes(A, dims=dims, nonempty_filter=nonempty_filter)
+
     if nonempty_filter is None:
         nonempty_filter = np.arange(A.shape[1])
-    elif nonempty_filter.dtype == bool:
+    elif onp.is_array_1d(nonempty_filter, np.bool_):
         if nonempty_filter.size != A.shape[1]:
             raise ValueError('Boolean nonempty_filter must be a mask with length equal to number of components')
         nonempty_filter = np.flatnonzero(nonempty_filter)
-    assert nonempty_filter is not None
-
-    if bboxes is None:
-        bboxes = get_bboxes(A, dims=dims, nonempty_filter=nonempty_filter)
+    elif not onp.is_array_1d(nonempty_filter, np.integer):
+        raise TypeError('nonempty_filter should be a 1D array of ints or bools')
 
     # process one component at a time
     radius = round(truncate_sigmas * sigma)
@@ -185,7 +218,7 @@ def smooth_footprints(A: MaybeSparse, dims: tuple[int, int], sigma: float, trunc
     return A_smoothed.tocsr().T
     
 
-def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray], tuple[None, None]]) -> sparse.csc_matrix:
+def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray], tuple[None, None]]) -> sparse.csc_matrix[np.float32]:
     """Use x/y remap derived from align_templates to map a set of footprints"""
     x_remap, y_remap = xy_remap
     if x_remap is None or y_remap is None:
@@ -195,13 +228,15 @@ def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray]
 
     dims = x_remap.shape
     A2 = sparse.csc_matrix(A)
-    rois2_2d = (A2[:, [i]].toarray().reshape(dims, order='F') for i in range(A2.shape[1]))      
+    rois2_2d = (A2[:, [i]].toarray().reshape(dims, order='F') for i in range(A2.shape[1]))  # type: ignore  
     coo_data = np.array([], dtype=np.float32)
     rows = np.array([], dtype=np.int32)
     cols = np.array([], dtype=np.int32)
     # use iterator to avoid pulling whole array into memory at once
     for i, roi2_2d in enumerate(rois2_2d):
-        remapped_roi = np.ravel(cv2.remap(roi2_2d.astype(np.float32), x_remap, y_remap, cv2.INTER_NEAREST), order='F')
+        remapped_roi_2d = np.empty(x_remap.shape, dtype=np.float32)
+        cv2.remap(roi2_2d.astype(np.float32), x_remap, y_remap, cv2.INTER_NEAREST, dst=remapped_roi_2d)
+        remapped_roi = np.ravel(remapped_roi_2d, order='F')
         roi_nonzero = np.flatnonzero(remapped_roi)
         coo_data = np.concatenate((coo_data, remapped_roi[roi_nonzero]))
         rows = np.concatenate((rows, roi_nonzero))
@@ -210,7 +245,7 @@ def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray]
     return sparse.csc_matrix(sparse.coo_matrix((coo_data, (rows, cols)), shape=A2.shape))
 
 
-def make_spatial_seed_from_projection(proj: np.ndarray, seed_params_extra: dict[str, Any]) -> sparse.csc_array:
+def make_spatial_seed_from_projection(proj: onp.Array2D[np.floating], seed_params_extra: dict[str, Any]) -> sparse.csc_array[np.bool_]:
     """Extract binary spatial seed from projection image and parameters"""
     borders: list[BorderSpec] = seed_params_extra.pop('borders')
     concat_planes = len(borders)
@@ -221,16 +256,19 @@ def make_spatial_seed_from_projection(proj: np.ndarray, seed_params_extra: dict[
     else:
         planes = [proj]
 
-    Ain_planes: list[sparse.csc_array] = []
+    Ain_planes: list[sparse.csc_array[np.bool_]] = []
     for plane, border in zip(planes, borders):
         center_slices = border.slices(plane.shape)
         plane_center = plane[center_slices]
-        Ain_plane, _ = cmcustom.my_extract_binary_masks_from_structural_channel(plane_center, **seed_params_extra)
+        Ain_center, _ = cmcustom.my_extract_binary_masks_from_structural_channel(plane_center, **seed_params_extra)
         # fix rows to take border into account
-        ind_array = np.arange(plane.size, dtype=int).reshape(plane.shape, order='F')
+        ind_array = np.arange(plane.size, dtype=np.int32).reshape(plane.shape, order='F')
         inds_used = ind_array[center_slices].ravel(order='F')
-        Ain_plane.resize((plane.size, Ain_plane.shape[1]))  # expand shape to take border into account
-        Ain_plane.indices = inds_used[Ain_plane.indices]  # offset indices to take border into account
+
+        Ain_plane = sparse.csc_array( # offset indices to take border into account
+            (Ain_center.data, inds_used[Ain_center.indices], Ain_center.indptr),
+            shape=(plane.size, Ain_center.shape[1])
+        )
         Ain_planes.append(Ain_plane)
 
     return sparse.block_diag(Ain_planes, format='csc')  # type: ignore
@@ -259,7 +297,7 @@ def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[fl
     return footprints_aug, zs_aug
 
 
-def make_footprint_interpolator(footprints: ArrayLike, zs: Union[Sequence[float], np.ndarray],
+def make_footprint_interpolator(footprints: onp.ToArray2D, zs: Union[Sequence[float], np.ndarray],
                                 z_border: float = 20, n_border_points=0, **mss_kwargs) -> Callable[[float], np.ndarray]:
     """
     Make function to interpolate between multiple footprints at different z locations, to a new z location.

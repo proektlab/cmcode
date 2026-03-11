@@ -5,7 +5,7 @@ import logging
 import os
 from pathlib import Path
 import shutil
-from typing import Any, Optional, Mapping
+from typing import Any, Optional
 
 import numpy as np
 
@@ -261,8 +261,9 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
         and returning None and writing out params if no params file was found.
         """
         try:
-            if not sessdata.result_file_matches_params(file_path, stage, raise_on_missing_params=True):
-                logging.warning(file_desc + ' had non-matching parameters')
+            nonmatching_params = list(sessdata.get_nonmatching_params_for_result_file(file_path, stage))
+            if len(nonmatching_params) > 0:
+                logging.warning(file_desc + ' had non-matching parameters: ' + ', '.join(nonmatching_params))
                 sessdata.invalidate_from_stage(stage)
                 return False
         except FileNotFoundError:
@@ -275,7 +276,7 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
         for k_plane, plane_file in enumerate(sessdata.plane_tifs):
             file_desc = f'plane {k_plane} TIF file'
             valid = check_file(plane_file, cmp.AnalysisStage.CONVERT, file_desc)
-            if valid == False:
+            if valid is False:
                 return
             
     # to know where to invalidate if motion params saved in CNMF don't match
@@ -286,17 +287,17 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
         for k_plane, mcorr_file in enumerate(sessdata.mc_result.mmap_files):
             file_desc = f'plane {k_plane} motion correction'
             valid = check_file(mcorr_file, cmp.AnalysisStage.MCORR, file_desc)
-            if valid == True:
+            if valid is True:
                 last_validated_stage = cmp.AnalysisStage.MCORR
-            elif valid == False:
+            elif valid is False:
                 return
     
     if sessdata.mmap_file_transposed is not None:
         valid = check_file(sessdata.mmap_file_transposed, cmp.AnalysisStage.TRANSPOSE,
                              'transposed/concatenated mmap file')
-        if valid == True:
+        if valid is True:
             last_validated_stage = cmp.AnalysisStage.TRANSPOSE
-        elif valid == False:
+        elif valid is False:
             return
     
     if sessdata.cnmf_fit_filename is not None:
@@ -340,4 +341,8 @@ def infer_params_from_cnmf_run(cnmf_filename: str) -> dict[str, dict[str, Any]]:
     cnmf_params = cnmf.params.to_dict()
     # blank out fnames to avoid data validation issue
     cnmf_params['data']['fnames'] = None
+    # blank out nb in spatial and temporal sections
+    # (these are filled automatically from init.nb when CNMFParams object is created)
+    del cnmf_params['spatial']['nb']
+    del cnmf_params['temporal']['nb']
     return cnmf_params

@@ -4,7 +4,7 @@ Functions for doing grid searches of parameters using mesmerize-core
 from itertools import product
 import os
 from pathlib import Path
-from typing import Any, Optional, Iterable, Union, Mapping, Sequence
+from typing import Any, Optional, Iterable, Union, Mapping, Sequence, cast
 
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -13,6 +13,7 @@ from mesmerize_core.caiman_extensions.common import Waitable
 
 from cmcode import caiman_analysis as cma, cmcustom
 from cmcode.caiman_params import AnalysisStage
+from cmcode.util import types
 
 
 ParamGrid = Mapping[tuple[str, str], Iterable]
@@ -84,9 +85,9 @@ def do_cnmf_gridsearch(sessdata: 'cma.SessionAnalysis', params_to_search: Union[
 
 class GridsearchError(RuntimeError):
     """Error shown after a gridsearch has failed, which displays the traceback of the first failed run if possible."""
-    def __init__(self, batch: pd.DataFrame, orig_nruns: int):
+    def __init__(self, batch: 'types.MescoreBatch', orig_nruns: int):
         """orig_nruns: How many runs were in the batch before this gridsearch."""
-        new_runs: pd.DataFrame = batch.iloc[orig_nruns:, :]
+        new_runs = batch.iloc[orig_nruns:, :]
         error_ind = None
         any_not_run = False
         for ind, row in new_runs.iterrows():
@@ -99,7 +100,8 @@ class GridsearchError(RuntimeError):
         if error_ind is not None:
             # get backtrace
             err_uuid = new_runs.at[ind, 'uuid']
-            err_bt = new_runs.at[ind, 'outputs']['traceback']
+            err_outputs = cast(dict, new_runs.at[ind, 'outputs'])
+            err_bt = err_outputs['traceback']
             super().__init__(f'Error running gridsearch - first error in UUID {err_uuid}. Backtrace:\n' + err_bt)
         elif not any_not_run:
             super().__init__('CNMF succeeded, but another error was raised in run script - see above.')

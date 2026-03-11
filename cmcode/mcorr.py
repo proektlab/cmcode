@@ -16,6 +16,7 @@ import caiman as cm
 from caiman.base.movies import get_file_size
 from caiman.motion_correction import MotionCorrect, get_patch_centers
 from caiman.paths import decode_mmap_filename_dict, memmap_frames_filename
+from caiman.source_extraction.cnmf.params import MotionParams
 import cv2
 import holoviews as hv
 from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel
@@ -47,7 +48,7 @@ class MCResult(paths.CustomPathMappable):
     shifts_rig: list[np.ndarray]
     shifts_els: Optional[list[np.ndarray]] = None
     dims: Optional[tuple[int, int]] = None
-    motion_params: Optional[dict] = None
+    motion_params: Optional[MotionParams] = None
     mmap_file_transposed: Optional[str] = None  # deprecated, keep for unpickling
 
     # cached datasets
@@ -88,6 +89,9 @@ class MCResult(paths.CustomPathMappable):
 
         if 'border_asym' not in state:
             state['border_asym'] = [BorderSpec.equal(state['border_to_0'])] * len(state['mmap_files'])
+        
+        if 'motion_params' in state and isinstance(state['motion_params'], dict):
+            state['motion_params'] = MotionParams(**state['motion_params'])
 
         self.__dict__.update(state)
 
@@ -133,8 +137,8 @@ class MCResult(paths.CustomPathMappable):
 
             # find patch locations
             patch_centers_y, patch_centers_x = get_patch_centers(
-                self.dims, strides=self.motion_params['strides'], overlaps=self.motion_params['overlaps'],
-                upsample_factor_grid=self.motion_params['upsample_factor_grid'], shifts_opencv=self.motion_params['shifts_opencv'])
+                self.dims, strides=self.motion_params.strides, overlaps=self.motion_params.overlaps,
+                upsample_factor_grid=self.motion_params.upsample_factor_grid, shifts_opencv=self.motion_params.shifts_opencv)
             
             npatch_y = len(patch_centers_y)
             npatch_x = len(patch_centers_x)
@@ -169,9 +173,7 @@ class MCResult(paths.CustomPathMappable):
     def apply_path_mapper(self, path_mapper: paths.PathMapper[P], *args: P.args, **kwargs: P.kwargs) -> 'MCResult':
         """Implements CustomPathMappable by normalizing paths to memmap files"""
         res_norm = deepcopy(self)
-        for field in ['mmap_files', 'mmap_file_transposed']:
-            norm_path = path_mapper(getattr(res_norm, field), *args, **kwargs)
-            setattr(res_norm, field, norm_path)  # type: ignore
+        res_norm.mmap_files = path_mapper(res_norm.mmap_files, *args, **kwargs)
         return res_norm
 
     def has_same_shifts_as(self, other: 'MCResult') -> bool:
@@ -204,7 +206,7 @@ class MCResult(paths.CustomPathMappable):
                 shifts_els = self.shifts_els[kplane]
                 mcorr_obj.x_shifts_els = list(shifts_els[0])
                 mcorr_obj.y_shifts_els = list(shifts_els[1])
-                if self.motion_params['is3D']:
+                if self.motion_params.is3D:
                     mcorr_obj.z_shifts_els = list(shifts_els[2])
             mcorr_objs.append(mcorr_obj)
         return mcorr_objs
@@ -294,14 +296,14 @@ def compute_border_asym(shifts: np.ndarray) -> BorderSpec:
     return BorderSpec(top=max_top, bottom=max_bottom, left=max_left, right=max_right)
 
 
-def compute_adjusted_indices(params_for_mcorr: cmp.UpToMcorrParamDict) -> Optional[tuple[slice, slice]]:
+def compute_adjusted_indices(params_for_mcorr: cmp.UpToMcorrParamStruct) -> Optional[tuple[slice, ...]]:
     """
     Compute indices (sub-region to motion correct) corrected for crop, ndead and offset (to exclude dead pixels)
     """
-    indices: tuple[slice, slice] = params_for_mcorr['motion']['indices']
-    ndead = params_for_mcorr['conversion'].odd_row_ndead
-    offset = params_for_mcorr['conversion'].odd_row_offset
-    crop = params_for_mcorr['conversion'].crop
+    indices = params_for_mcorr.motion.indices
+    ndead = params_for_mcorr.conversion.odd_row_ndead
+    offset = params_for_mcorr.conversion.odd_row_offset
+    crop = params_for_mcorr.conversion.crop
     
     # compute left border and exclude, if not already cropped out
     ndead_max = 0 if ndead is None else max(ndead)
@@ -367,19 +369,19 @@ def load_mcorr_result(mmap_path: str) -> PlaneMcorrResult:
     )
 
 
-def motion_correct_file(tif_file: str, motion_params: dict[str, Any], dview: Optional[Cluster] = None) -> PlaneMcorrResult:
+def motion_correct_file(tif_file: str, motion_params: MotionParams, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
     """Runs motion correction on the given file (does not attempt to load)"""
     # First, make a link to the tif_file with the current date, so that the mmap file will have it too
     tif_file_link = _make_hardlink_with_dt(tif_file)
 
     # Get path to output file we want to be created in the mcorr folder
-    expected_file = _build_motion_correct_path(tif_file_link, is_piecewise=motion_params['pw_rigid'])
+    expected_file = _build_motion_correct_path(tif_file_link, is_piecewise=motion_params.pw_rigid)
 
     # whether to first fit to subwindow and then apply to whole movie
     with set_output_location(expected_file):
         mcorr_obj = MotionCorrect(tif_file_link, **motion_params, dview=dview)
         # if we have indices, first compute using indices, then apply to the original movie.
-        if any(s != slice(None) for s in motion_params['indices']):
+        if any(s != slice(None) for s in motion_params.indices):
             mcorr_obj.motion_correct(save_movie=False)
             actual_file = apply_mcorr_to_file(mcorr_obj, tif_file_link)
             if expected_file != actual_file:
@@ -390,7 +392,7 @@ def motion_correct_file(tif_file: str, motion_params: dict[str, Any], dview: Opt
 
     # extract shifts
     shifts_rig = np.array(mcorr_obj.shifts_rig).T  # transpose to dims x frames
-    if motion_params["pw_rigid"] == True:
+    if motion_params.pw_rigid:
         x_shifts = mcorr_obj.x_shifts_els
         y_shifts = mcorr_obj.y_shifts_els
         shifts = [x_shifts, y_shifts]
@@ -584,7 +586,7 @@ def transpose_flatten_mc_mmap(
 
 
 def do_or_load_transpose(
-        mc_result: MCResult, params: cmp.UpToTransposeParamDict, fr: float, metadata: dict[str, Any],
+        mc_result: MCResult, params: cmp.UpToTransposeParamStruct, fr: float, metadata: dict[str, Any],
         dview: Optional[Cluster] = None, load: Optional[bool] = None) -> str:
     """
     Either load existing result or do the transpose, saving a params file along with it
@@ -594,24 +596,24 @@ def do_or_load_transpose(
             True: use previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results even if they already exist.
     """
-    if load != False:   # try to load existing results
-        expected_file = get_transposed_mmap_name(mc_result.mmap_files, params['transposition'])
+    if load is not False:   # try to load existing results
+        expected_file = get_transposed_mmap_name(mc_result.mmap_files, params.transposition)
         params_file = paths.params_file_for_result(expected_file)
         try:
-            loaded_params = cmp.read_params_up_to_stage(cmp.AnalysisStage.TRANSPOSE, params_file)
-            if cmp.do_params_match(params, loaded_params, metadata=metadata):
+            loaded_params = cmp.UpToTransposeParamStruct.read_from_file(params_file)
+            if loaded_params.do_params_match(params, metadata=metadata, stage=cmp.AnalysisStage.TRANSPOSE):
                 if load is None:  # only log if we were unsure whether to load
                     logging.info('Using existing transposed file: ' + expected_file)
                 return expected_file
         except FileNotFoundError:
             pass
         
-    if load == True:
+    if load is True:
         raise NoMatchingResultError('Cannot find matching transposed file.')
     else:
         # we are doing the transpose
-        res_file = transpose_flatten_mc_mmap(mc_result, params['transposition'], fr=fr, dview=dview)
+        res_file = transpose_flatten_mc_mmap(mc_result, params.transposition, fr=fr, dview=dview)
         # write params file as well
         params_file = paths.params_file_for_result(res_file)
-        cmp.write_params(params, params_file)
+        params.write_params(params_file, stage=cmp.AnalysisStage.TRANSPOSE)
         return res_file

@@ -201,8 +201,9 @@ class PathMapper(Generic[P], Protocol):
     @overload
     def __call__(self, obj: PurePath, *args: P.args, **kwargs: P.kwargs) -> PurePath: ...
 
+    PM = TypeVar('PM', bound=PathMappable)
     @overload
-    def __call__(self, obj: list[PathMappable], *args: P.args, **kwargs: P.kwargs) -> list[PathMappable]: ...
+    def __call__(self, obj: list[PM], *args: P.args, **kwargs: P.kwargs) -> list[PM]: ...
 
     N = TypeVar('N', bound='CustomPathMappable')
     @overload

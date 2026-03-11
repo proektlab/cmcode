@@ -1,5 +1,5 @@
 from copy import deepcopy
-from functools import partial, cache
+from functools import partial
 import logging
 import math
 import time
@@ -905,8 +905,8 @@ def my_check_register_ROIs(matched1: list[int],
     titles =[
         f'{contour1_name} ({pct_1:.2f}% matched)',
         f'{contour2_name} ({pct_2:.2f}% matched)',
-        f'Matched',
-        f'Unmatched'
+        'Matched',
+        'Unmatched'
     ]
 
     if isinstance(xrange, slice):
@@ -981,7 +981,9 @@ def my_check_register_ROIs(matched1: list[int],
             #     vals[1] if len(vals) > 1 else vals[0],
             #     vals[-1]
             # )
-            return tuple(np.percentile(data[~np.isnan(data)], [1, 99.96]))
+            pcts = np.percentile(data[~np.isnan(data)], [1, 99.96])
+            return float(pcts[0]), float(pcts[1])
+
         clims1 = infer_clims_robust(background1)
         clims2 = infer_clims_robust(background2)
     else:
@@ -1078,7 +1080,7 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
     lws2 = np.full(len(coordinates2), 1.)
     lws2[highlight2] = 2.
 
-    with mplstyle.context('dark_background'):
+    with mplstyle.context('dark_background'):  # type: ignore
         fig, axs = plt.subplots(2, 2, sharex=sharexy, sharey=sharexy)
         # top plots
         for ax, clims, image, coords, matched, unmatched, contour_color, title, lws in zip(
@@ -1366,7 +1368,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
 
     # convert cells_to_highlight to session indices
     def get_highlight_sess_ids(matchings: pd.DataFrame) -> list[int]:
-        b_take = np.in1d(matchings.index, cells_to_highlight)
+        b_take = np.isin(matchings.index, cells_to_highlight)
         if sum(b_take) < len(cells_to_highlight):
             logging.warning('Not all highlighted cells found in session')
         return list(matchings.loc[b_take, 'session_cell_id'])
@@ -1662,13 +1664,13 @@ def plot_mean_in_square_region(sessinfo: 'cma.SessionAnalysis', center: tuple[in
     bg_img: background image to plot; if None uses the mean projection
     plot_options: passed on to my_plot_contours (e.g. can override accept/reject colors, vmin, vmax)
     """
-    if sessinfo.mc_result is None:
-        raise RuntimeError('Motion correction not run')
+    if sessinfo.mmap_file_transposed is None:
+        raise RuntimeError('Motion correction or transpose not run')
 
     if sessinfo.cnmf_fit is None:
         raise RuntimeError('CNMF not run or not selected')
 
-    Yr, dims, T = caiman.load_memmap(sessinfo.mc_result.mmap_file_transposed)
+    Yr, dims, T = caiman.load_memmap(sessinfo.mmap_file_transposed)
     Yr_3d = np.reshape(Yr, dims + (T,), order='F')
     if bg_img is None:
         bg_img = sessinfo.get_projection('mean')
