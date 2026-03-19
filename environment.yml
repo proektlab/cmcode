@@ -11,8 +11,10 @@ dependencies:
 - mslex
 - nest-asyncio
 - ipympl
+- optype-numpy
 - pip
 - pydantic
+- setuptools < 82.0.0  # for mesmerize-viz (pkg_resources dependency in pygfx version)
 - scipy-stubs
 - pip:
   - mesmerize-viz

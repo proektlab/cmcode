@@ -49,7 +49,7 @@ from cmcode.util.compat import reconstruct_sessdata_obj, infer_params_from_cnmf_
 from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_files
 from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
-from cmcode.util.types import NoBatchFileError, MaybeSparse, NoMatchingResultError, MescoreBatch, MescoreSeries
+from cmcode.util.types import NoBatchFileError, NoMatchingResultError, MescoreBatch, MescoreSeries
 
 
 if in_jupyter():

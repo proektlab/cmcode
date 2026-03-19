@@ -8,6 +8,7 @@ import shutil
 from typing import Any, Optional
 
 import numpy as np
+from pydantic import TypeAdapter
 
 from cmcode import caiman_analysis as cma, caiman_params as cmp, cnmf_ext
 from cmcode.util.paths import normalize_path, params_file_for_result
@@ -129,7 +130,7 @@ def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
 
         eval_extra = cmp.EvalParamsExtra(**eval_extra_changes)
 
-        sessdata.params = cmp.SessionAnalysisParams(
+        sessdata.params = cmp.SessionAnalysisParams.from_cnmf_params(
             cnmf=cnmf_params, conversion=conversion, mcorr_extra=mcorr_extra, transposition=transposition, 
             cnmf_extra=cnmf_extra, eval_extra=eval_extra
         )
@@ -318,7 +319,7 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
             )
             params_file = params_file_for_result(sessdata.cnmf_fit_filename)
             logging.info('Writing missing parameters for CNMF')
-            cnmf_run_params.write_params_for_stage(cmp.AnalysisStage.CNMF, params_file)
+            cnmf_run_params.write_params(params_file, stage=cmp.AnalysisStage.CNMF)
 
             if invalid_stage is None:
                 # It matches, we can update our params (only things that don't matter for comparison)
@@ -338,7 +339,9 @@ def infer_params_from_cnmf_run(cnmf_filename: str) -> dict[str, dict[str, Any]]:
     """Find what info we can about the params used to produce a CNMF results file"""
     # use the params saved with the CNMF object
     cnmf = cnmf_ext.load_CNMFExt(cnmf_filename)
-    cnmf_params = cnmf.params.to_dict()
+    ta = TypeAdapter(CNMFParams)
+    cnmf_params = ta.dump_python(cnmf.params, round_trip=True)
+
     # blank out fnames to avoid data validation issue
     cnmf_params['data']['fnames'] = None
     # blank out nb in spatial and temporal sections

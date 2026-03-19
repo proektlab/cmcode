@@ -27,9 +27,9 @@ from cmcode.util.types import MaybeSparse, ST
 def normalize_footprints(A: MaybeSparse[np.floating]) -> sparse.csc_matrix[np.floating]:
     """Make a copy with each column normalized"""
     A = sparse.csc_matrix(A, copy=True)
-    norms = np.sqrt(A.power(2).sum(axis=0))
+    norms = np.asarray(np.sqrt(A.power(2).sum(axis=0))).ravel()
     nonempty = norms != 0
-    A[:, nonempty] /= norms[nonempty]  # type: ignore
+    A[:, nonempty] /= norms[nonempty]
     return A
 
 

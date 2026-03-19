@@ -6,13 +6,13 @@ from itertools import pairwise
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar
+from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar, Annotated
 import warnings
 
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
 import numpy as np
-from pydantic import BaseModel, ConfigDict, TypeAdapter, Field, PrivateAttr, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
 from pydantic.dataclasses import dataclass
 from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 
@@ -31,6 +31,14 @@ EXCLUDE_FROM_DIFFS = [
     'data.last_commit',
     'data.fnames',
 ]
+
+# pydantic helpers
+def list_from_ndarray(obj: Any) -> Any:
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    return obj
+
+ReadNDArray = BeforeValidator(list_from_ndarray)
 
 
 Self = TypeVar('Self', bound='StageParams')
@@ -116,7 +124,7 @@ class ConversionParams(StageParams):
     chunk_size: Optional[int] = 100
     force_estim_ndead_offset: bool = False
     interp: bool = True
-    dead_pix_mode: Union[bool, Literal['copy', 'min']] = 'copy'
+    dead_pix_mode: Union[bool, params.LitStr[Literal['copy', 'min']]] = 'copy'
 
     def get_differing_params(self, other: 'ConversionParams', metadata: dict[str, Any]) -> Iterable[str]:
         """Determine whether loaded params are compatible with current ones"""
@@ -232,13 +240,13 @@ class SeedParams(StageParams):
     borders: Optional[list[BorderSpec]] = None  # None = auto-fill from mcorr
 
     # defaults from my_extract_binary_masks_from_structural_channel
-    gSig: Optional[Union[int, Sequence[int]]] = 5  # neuron pixel size (None = same as CNMF gSig)
-    blur_type: Literal['box', 'gaussian'] = 'gaussian'
+    gSig: Annotated[Union[None, int, Sequence[int]], ReadNDArray] = 5  # neuron pixel size (None = same as CNMF gSig)
+    blur_type: params.LitStr[Literal['box', 'gaussian']] = 'gaussian'
     blur_gSig_multiple: Optional[float] = None  # this is for the extract_binary_masks step, not projection
     min_area_size: int = 30
     min_hole_size: int = 15
-    expand_method: Literal['closing', 'dilation'] = 'closing'
-    selem: np.ndarray = np.ones((3, 3))
+    expand_method: params.LitStr[Literal['closing', 'dilation']] = 'closing'
+    selem: params.NDArray = Field(default_factory=lambda: np.ones((3, 3)))
 
     @classmethod
     def infer_from_seed_path(cls, path_to_seed: Union[str, Path]) -> 'SeedParams':
@@ -310,7 +318,7 @@ class CNMFParamsExtra(StageParams):
 @dataclass(kw_only=True, frozen=True)
 class EvalParamsExtra(StageParams):
     """Extra parameters for CNMF evaluation (do not require redoing CNMF)"""
-    snr_type: Literal['normal', 'gamma'] = 'normal'
+    snr_type: params.LitStr[Literal['normal', 'gamma']] = 'normal'
 
     def get_differing_params(self, other: 'EvalParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
         if self.snr_type != other.snr_type:
