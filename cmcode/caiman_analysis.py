@@ -203,6 +203,7 @@ class SessionAnalysis:
                 param_overrides = {}
 
             # annoyingly we have to apply any snr_type override here as a special case so we have it for make_cnmf_params
+            snr_type = None
             for params_dict in [param_overrides, mouse_params]:
                 if 'eval_extra' in params_dict and 'snr_type' in params_dict['eval_extra']:
                     snr_type = params_dict['eval_extra']['snr_type']
@@ -246,7 +247,7 @@ class SessionAnalysis:
             
             if 'ended_time' not in self.metadata:
                 # re-read metadata
-                self.read_metadata()
+                self.read_metadata(verbose=False)
 
     @property
     def trial_numbers(self) -> np.ndarray:
@@ -371,14 +372,15 @@ class SessionAnalysis:
         return AnalysisStage.EVAL
     
 
-    def read_metadata(self, file_ind=0):
+    def read_metadata(self, file_ind=0, verbose=True):
         """Create or replace metadata field with SBX metadata read from the nth file"""
         meta = sbx_utils.sbx_meta_data(self.sbx_files[file_ind])
         if meta['ended_time'] is None:
             logging.warning("Ended time is missing from at least the first SBX file's metadata. Inferring from modified time instead.")
 
-        logging.info(f'Shape of SBX file #{file_ind}: ' + 
-                     f'({meta["num_frames"]}, {meta["frame_size"][0]}, {meta["frame_size"][1]}, {meta["num_planes"]})')
+        if verbose:
+            logging.info(f'Shape of SBX file #{file_ind}: ' + 
+                         f'({meta["num_frames"]}, {meta["frame_size"][0]}, {meta["frame_size"][1]}, {meta["num_planes"]})')
         self.metadata = meta
 
 

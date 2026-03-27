@@ -9,7 +9,6 @@ from warnings import warn
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
-from numpy.typing import ArrayLike
 import optype.numpy as onp
 from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import gaussian_filter
@@ -24,12 +23,18 @@ from cmcode.util.naming import make_sess_name
 from cmcode.util.types import MaybeSparse, ST
 
 
+# type for nonrigid remapping
+RemapMats = tuple[onp.Array2D[np.floating], onp.Array2D[np.floating]]
+RemapOrNull = Union[RemapMats, tuple[None, None]]
+
+
 def normalize_footprints(A: MaybeSparse[np.floating]) -> sparse.csc_matrix[np.floating]:
     """Make a copy with each column normalized"""
     A = sparse.csc_matrix(A, copy=True)
     norms = np.asarray(np.sqrt(A.power(2).sum(axis=0))).ravel()
-    nonempty = norms != 0
-    A[:, nonempty] /= norms[nonempty]
+    for col, norm in enumerate(norms):
+        if norm != 0:
+            A.data[A.indptr[col]:A.indptr[col+1]] /= norm
     return A
 
 
@@ -63,6 +68,7 @@ def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', t
             raise ValueError(f'Unrecogized thresholding method {thr}')
         A_binarized = sparse.lil_matrix(A.T.shape, dtype=np.bool_)  # construct transposed
         for c in nonempty_filter:
+            c = int(c)
             patch_data = A.data[A.indptr[c]:A.indptr[c+1]]
             if len(patch_data) == 0:
                 continue
@@ -101,7 +107,7 @@ def binarize_and_collapse_to_xy(A: MaybeSparse, n_planes: int, **binarize_kwargs
     xy_mask = sparse.csc_matrix((xy_size, A.shape[1]), dtype=bool)
 
     for k_plane in range(n_planes):
-        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]  # type: ignore
+        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]
         plane_mask = binarize_footprints(plane_footprints, **binarize_kwargs)
         xy_mask = xy_mask + plane_mask
 
@@ -125,11 +131,12 @@ def collapse_footprints_to_xy(A: MaybeSparse, n_planes: int, binarize=False, **b
     if binarize:
         return binarize_and_collapse_to_xy(A, n_planes, **binarize_kwargs)
 
+    # A = sparse.csc_array(A)
     xy_size = A.shape[0] // n_planes
     xy_footprints = sparse.csc_matrix((xy_size, A.shape[1]), dtype=A.dtype)
 
     for k_plane in range(n_planes):
-        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]  # type: ignore
+        plane_footprints = A[k_plane*xy_size:(k_plane+1)*xy_size, :]
         xy_footprints += plane_footprints
 
     return sparse.csc_matrix(xy_footprints)
@@ -204,6 +211,7 @@ def smooth_footprints(
     radius = round(truncate_sigmas * sigma)
     A_smoothed = sparse.lil_matrix(A.T.shape, dtype=float)
     for c in nonempty_filter:
+        c = int(c)
         # efficiently smooth only the nonzero entries
         # update bboxes first to include zeros within the filter's radius
         bboxes[c] = bboxes[c].decreased(radius)
@@ -218,7 +226,7 @@ def smooth_footprints(
     return A_smoothed.tocsr().T
     
 
-def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray], tuple[None, None]]) -> sparse.csc_matrix[np.float32]:
+def map_footprints(A: MaybeSparse, xy_remap: RemapOrNull) -> sparse.csc_matrix[np.float32]:
     """Use x/y remap derived from align_templates to map a set of footprints"""
     x_remap, y_remap = xy_remap
     if x_remap is None or y_remap is None:
@@ -228,7 +236,7 @@ def map_footprints(A: MaybeSparse, xy_remap: Union[tuple[np.ndarray, np.ndarray]
 
     dims = x_remap.shape
     A2 = sparse.csc_matrix(A)
-    rois2_2d = (A2[:, [i]].toarray().reshape(dims, order='F') for i in range(A2.shape[1]))  # type: ignore  
+    rois2_2d = (A2[:, [i]].toarray().reshape(dims, order='F') for i in range(A2.shape[1])) 
     coo_data = np.array([], dtype=np.float32)
     rows = np.array([], dtype=np.int32)
     cols = np.array([], dtype=np.int32)
@@ -297,7 +305,7 @@ def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[fl
     return footprints_aug, zs_aug
 
 
-def make_footprint_interpolator(footprints: onp.ToArray2D, zs: Union[Sequence[float], np.ndarray],
+def make_footprint_interpolator(footprints: onp.ToArrayStrict2D, zs: Union[Sequence[float], np.ndarray],
                                 z_border: float = 20, n_border_points=0, **mss_kwargs) -> Callable[[float], np.ndarray]:
     """
     Make function to interpolate between multiple footprints at different z locations, to a new z location.
@@ -437,7 +445,8 @@ class FootprintsPerPlane:
             self.footprint_type = 'likelihood'
 
 
-    def remap(self, xy_remap: Union[ArrayLike, Mapping[str, ArrayLike]], to_sess: Optional[str] = None):
+    def remap(self, xy_remap: Union[onp.Array3D[np.floating], Mapping[str, onp.Array3D[np.floating]]],
+              to_sess: Optional[str] = None):
         """
         Remap footprints to be in the space of another session
         xy_remap can either be a single tuple (X, Y) of remapping matrices or a dict mapping from
@@ -449,13 +458,10 @@ class FootprintsPerPlane:
                 raise TypeError('to_sess must be provided if xy_remap is a dict')
             xy_remap = xy_remap[to_sess]
 
-        if not isinstance(xy_remap, Sequence):
-            xy_remap = np.asarray(xy_remap)
-
         if len(xy_remap) != 2:
             raise TypeError('xy_remap must have a size of 2 along the first dimension (X and Y)')
 
-        this_remap = (np.asarray(xy_remap[0]), np.asarray(xy_remap[1]))
+        this_remap = (xy_remap[0], xy_remap[1])
         self.data = [map_footprints(fp, this_remap) for fp in self.data]
         self.space_of_session = to_sess
 

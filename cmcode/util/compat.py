@@ -18,8 +18,6 @@ from caiman.source_extraction.cnmf.params import CNMFParams
 
 def reconstruct_sessdata_obj(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
     """to be called from the SessionAnalysis constructor with loaded_fields passed in"""
-    if 'cnmf_params' not in loaded_info:
-        raise ValueError('Cannot load SessionAnalysis without saved params')
     _populate_missing_fields(loaded_info)
     _set_params(sessdata, loaded_info)
     _set_fields(sessdata, loaded_info)
@@ -54,8 +52,7 @@ def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
 
     elif 'cnmf_params' in loaded_info:
         # re-create params object from dict for backward compatibility
-        params_orig: CNMFParams = loaded_info.pop('cnmf_params')
-        cnmf_params = CNMFParams(params_dict=params_orig.to_dict())
+        cnmf_params: CNMFParams = loaded_info.pop('cnmf_params')
         
         # update other parameters from loaded fields as needed
         conv_changes = {}
@@ -74,11 +71,8 @@ def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
 
         # old method was to auto adjust indices only if rigid shifts were used
         mcorr_extra_changes = {}
-        if loaded_info.get('mc_result'):
-            if cnmf_params.motion['pw_rigid']:
-                mcorr_extra_changes['auto_adjust_indices'] = False
-            else:
-                mcorr_extra_changes['_indices_are_adjusted'] = True
+        if loaded_info.get('mc_result') and not cnmf_params.motion['pw_rigid']:
+            mcorr_extra_changes['_indices_are_adjusted'] = True
         
         mcorr_extra = cmp.McorrParamsExtra(**mcorr_extra_changes)
 

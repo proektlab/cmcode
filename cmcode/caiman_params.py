@@ -198,13 +198,13 @@ class McorrParamsExtra(StageParams):
 
 
     def get_differing_params(self, other: 'McorrParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
-        # only care about auto_adjust_indices if indices are out of date, meaning that
+        # only care about indices_exclude_fringe if indices are out of date, meaning that
         # matching motion.indices can't be trusted.
 
         if self.indices_exclude_fringe and not other.indices_exclude_fringe and not self._indices_are_adjusted:
-            yield 'auto_adjust_indices'
+            yield 'indices_exclude_fringe'
         elif other.indices_exclude_fringe and not self.indices_exclude_fringe and not other._indices_are_adjusted:
-            yield 'auto_adjust_indices'
+            yield 'indices_exclude_fringe'
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -282,7 +282,7 @@ class SeedParams(StageParams):
         return cls(
             type='mean',
             norm_medw=25,
-            gSig=tuple(np.unique(round_to_odd(np.array([5, 7, 9]) * scale))),
+            gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
             )
 
     def get_differing_params(self, other: 'SeedParams', metadata: dict[str, Any]) -> Iterable[str]:
@@ -558,7 +558,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         cls, metadata: dict, dims: int, tif_file: Optional[str] = None, channel=0, odd_row_offset: Optional[int] = None,
         odd_row_ndead: Optional[list[int]] = None, crop: BorderSpec = BorderSpec(), downsample_factor: Optional[int] = None,
         extra_conversion_params: Optional[dict[str, Any]] = None, seed_params: Optional[dict[str, Any]] = None,
-        snr_type: Literal['normal', 'gamma'] = 'gamma', crossplane_merge_thr: Optional[float] = 0.7,
+        snr_type: Optional[Literal['normal', 'gamma']] = None, crossplane_merge_thr: Optional[float] = 0.7,
         highpass_cutoff: float = 0, highpass_order=4, add_to_mov=0
         ) -> 'SessionAnalysisParams':
         """Constructor that makes CNMFParams based on other params (ensuring it is consistent)"""
@@ -569,6 +569,9 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             seed = SeedParams.default(metadata)
         else:
             seed = SeedParams(**seed_params)
+
+        if snr_type is None:
+            snr_type = 'gamma'
 
         return cls.from_cnmf_params(
             conversion=ConversionParams(
