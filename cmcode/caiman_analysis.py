@@ -13,7 +13,7 @@ import pickle
 import re
 import shutil
 from subprocess import CalledProcessError
-from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, overload
+from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, overload, Mapping
 
 import cv2
 from hdf5storage import savemat
@@ -30,6 +30,7 @@ import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
 from caiman.base import rois
 from caiman.source_extraction.cnmf.estimates import Estimates
+from caiman.source_extraction.cnmf.params import CNMFParams
 from caiman.source_extraction.cnmf.utilities import detrend_df_f
 from caiman.utils import sbx_utils
 from caiman.utils.visualization import view_quilt
@@ -37,15 +38,14 @@ import mesmerize_core as mc
 from mesmerize_core.algorithms._utils import make_projection_parallel, make_correlation_parallel
 from mesmerize_core.caiman_extensions.common import Waitable, DummyProcess
 
-from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, caiman_params as cmp
+from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, cnmf_ext, caiman_params as cmp
 from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
-from cmcode.cnmf_ext import CNMFExt, EstimatesExt, load_CNMFExt, clear_cnmf_cache  # noqa: F401
 # from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
 from cmcode.util import footprints, paths
 from cmcode.util.cluster import Cluster
-from cmcode.util.compat import reconstruct_sessdata_obj, infer_params_from_cnmf_run
+from cmcode.util.compat import reconstruct_sessdata_obj
 from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_files
 from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
@@ -168,7 +168,7 @@ class SessionAnalysis:
         # initialize fields that don't depend on input parameters
         self.cluster_args: Optional[dict] = None
         self.sess_filename: str = '' if sess_filename is None else sess_filename  # .pkl file to save to (gets set on first save)
-        self._cnmf_fit: Optional[CNMFExt] = None  # CNMF results
+        self._cnmf_fit: Optional['cnmf_ext.CNMFExt'] = None  # CNMF results
         self._frames_per_trial: Optional[np.ndarray] = None
         self._cnmf_changed_flag = False  # flag that CNMF results should be changed next time
 
@@ -267,7 +267,7 @@ class SessionAnalysis:
 
 
     @property
-    def cnmf_fit(self) -> Optional[CNMFExt]:
+    def cnmf_fit(self) -> Optional['cnmf_ext.CNMFExt']:
         """Lazy loader for CNMF results"""
         if self.cnmf_fit_filename is None:
             return None  # either CNMF has not been run or it's invalidated
@@ -281,7 +281,7 @@ class SessionAnalysis:
         return self._cnmf_fit
 
     @cnmf_fit.setter
-    def cnmf_fit(self, value: CNMFExt):
+    def cnmf_fit(self, value: 'cnmf_ext.CNMFExt'):
         self._cnmf_fit = value
 
     
@@ -486,7 +486,7 @@ class SessionAnalysis:
         self.params.write_params(path=params_path, stage=stage)
 
 
-    def update_params(self, param_changes: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    def update_params(self, param_changes: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
         """
         Update params, also allowing changes to some things that are not part of CNMFParams:
 
@@ -538,7 +538,7 @@ class SessionAnalysis:
             self.cnmf_fit.save(self.cnmf_fit_filename)
             self.write_params_for_result_file(self.cnmf_fit_filename, AnalysisStage.EVAL)
             self._cnmf_changed_flag = False
-            clear_cnmf_cache()
+            cnmf_ext.clear_cnmf_cache()
 
 
     #--------------------------- PREPROCESSING --------------------------------#
@@ -1445,21 +1445,43 @@ class SessionAnalysis:
     def get_gridsearch_diffs(self, batch: Optional[MescoreBatch] = None) -> pd.DataFrame:
         """
         Get table of parameter differences between all the gridsearch runs that have been run so far
+        as well as the current parameter values.
         If batch is given, use this batch dataframe instead of calling get_gridsearch_results()
         """
         if batch is None:
             df = self.get_gridsearch_results()
         else:
             df = batch.reset_index(drop=True)
-        
-        df_diffs = df.caiman.get_params_diffs('cnmf', str(df.item_name.iat[0]))
 
-        # filter out unimportant parameters (in case they aren't fixed by get_cnmf_run_params)
-        df_diffs = df_diffs.loc[:, ~np.isin(df_diffs.columns, cmp.EXCLUDE_FROM_DIFFS)]
+        # subset to algorithm == CNMF
+        sub_df = df[df.algo == 'cnmf']
 
-        # add UUIDs
-        df_diffs = pd.concat([df_diffs, df.loc[:, 'uuid']], axis=1)
-        return df_diffs
+        # get a list of params objects
+        params_objs: list[Union[cmp.SessionAnalysisParams, CNMFParams]] = []
+        differing_params: set[str] = set()
+
+        # iterate through and build list of params that differ from current ones
+        for ind in sub_df.index:
+            params = cmp.load_params_from_batch_item(sub_df.loc[ind, :])
+            for changed_param in self.params.get_differing_params(params, metadata=self.metadata):
+                differing_params.add(changed_param)
+            params_objs.append(params)
+
+        # now make a dataframe of the differences
+        param_names = sorted(differing_params)
+        records: dict[str, Union[list, pd.Series]] = {param_name: [] for param_name in param_names}
+
+        for params in params_objs:
+            for param_name in param_names:
+                group, key = param_name.split('.')
+                if hasattr(params, group):
+                    val = getattr(getattr(params, group), key)
+                else:  # (for CNMFParams where we don't have all the groups available)
+                    val = "<unknown>"
+                records[param_name].append(val)
+
+        records['uuid'] = sub_df.uuid
+        return pd.DataFrame(records, dtype=object, index=sub_df.index)
             
 
     def select_gridsearch_run(self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
@@ -1529,8 +1551,8 @@ class SessionAnalysis:
         except FileNotFoundError:
             # load partial params from CNMF object
             logging.info('CNMF params file not found - assuming params not specified in the CNMF object match current params.')
-            cnmf_params_dict = infer_params_from_cnmf_run(cnmf_path)
-            self.update_params(cnmf_params_dict)
+            cnmf_params = cmp.load_params_from_cnmf_h5(cnmf_path)
+            self.update_params(cnmf_params.to_dict())
 
         # try loading  or running prerequisites to fill in invalidated data
         try:
@@ -1544,7 +1566,7 @@ class SessionAnalysis:
                 'without re-running to get the missing results (see exception info).', exc_info=e)
 
         self.cnmf_fit_filename = cnmf_path
-        cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
+        cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
         self.cnmf_fit = cnmf_fit
         return uuid
     
@@ -1583,7 +1605,7 @@ class SessionAnalysis:
         index = self.get_selected_index()
         if index is not None:
             batch = self.get_gridsearch_results()
-            return batch[index].uuid
+            return str(batch.loc[index, 'uuid'])
         return None
     
 
@@ -1714,7 +1736,7 @@ class SessionAnalysis:
 
         xy_footprints_each: list[sparse.csc_matrix] = []
         for k_plane in range(n_planes):
-            submat = A[pix_per_plane*k_plane:pix_per_plane*(k_plane+1), :]  # type: ignore
+            submat = A[pix_per_plane*k_plane:pix_per_plane*(k_plane+1), :]
             if binarize:
                 submat = footprints.binarize_footprints(submat, **binarize_kwargs)
             elif normalize:
@@ -1740,7 +1762,7 @@ class SessionAnalysis:
                 assert self.cnmf_fit_filename is not None
 
         # reload from disk (e.g. to sync changes from mesmerize_viz)
-        cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
+        cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
         self.cnmf_fit = cnmf_fit
         est = cnmf_fit.estimates
         assert est.A is not None and est.dims is not None, 'Estimates elements should not be None - has CNMF been run?'
@@ -1894,7 +1916,7 @@ class SessionAnalysis:
         # restrict to single plane if requested
         if k_plane is not None:
             plane_pixels = int(np.prod(self.plane_size))
-            A = A[k_plane*plane_pixels:(k_plane+1)*plane_pixels, :]  # type: ignore
+            A = A[k_plane*plane_pixels:(k_plane+1)*plane_pixels, :]
             idx_used = np.flatnonzero(A.getnnz(axis=0) > 0)
             bg_proj = bg_proj[:, k_plane*self.plane_size[1]:(k_plane+1)*self.plane_size[1]]
         else:
@@ -1910,11 +1932,11 @@ class SessionAnalysis:
         # plot background and contours
         if marked_color is not None:
             idx_marked = np.intersect1d(idx_used, idx_marked)
-            cmcustom.my_vis_plot_contours(A[:, idx_marked], bg_proj, display_numbers=False,  # type: ignore
+            cmcustom.my_vis_plot_contours(A[:, idx_marked], bg_proj, display_numbers=False,
                                           cmap=cmap, colors=marked_color)
         if unmarked_color is not None:
             idx_unmarked = np.intersect1d(idx_used, idx_unmarked)
-            cmcustom.my_vis_plot_contours(A[:, idx_unmarked], bg_proj, display_numbers=False,  # type: ignore
+            cmcustom.my_vis_plot_contours(A[:, idx_unmarked], bg_proj, display_numbers=False,
                                           cmap=cmap, colors=unmarked_color)
         if remove_border:
             assert self.mc_result is not None, 'No mcorr results?'
@@ -1941,7 +1963,7 @@ class SessionAnalysis:
             inds = est.idx_components
         else:
             title = 'All ROIs'
-            inds = range(est.A.shape[1])
+            inds = range(est.A.shape[1])  # type: ignore
         
         if order_by.lower() == 'snr':
             if est.SNR_comp is None:
@@ -2026,7 +2048,7 @@ class SessionAnalysis:
         
         if force_reload_cnmf or self.cnmf_fit is None:
             # reload from disk (e.g. to sync changes from mesmerize_viz)
-            self.cnmf_fit = load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
+            self.cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
 
         est = self.cnmf_fit.estimates
         assert isinstance(est.dims, tuple) and len(est.dims) == 2, 'should be 2D CNMF'
@@ -2193,10 +2215,12 @@ class SessionAnalysis:
         uuid = self.get_selected_uuid()
         assert uuid is not None, 'Selected CNMF run does not have a UUID?'
 
-        if roi_ids is None:
-            roi_ids = range(est.A.shape[1])
+        n_comps = est.A.shape[1]  # type: ignore
 
-        if any([id not in range(est.A.shape[1]) for id in roi_ids]):
+        if roi_ids is None:
+            roi_ids = range(n_comps)
+
+        if any([id not in range(n_comps) for id in roi_ids]):
             raise RuntimeError('Not all roi_ids are in range')
         
         # make save dir
@@ -2224,10 +2248,13 @@ class SessionAnalysis:
         fig, ax = plt.subplots()
         thumbnail = np.empty((box_size, box_size), dtype=proj.dtype)
 
-        for roi_id, path, (com_y, com_x) in zip(roi_ids, save_paths, tqdm(coms, desc='Saving thumbnails...', unit='ROI')):
+        for roi_id, path, com in zip(roi_ids, save_paths, tqdm(coms, desc='Saving thumbnails...', unit='ROI')):
             if not force and os.path.exists(path):
                 logging.info(f'Skipping {roi_id} since it is already saved')
                 continue
+
+            com_y = float(com[0])
+            com_x = float(com[1])
 
             # get data for image, filling with zeros if necessary
             top = round(com_y - box_size / 2)
@@ -2246,7 +2273,7 @@ class SessionAnalysis:
             vmin = float(np.percentile(data[~np.isnan(data)], vmin_pct))
             vmax = float(np.percentile(data[~np.isnan(data)], vmax_pct))
             ax.clear()
-            ax.imshow(thumbnail, interpolation=None, vmin=vmin, vmax=vmax, cmap=cmap)
+            ax.imshow(thumbnail, interpolation='none', vmin=vmin, vmax=vmax, cmap=cmap)
             ax.set_axis_off()
 
             # save as PNG
@@ -2278,14 +2305,14 @@ def load(filename: str, quiet=True, lazy=True, **field_overrides) -> SessionAnal
     return sessdata
 
 
-def load_cnmf(cnmf_filename: str, quiet=True) -> Optional[CNMFExt]:
+def load_cnmf(cnmf_filename: str, quiet=True) -> Optional['cnmf_ext.CNMFExt']:
     """
     Tries to load CNMF results
     """
     if not quiet:
         logging.info(f'Loading CNMF results from {cnmf_filename}')
     try:
-        cnmf_obj = load_CNMFExt(cnmf_filename, dview=cluster.dview, quiet=quiet)
+        cnmf_obj = cnmf_ext.load_CNMFExt(cnmf_filename, dview=cluster.dview, quiet=quiet)
     except FileNotFoundError:
         logging.warning('CNMF file could not be found; not loaded')
         return None
@@ -2331,7 +2358,7 @@ def load_selected_metadata(mouse_id: Union[int, str], sess_id: int, tag: Optiona
     return load_cell_metadata(mouse_id, sess_id, uuid=uuid, tag=tag, rec_type=rec_type)
 
 
-def evaluate_cnmf(cnmf_fit: CNMFExt, mc_res_path_or_images: Union[str, np.ndarray], snr_type: Literal['normal', 'gamma'] = 'gamma',
+def evaluate_cnmf(cnmf_fit: 'cnmf_ext.CNMFExt', mc_res_path_or_images: Union[str, np.ndarray], snr_type: Literal['normal', 'gamma'] = 'gamma',
                   new_quality_params: Optional[dict] = None, recalc=False, n_planes=1, dview=None):
     """
     Do CNMF evaluation. If the image is 2D and n_planes > 1 (meaning planes are concatenated along X), takes the additional step of
@@ -2374,7 +2401,7 @@ def evaluate_cnmf(cnmf_fit: CNMFExt, mc_res_path_or_images: Union[str, np.ndarra
         est.idx_components = np.setdiff1d(range(est.A.shape[-1]), est.idx_components_bad)
 
 
-def identify_marked_rois(cnmf_obj: CNMFExt, cnmf_filename: Optional[str], A_structural: sparse.csc_array,
+def identify_marked_rois(cnmf_obj: 'cnmf_ext.CNMFExt', cnmf_filename: Optional[str], A_structural: sparse.csc_array,
                          structural_template: np.ndarray, functional_template: np.ndarray,
                          n_planes=1, border: Union[BorderSpec, int] = 0, subset='all', **register_rois_kwargs):
     """
@@ -2415,12 +2442,12 @@ def identify_marked_rois(cnmf_obj: CNMFExt, cnmf_filename: Optional[str], A_stru
 
     if cnmf_filename is not None:
         cnmf_obj.save(cnmf_filename)
-        clear_cnmf_cache()
+        cnmf_ext.clear_cnmf_cache()
     else:
         logging.warning('CNMF not saved - no filename')
 
 
-def calc_df_over_f(est: Estimates, use_residuals=True, roi_subset: Optional[Sequence[int]] = None,
+def calc_df_over_f(est: cnmf_ext.EstimatesExt, use_residuals=True, roi_subset: Optional[Sequence[int]] = None,
                    detrend_window=500) -> np.ndarray:
     """
     Calculates dF/F using CaImAn background components to define baseline, which is the default in
@@ -2437,12 +2464,7 @@ def calc_df_over_f(est: Estimates, use_residuals=True, roi_subset: Optional[Sequ
         raise RuntimeError('CNMF fit is not complete; do not have data needed for dF/F')
 
     if roi_subset is not None:
-        # index to just the component(s) requested
-        if isinstance(est.A, (sparse.coo_matrix, sparse.coo_array)):
-            A = sparse.csc_matrix(est.A)[:, roi_subset]  # type: ignore
-        else:
-            A = est.A[:, roi_subset]  # type: ignore
-
+        A = est.A[:, roi_subset]
         C = est.C[roi_subset]
         YrA = est.YrA[roi_subset]
     else:

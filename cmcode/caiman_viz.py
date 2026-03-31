@@ -551,6 +551,17 @@ class CNMFVizWideContainer(CNMFVizContainer):
         assert isinstance(colors, str), 'Dropdown value should be a string'
         self.set_component_colors(colors)
 
+    def _manual_toggle_component(self, ev):
+        """Override a/r keyboard shortcut to use my manual curation controller"""
+        if not hasattr(ev, "key"):
+            return
+
+        if ev.key == "a":
+            self._manual_curation_controller._add_cell(b_accept=True)
+        elif ev.key == "r":
+            self._manual_curation_controller._add_cell(b_accept=False)
+
+
     def get_cnmf_data_mapping(self, series: pd.Series, input_movie_kwargs: dict, temporal_kwargs: dict
                               ) -> dict[str, Callable[[], np.ndarray]]:
         mapping = CNMFVizContainer.get_cnmf_data_mapping(series, input_movie_kwargs, temporal_kwargs)

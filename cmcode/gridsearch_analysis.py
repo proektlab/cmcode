@@ -1,6 +1,7 @@
 """
 Functions for doing grid searches of parameters using mesmerize-core
 """
+from copy import deepcopy
 from itertools import product
 import os
 from pathlib import Path
@@ -11,9 +12,8 @@ import matplotlib.pyplot as plt
 
 from mesmerize_core.caiman_extensions.common import Waitable
 
-from cmcode import caiman_analysis as cma, cmcustom
-from cmcode.caiman_params import AnalysisStage
-from cmcode.util import types
+from cmcode import caiman_analysis as cma, caiman_params as cmp, cmcustom
+from cmcode.util import types, paths
 
 
 ParamGrid = Mapping[tuple[str, str], Iterable]
@@ -59,10 +59,10 @@ def do_cnmf_gridsearch(sessdata: 'cma.SessionAnalysis', params_to_search: Union[
         sessdata.update_params(param_changes)
 
         # get up to the point of doing CNMF for these parameters if necessary
-        if sessdata.last_valid_stage < AnalysisStage.CONVERT:
+        if sessdata.last_valid_stage < cmp.AnalysisStage.CONVERT:
             sessdata.convert_to_tif()
         
-        if sessdata.last_valid_stage < AnalysisStage.TRANSPOSE:
+        if sessdata.last_valid_stage < cmp.AnalysisStage.TRANSPOSE:
             sessdata.do_motion_correction()
 
         uuid, proc = sessdata.start_cnmf_with_mescore(backend=backend, wait=False, partition=partition)
@@ -109,9 +109,9 @@ class GridsearchError(RuntimeError):
             super().__init__('Error running gridsearch, but no error is saved in the dataframe - check log files.')
 
 
-def make_contour_pdf(batch: pd.DataFrame, uuid: str):
+def make_contour_pdf(batch: types.MescoreBatch, uuid: str):
     """Produce PDF of contours for a given batch item, with accepted/rejected ROIs marked."""
-    res_series = batch.loc[batch.uuid == uuid, :].iloc[0]
+    res_series: types.MescoreSeries = batch.loc[batch.uuid == uuid, :].iloc[0]  # type: ignore
     corr_bg = res_series.caiman.get_corr_image()
     cnmf = res_series.cnmf.get_output()
     output_dir = Path(res_series.cnmf.get_output_path()).parent

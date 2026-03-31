@@ -4,12 +4,15 @@ install_requires = [
     "asyncssh",
     "caiman>=1.10.0",
     "dask",
+    "fastplotlib~=0.1.0.a17",
+    "h5py",
     "hdf5storage",
     "ipympl",
     "mesmerize-core",
     "mesmerize-viz",
     "mslex",
     "nest-asyncio",
+    "opencv-python",
     "optype[numpy]",
     "pydantic"
 ]

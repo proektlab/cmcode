@@ -1,4 +1,4 @@
-from typing import Optional, Union, TYPE_CHECKING, TypeVar
+from typing import Optional, Union, TYPE_CHECKING, TypeVar, Type, Callable
 
 import numpy as np
 from optype.numpy import Array2D

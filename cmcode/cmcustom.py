@@ -368,7 +368,7 @@ def my_extract_binary_masks_from_structural_channel(Y: Union[onp.Array2D[np.floa
 
     for single_gSig in gSig:
         blur_sig = blur_gSig_multiple * single_gSig
-        img = np.empty_like(mR)
+        img = np.empty_like(mR, order='C')
         if blur_type == 'box':
             blur_sig = round(blur_sig)
             cv2.blur(mR, (blur_sig, blur_sig), dst=img)

@@ -1260,7 +1260,7 @@ class RegisterROIsResults:
     x_remap: Union[Optional[np.ndarray], NAType] = pd.NA  # x-values of pixel remap function
     y_remap: Union[Optional[np.ndarray], NAType] = pd.NA  # y-values of pixel remap function
     A2_orig: Optional[sparse.csc_matrix] = None  # Second set of ROIs (unchanged)
-    components_used: Optional[np.ndarray]  = None  # which of original components were used for registration
+    components_used: Optional[onp.Array1D[np.integer]]  = None  # which of original components were used for registration
 
 
 def threshold_masks(A: sparse.csc_matrix, max_thr: float):

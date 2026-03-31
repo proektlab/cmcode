@@ -2,20 +2,24 @@ from copy import deepcopy
 from datetime import date
 from enum import IntEnum
 from functools import cache
+import h5py
 from itertools import pairwise
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar, Annotated
+from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar, Annotated, cast
 import warnings
 
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
+from caiman.utils.utils import recursively_load_dict_contents_from_group
 import numpy as np
+import pandas as pd
 from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
 from pydantic.dataclasses import dataclass
 from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 
+from cmcode.util import types, paths
 from cmcode.util.image import BorderSpec
 
 
@@ -210,9 +214,9 @@ class McorrParamsExtra(StageParams):
 @dataclass(kw_only=True, frozen=True)
 class TranspositionParams(StageParams):
     """Settings for transpose/concat planes"""
-    highpass_cutoff: float = 0
+    highpass_cutoff: float = 0.
     highpass_order: int = 4
-    add_to_mov: float = 0
+    add_to_mov: float = 0.
     blur_kernel_size: int = 1  # same as blur_size in SeedParams
 
     def get_differing_params(self, other: 'TranspositionParams', metadata: dict[str, Any]) -> Iterable[str]:
@@ -382,7 +386,7 @@ class ParamStruct(BaseModel):
 
     
     def get_differing_params(
-            self, other: 'ParamStruct', metadata: dict[str, Any], stage: Optional[AnalysisStage] = None,
+            self, other: Union['ParamStruct', params.CNMFParams], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None,
             include_different_toplevel=False, ignore_prereq_stages=False) -> Iterable[str]:
         """
         Return flattened names of params that differ between first and second
@@ -396,7 +400,11 @@ class ParamStruct(BaseModel):
                 seeded = False
 
         first_fields = type(self).model_fields.keys()
-        second_fields = type(other).model_fields.keys()
+        if isinstance(other, params.CNMFParams):
+            second_fields = set(other.groups)
+        else:
+            second_fields = type(other).model_fields.keys()
+
         if stage is not None:
             if ignore_prereq_stages:
                 # subset to fields for this stage
@@ -411,30 +419,32 @@ class ParamStruct(BaseModel):
             if key in EXCLUDE_FROM_DIFFS:
                 continue
 
-            if (key not in first_fields or key not in second_fields) and include_different_toplevel:
-                yield key
+            if (key not in first_fields or key not in second_fields):
+                if include_different_toplevel:
+                    yield key
+                continue
+
+            val1, val2 = getattr(self, key), getattr(other, key)
+            if isinstance(val1, params.GroupParams):
+                assert isinstance(val2, type(val1)),  'same key should contain same types'
+                for param, _, _ in val1.get_differing_params(val2):
+                    # skip ones that we don't care about
+                    param_flat = key + '.' + param
+                    if param_flat in EXCLUDE_FROM_DIFFS:
+                        continue
+
+                    # ignore rf and only_init if we are using seeded CNMF
+                    if seeded and key == 'patch' and param in ['rf', 'only_init']:
+                        continue
+
+                    yield param_flat
             else:
-                val1, val2 = getattr(self, key), getattr(other, key)
-                if isinstance(val1, params.GroupParams):
-                    assert isinstance(val2, type(val1)),  'same key should contain same types'
-                    for param, _, _ in val1.get_differing_params(val2):
-                        # skip ones that we don't care about
-                        param_flat = key + '.' + param
-                        if param_flat in EXCLUDE_FROM_DIFFS:
-                            continue
-
-                        # ignore rf and only_init if we are using seeded CNMF
-                        if seeded and key == 'patch' and param in ['rf', 'only_init']:
-                            continue
-
-                        yield param_flat
-                else:
-                    assert isinstance(val1, StageParams), 'params dict should only contain subdicts and StageParams objects'
-                    assert isinstance(val2, type(val1)),  'same key should contain same types'
-                    for param in val1.get_differing_params(val2, metadata=metadata):
-                        yield key + '.' + param
+                assert isinstance(val1, StageParams), 'params dict should only contain subdicts and StageParams objects'
+                assert isinstance(val2, type(val1)),  'same key should contain same types'
+                for param in val1.get_differing_params(val2, metadata=metadata):
+                    yield key + '.' + param
         
-    def do_params_match(self, other: 'ParamStruct', metadata: dict[str, Any],
+    def do_params_match(self, other: Union['ParamStruct', params.CNMFParams], metadata: dict[str, Any],
                         stage: Optional[AnalysisStage] = None, ignore_prereq_stages=False) -> bool:
         return not any(self.get_differing_params(other, metadata=metadata, stage=stage, ignore_prereq_stages=ignore_prereq_stages))
 
@@ -641,6 +651,9 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             if invalid_stage is None and not self.do_params_match(new_params, metadata=metadata, stage=stage, ignore_prereq_stages=True):
                 invalid_stage = stage
 
+        if changes:
+            raise RuntimeError('These groups in change dict did not match: ' + ', '.join(changes.keys()))
+
         return new_params, invalid_stage
 
     
@@ -817,3 +830,30 @@ def round_to_odd(x: Union[float, np.ndarray]):
         return np.vectorize(round_to_odd)(x)
     
     return round((x - 1) / 2) * 2 + 1
+
+
+# more utilities for loading
+
+def load_params_from_cnmf_h5(filename: Union[Path, str]) -> params.CNMFParams:
+    """Load just params from CNMF HDF5 file"""
+    with h5py.File(filename, 'r') as h5file:
+        params_grp = recursively_load_dict_contents_from_group(h5file, '/params/')
+    loaded_params = params.CNMFParams(**params_grp)
+    # blank out fnames to avoid data validation issue
+    loaded_params.change_params({'data': {'fnames': None}})
+    return loaded_params
+
+
+def load_params_from_batch_item(item: pd.Series) -> Union[SessionAnalysisParams, params.CNMFParams]:
+    """
+    Load params used for this batch item, either from the full params JSON file (if saved)
+    or from the params saved with the CNMF run.
+    """
+    item = cast(types.MescoreSeries, item)
+    cnmf_path = str(item.cnmf.get_output_path())
+    params_path = paths.params_file_for_result(cnmf_path)
+
+    try:
+        return SessionAnalysisParams.read_from_file(params_path)
+    except FileNotFoundError:
+        return load_params_from_cnmf_h5(cnmf_path)

@@ -19,7 +19,7 @@ from caiman.source_extraction.cnmf import cnmf, params, merging
 
 from cmcode import alignment, caiman_params as cmp
 from cmcode.cmcustom import compute_snr_gamma
-from cmcode.util import paths
+from cmcode.util import paths, types
 
 @dataclass
 class MetricInfo:
@@ -69,7 +69,25 @@ class EstimatesExt(cnmf.Estimates):
             object.__setattr__(self.estimates, name, val)
 
     @property
-    def idx_components(self) -> Optional[np.ndarray]:
+    def A(self) -> Optional[types.MaybeSparse[np.floating]]:
+        """Just provide more precise type for estimates.A"""
+        return self.estimates.A  # type: ignore
+
+    @A.setter
+    def A(self, val):
+        self.estimates.A = val
+
+    @property
+    def C(self) -> Optional[onp.Array2D[np.floating]]:
+        """Just provide more precise type for estimates.C"""
+        return self.estimates.C  # type: ignore
+
+    @C.setter
+    def C(self, val):
+        self.estimates.C = val
+
+    @property
+    def idx_components(self) -> Optional[onp.Array1D[np.integer]]:
         """Combines automatic evaluation and manual curation to produce idx_components"""
         if self.idx_components_eval is None:
             return None
@@ -80,7 +98,7 @@ class EstimatesExt(cnmf.Estimates):
         raise NotImplementedError('idx_components is a read-only property on EstimatesExt; use idx_components_eval')
     
     @property
-    def idx_components_bad(self) -> Optional[np.ndarray]:
+    def idx_components_bad(self) -> Optional[onp.Array1D[np.integer]]:
         """Combines automatic evaluation and manual curation to produce idx_components_bad"""
         if self.idx_components_bad_eval is None:
             return None
@@ -91,7 +109,7 @@ class EstimatesExt(cnmf.Estimates):
         raise NotImplementedError('idx_components_bad is a read-only property on EstimatesExt; use idx_components_bad_eval')
 
     @property
-    def idx_components_eval(self) -> Optional[np.ndarray]:
+    def idx_components_eval(self) -> Optional[onp.Array1D[np.integer]]:
         return self.estimates.idx_components
     
     @idx_components_eval.setter
@@ -99,7 +117,7 @@ class EstimatesExt(cnmf.Estimates):
         self.estimates.idx_components = val
     
     @property
-    def idx_components_bad_eval(self) -> Optional[np.ndarray]:
+    def idx_components_bad_eval(self) -> Optional[onp.Array1D[np.integer]]:
         return self.estimates.idx_components_bad
     
     @idx_components_bad_eval.setter
@@ -116,14 +134,14 @@ class EstimatesExt(cnmf.Estimates):
             return np.arange(self.A.shape[1])
 
     @property
-    def idx_components_marked(self) -> Optional[np.ndarray]:
+    def idx_components_marked(self) -> Optional[onp.Array1D[np.integer]]:
         comps_used = self.structural_reg_idx_used
         if comps_used is None or self.structural_reg_res is None:
             return None
         return comps_used[self.structural_reg_res.matched1]
     
     @property
-    def idx_components_unmarked(self) -> Optional[np.ndarray]:
+    def idx_components_unmarked(self) -> Optional[onp.Array1D[np.integer]]:
         comps_used = self.structural_reg_idx_used
         if comps_used is None or self.structural_reg_res is None:
             return None
@@ -305,7 +323,7 @@ class EstimatesExt(cnmf.Estimates):
         self.crossplane_merge_thr_used = thr
 
         est = self.estimates
-        assert est.A is not None and est.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'
+        assert est.A is not None and self.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'
         A = est.A
         if not isinstance(A, sparse.csc_matrix):
             A = sparse.csc_matrix(A)
@@ -314,7 +332,7 @@ class EstimatesExt(cnmf.Estimates):
         A_flat = sparse.csc_matrix((A.data, A.indices % plane_pixels, A.indptr), shape=(plane_pixels, A.shape[1]))
 
         # find which components to merge
-        rois_to_merge = merging.get_ROIs_to_merge(A_flat, est.C, thr=thr)[0]
+        rois_to_merge = merging.get_ROIs_to_merge(A_flat, self.C, thr=thr)[0]
 
         # only keep groups that span more than one plane
         rois_to_merge = [group for group in rois_to_merge if not np.all(np.diff(plane_per_comp[group]) == 0)]

@@ -6,11 +6,13 @@ dependencies:
 - caiman >= 1.10.0
 - dask
 - distributed
+- h5py
 - hdf5storage
 - mesmerize-core
 - mslex
 - nest-asyncio
 - ipympl
+- opencv
 - optype-numpy
 - pip
 - pydantic
@@ -18,3 +20,4 @@ dependencies:
 - scipy-stubs
 - pip:
   - mesmerize-viz
+  - fastplotlib ~= 0.1.0.a17
