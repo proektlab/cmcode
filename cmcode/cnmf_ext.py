@@ -312,7 +312,7 @@ class EstimatesExt(cnmf.Estimates):
         if self.F_dff_denoised is not None:
             self.F_dff_denoised = interpolate_each_trial(self.F_dff_denoised, method=method)
     
-    def merge_components_crossplane(self, n_planes: int, params: params.CNMFParams, thr=0.7) -> int:
+    def merge_components_crossplane(self, n_planes: int, params: params.CNMFParams, thr: Optional[float] = 0.7) -> int:
         """
         Merge components across planes as if they were in the same plane, by flattening A
         Returns number of sets that were merged.
@@ -321,6 +321,9 @@ class EstimatesExt(cnmf.Estimates):
             raise RuntimeError(f'Crossplane merging already run with threshold {self.crossplane_merge_thr_used}; cannot re-run.')
         
         self.crossplane_merge_thr_used = thr
+
+        if thr is None:
+            return 0
 
         est = self.estimates
         assert est.A is not None and self.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'

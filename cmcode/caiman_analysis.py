@@ -1,9 +1,10 @@
 import asyncio
 from collections import Counter
+from collections.abc import Container, Iterable, Sequence, Mapping
 from copy import copy
 from dataclasses import asdict
 from datetime import date, datetime
-from functools import lru_cache
+from functools import lru_cache, partial
 import json
 import logging
 import math
@@ -13,7 +14,7 @@ import pickle
 import re
 import shutil
 from subprocess import CalledProcessError
-from typing import Optional, Union, Any, Iterable, Sequence, cast, Literal, overload, Mapping
+from typing import Optional, Union, Any, cast, Literal, overload, TYPE_CHECKING
 
 import cv2
 from hdf5storage import savemat
@@ -51,9 +52,9 @@ from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_fil
 from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
 from cmcode.util.types import NoBatchFileError, NoMatchingResultError, MescoreBatch, MescoreSeries
 
-
-if in_jupyter():
-    from . import caiman_viz
+if TYPE_CHECKING or in_jupyter():
+    # avoid importing caiman_viz if not in a notebook
+    from cmcode import caiman_viz
     from tqdm.notebook import tqdm_notebook as tqdm
 else:
     from tqdm import tqdm
@@ -237,7 +238,6 @@ class SessionAnalysis:
             # blank out machine-specific params; will set if necessary before running any analysis
             self.update_params({
                 'data': {'fnames': None},
-                'preprocess': {'n_pixels_per_process': None},
                 'spatial': {'n_pixels_per_process': None}
             })
 
@@ -1205,10 +1205,9 @@ class SessionAnalysis:
 
         if self.mmap_file_transposed is None:
             raise RuntimeError('No transposed data file; cannot run CNMF')
-        file_size = get_file_size(self.mmap_file_transposed)[0]
 
         params_obj.change_params({
-            'data': {'fnames': [self.mmap_file_transposed], 'dims': file_size},
+            'data': {'fnames': [self.mmap_file_transposed]},
             'patch': {'border_pix': self.mc_result.border_to_0}  # only allows scalar value for border
         })
 
@@ -1233,11 +1232,17 @@ class SessionAnalysis:
 
         item = cast(MescoreSeries, batch.iloc[-1])
         uuid = str(item.uuid)
+        output_dir = batch.paths.get_batch_path().parent.joinpath(uuid).resolve()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        # preemptively save params that will be used for this run
+        output_path = output_dir / f'{uuid}.hdf5'
+        params_path = paths.params_file_for_result(output_path)
+        mesmerize_cnmf_params = self.params.copy_with_mesmerize_run_differences()
+        mesmerize_cnmf_params.write_params(params_path)
+
         if seed_params.type != 'none':
             # actually make and save seed
-            output_dir = batch.paths.get_batch_path().parent.joinpath(uuid).resolve()
-            output_dir.mkdir(parents=True, exist_ok=True)
-
             seed_param_dict = asdict(seed_params)
             # fill in default value of gSig
             if seed_param_dict['gSig'] is None:
@@ -1260,17 +1265,29 @@ class SessionAnalysis:
         Post-processing to do after a mesmerize CNMF run has finished or been loaded,
         to select (load) the run and ensure results match cnmf_extra and eval parameters.
         """
+        # Load results from mesmerize. We want the params actually used to match current self.params
+        # once this method is done.
+        target_params = self.params
         self.select_gridsearch_run(finished_or_loaded_cnmf_uuid, quiet=True)
+        assert self.cnmf_fit is not None, 'cnmf_fit must be assigned if select_gridsearch_run succeeds'
 
-        assert self.cnmf_fit is not None
-        logging.info(f'Selected CNMF run with UUID {finished_or_loaded_cnmf_uuid}')
+        # fix remaining differences
+        do_crossplane_merge = False
+        redo_eval = False
+        diff_params = self.params.get_differing_params(target_params, metadata=self.metadata)
+        self.params = target_params  # reset from temporary variable
 
-        redo_eval = False  # need to recalc evaluation if current state of estimates doesn't match params
-        # will also redo (automatically) if the quality parameters have changed from what was loaded
+        for diff_param in diff_params:
+            if diff_param == 'cnmf_extra.crossplane_merge_thr':
+                do_crossplane_merge = self.metadata['num_planes'] > 1  # only matters if there are at least 2 planes
+            elif diff_param.split('.')[0] in cmp.EvalParamStruct.model_fields:
+                redo_eval = True
+            else:
+                self.invalidate_from_stage(cmp.AnalysisStage.CNMF)
+                raise RuntimeError('Unexpected differences between current parameters and those used in CNMF run; invalidating')
 
-        # if we loaded the result and crossplane merging was already done, don't redo
-        if (self.crossplane_merge_thr is not None and self.cnmf_fit.estimates.crossplane_merge_thr_used is None
-            and self.metadata['num_planes'] > 1):
+        # do crossplane merging if necessary
+        if do_crossplane_merge:
             logging.info('Doing crossplane merging')
             n_merged = self.cnmf_fit.estimates.merge_components_crossplane(
                 n_planes=self.metadata['num_planes'], params=self.cnmf_fit.params, thr=self.crossplane_merge_thr)
@@ -1281,19 +1298,16 @@ class SessionAnalysis:
         else:
             n_merged = 0
         
-        if self.snr_type != self.cnmf_fit.estimates.snr_type:
-            # redo evaluation after switching SNR type
+        # redo evaluation after merging or switching SNR type
+        if redo_eval:
             if n_merged == 0:
                 logging.info(f'Redoing evaluation with {self.snr_type} SNR type')
-            redo_eval = True
-
-        self.do_cnmf_evaluation(recalc=redo_eval)
+            self.do_cnmf_evaluation(recalc=True)
 
         self.make_df_over_f(recalc=False)
 
         if self.downsample_factor is not None:
             assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
-            assert self.cnmf_fit is not None, 'CNMF not successful?'
             logging.info(f'Upsampling (interpolating) results by a factor of {self.downsample_factor}')
             self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)
         
@@ -1442,7 +1456,9 @@ class SessionAnalysis:
         return df
 
 
-    def get_gridsearch_diffs(self, batch: Optional[MescoreBatch] = None) -> pd.DataFrame:
+    def get_gridsearch_diffs(
+        self, batch: Optional[MescoreBatch] = None, params_to_exclude: Optional[Container[str]] = None, exclude_quality=True
+        ) -> pd.DataFrame:
         """
         Get table of parameter differences between all the gridsearch runs that have been run so far
         as well as the current parameter values.
@@ -1463,7 +1479,8 @@ class SessionAnalysis:
         # iterate through and build list of params that differ from current ones
         for ind in sub_df.index:
             params = cmp.load_params_from_batch_item(sub_df.loc[ind, :])
-            for changed_param in self.params.get_differing_params(params, metadata=self.metadata):
+            for changed_param in self.params.get_differing_params(
+                params, metadata=self.metadata, params_to_exclude=params_to_exclude, exclude_quality=exclude_quality):
                 differing_params.add(changed_param)
             params_objs.append(params)
 
@@ -1554,7 +1571,7 @@ class SessionAnalysis:
             cnmf_params = cmp.load_params_from_cnmf_h5(cnmf_path)
             self.update_params(cnmf_params.to_dict())
 
-        # try loading  or running prerequisites to fill in invalidated data
+        # try loading or running prerequisites to fill in invalidated data
         try:
             load = None if allow_rerunning_prereqs else True
             self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load)
@@ -2019,6 +2036,70 @@ class SessionAnalysis:
         fig.suptitle('Background components')
         fig.tight_layout()
         return fig
+
+
+    def show_cnmf_results(self, image_data_options: Optional[list[str]] = None, denoised_temporal=True):
+        """
+        Make CNMF visualization of completed runs with controls to adjust automatic evaluation & manual accepted/rejected cells,
+        linked to this object so that saving updates & saves the parameters if appropriate.
+        """
+        batch = self.get_gridsearch_results()
+        is_completed = [out is not None and out['success'] for out in batch.outputs]
+        if not any(is_completed):
+            raise RuntimeError('No completed CNMF results to show')
+
+        completed_runs = batch.loc[is_completed, :].reset_index(drop=True)
+
+        if image_data_options is None:
+            image_data_options = ['corr', 'mean_equalized']
+
+        start_uuid = self.get_selected_uuid()
+        if start_uuid is None or start_uuid not in completed_runs.uuid:
+            start_i = -1
+        else:
+            start_i = list(completed_runs.uuid).index(start_uuid)
+
+        temporal_kwargs = {}
+        if not denoised_temporal:
+            temporal_kwargs['add_residuals'] = True
+
+        viz: 'caiman_viz.CNMFVizWideContainer' = completed_runs.cnmf.viz_wide(
+            image_data_options=image_data_options, image_widget_kwargs={'cmap': 'gray'}, n_planes=self.metadata['num_planes'],
+            start_index=completed_runs.iloc[start_i].name, temporal_kwargs=temporal_kwargs)
+
+        viz.on_save(partial(self._update_params_from_viz, viz))
+        return viz.show()
+
+
+    def _update_params_from_viz(self, viz: 'caiman_viz.CNMFVizWideContainer', _save_button):
+        """Callback to update eval params from visualization"""
+        viz_ind = viz._get_selected_row()
+        if viz_ind is None:
+            return
+
+        viz_row = cast(MescoreSeries, viz._dataframe.iloc[viz_ind])
+        viz_uuid = viz_row.uuid
+        cnmf_path = viz_row.cnmf.get_output_path()
+
+        # get updates to save
+        eval_updates = {'quality': viz._eval_controller.get_data()}
+
+        curr_uuid = self.get_selected_uuid()
+        if viz_uuid == curr_uuid:
+            # update params and save - here we don't need to invalidate, since we're just updating it to reflect
+            # the processing that has already been done
+            self.params, _ = self.params.change_params_and_get_stage_to_invalidate(eval_updates, metadata=self.metadata)
+            self.write_params_for_result_file(cnmf_path, cmp.AnalysisStage.EVAL)
+
+            # also save SessionAnalysis & params file, but don't re-save CNMF
+            self.save(save_cnmf=False)
+        else:
+            # only write out new params if a params file already exists; otherwise writing to CNMF file is sufficient
+            params_path = paths.params_file_for_result(cnmf_path)
+            if os.path.exists(params_path):
+                curr_params = cmp.SessionAnalysisParams.read_from_file(params_path)
+                new_params, _ = curr_params.change_params_and_get_stage_to_invalidate(eval_updates, metadata=self.metadata)
+                new_params.write_params(params_path)
 
 
     #-------------------------- STRUCTURAL DATA -----------------------#

@@ -1,3 +1,4 @@
+from collections.abc import Container, Iterator, Sequence, Mapping
 from copy import deepcopy
 from datetime import date
 from enum import IntEnum
@@ -7,7 +8,7 @@ from itertools import pairwise
 import json
 import os
 from pathlib import Path
-from typing import Iterable, Sequence, Optional, Literal, Union, Any, Mapping, Type, TypeVar, Annotated, cast
+from typing import Optional, Literal, Union, Any, Type, TypeVar, Annotated, cast
 import warnings
 
 from caiman.source_extraction.cnmf import params
@@ -22,19 +23,6 @@ from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 from cmcode.util import types, paths
 from cmcode.util.image import BorderSpec
 
-
-# parameters to not show in diffs between CNMF runs
-EXCLUDE_FROM_DIFFS = [
-    'online.path_to_model',  # depends on caiman data dir
-    'online.init_batch',
-    'online.movie_name_online',
-    'preprocess.n_pixels_per_process',
-    'spatial.n_pixels_per_process',
-    'patch.n_processes',
-    'data.caiman_version',  # could be relevant at some point, but don't show for now
-    'data.last_commit',
-    'data.fnames',
-]
 
 # pydantic helpers
 def list_from_ndarray(obj: Any) -> Any:
@@ -74,7 +62,7 @@ class StageParams:
             return set(ta.json_schema(mode='serialization')['properties'].keys())
 
 
-    def get_differing_params(self: Self, other: Self, metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self: Self, other: Self, metadata: dict[str, Any]) -> Iterator[str]:
         yield from ()
         """Find names of parameters that are different between self and other"""
 
@@ -130,7 +118,7 @@ class ConversionParams(StageParams):
     interp: bool = True
     dead_pix_mode: Union[bool, params.LitStr[Literal['copy', 'min']]] = 'copy'
 
-    def get_differing_params(self, other: 'ConversionParams', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'ConversionParams', metadata: dict[str, Any]) -> Iterator[str]:
         """Determine whether loaded params are compatible with current ones"""
         # build list of fields that don't matter for outputs with current settings (or are checked separately)
         irrelevant_fields = ['chunk_size', 'odd_row_offset', 'odd_row_ndead', 'force_estim_ndead_offset']
@@ -201,7 +189,7 @@ class McorrParamsExtra(StageParams):
         return not self._mcorr_params.motion.pw_rigid
 
 
-    def get_differing_params(self, other: 'McorrParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'McorrParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
         # only care about indices_exclude_fringe if indices are out of date, meaning that
         # matching motion.indices can't be trusted.
 
@@ -219,7 +207,7 @@ class TranspositionParams(StageParams):
     add_to_mov: float = 0.
     blur_kernel_size: int = 1  # same as blur_size in SeedParams
 
-    def get_differing_params(self, other: 'TranspositionParams', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'TranspositionParams', metadata: dict[str, Any]) -> Iterator[str]:
         irrelevant_fields = ['conversion_params', 'highpass_cutoff']
         if self.highpass_cutoff != other.highpass_cutoff:
             yield 'highpass_cutoff'
@@ -289,7 +277,7 @@ class SeedParams(StageParams):
             gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
             )
 
-    def get_differing_params(self, other: 'SeedParams', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'SeedParams', metadata: dict[str, Any]) -> Iterator[str]:
         if self.type != 'none' or other.type != 'none':
             for param in self.params():
                 val1 = getattr(self, param)
@@ -311,7 +299,7 @@ class CNMFParamsExtra(StageParams):
     seed_params: SeedParams = SeedParams()
     crossplane_merge_thr: Optional[float] = None
 
-    def get_differing_params(self, other: 'CNMFParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'CNMFParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
         for param in self.seed_params.get_differing_params(
             other.seed_params, metadata=metadata):
             yield 'seed_params.' + param
@@ -324,7 +312,7 @@ class EvalParamsExtra(StageParams):
     """Extra parameters for CNMF evaluation (do not require redoing CNMF)"""
     snr_type: params.LitStr[Literal['normal', 'gamma']] = 'normal'
 
-    def get_differing_params(self, other: 'EvalParamsExtra', metadata: dict[str, Any]) -> Iterable[str]:
+    def get_differing_params(self, other: 'EvalParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
         if self.snr_type != other.snr_type:
             yield 'snr_type'
 
@@ -387,12 +375,26 @@ class ParamStruct(BaseModel):
     
     def get_differing_params(
             self, other: Union['ParamStruct', params.CNMFParams], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None,
-            include_different_toplevel=False, ignore_prereq_stages=False) -> Iterable[str]:
+            include_different_toplevel=False, ignore_prereq_stages=False,
+            params_to_exclude: Optional[Container[str]] = None, exclude_quality=True) -> Iterator[str]:
         """
         Return flattened names of params that differ between first and second
         include_different_toplevel: include top-level keys if one is present and the other is not.
             By default, only compares top-level keys that are present in both dicts.
         """
+        if params_to_exclude is None:
+            params_to_exclude = {
+                'online.path_to_model',  # depends on caiman data dir
+                'online.init_batch',
+                'online.movie_name_online',
+                'preprocess.n_pixels_per_process',
+                'spatial.n_pixels_per_process',
+                'patch.n_processes',
+                'data.caiman_version',  # could be relevant at some point, but don't show for now
+                'data.last_commit',
+                'data.fnames',
+            }
+
         # infer whether CNMF is seeded because in this case we don't care about patch.rf and patch.only_init
         seeded = True
         for struct in self, other:
@@ -416,7 +418,7 @@ class ParamStruct(BaseModel):
             second_fields &= stage_fields
 
         for key in first_fields | second_fields:
-            if key in EXCLUDE_FROM_DIFFS:
+            if key in params_to_exclude or (exclude_quality and key == 'quality'):
                 continue
 
             if (key not in first_fields or key not in second_fields):
@@ -430,7 +432,7 @@ class ParamStruct(BaseModel):
                 for param, _, _ in val1.get_differing_params(val2):
                     # skip ones that we don't care about
                     param_flat = key + '.' + param
-                    if param_flat in EXCLUDE_FROM_DIFFS:
+                    if param_flat in params_to_exclude:
                         continue
 
                     # ignore rf and only_init if we are using seeded CNMF
@@ -450,7 +452,7 @@ class ParamStruct(BaseModel):
 
     
     def get_differing_params_from_file(
-            self, path: Union[str, Path], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None) -> Iterable[str]:
+            self, path: Union[str, Path], metadata: dict[str, Any], stage: Optional[AnalysisStage] = None) -> Iterator[str]:
         if stage is None:
             other_params = type(self).read_from_file(path)
         else:
@@ -680,6 +682,17 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         run_params = deepcopy(self._cnmf)
         run_params.change_params(updates)
         return run_params
+
+
+    def copy_with_mesmerize_run_differences(self) -> 'SessionAnalysisParams':
+        """
+        Return a copy with changes to reflect the parameters used during a mesmerize-core run,
+        before finish_cnmf_processing is called.
+        """
+        new_params = deepcopy(self)
+        new_params.cnmf_extra = self.cnmf_extra.replace(crossplane_merge_thr=None)
+        new_params.eval_extra = self.eval_extra.replace(snr_type='normal')
+        return new_params
     
 
 # convenience mappings to find params container for a given analysis stage

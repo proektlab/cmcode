@@ -21,7 +21,7 @@ from holoviews.operation import Operation
 from holoviews.streams import Stream, param
 from IPython.display import display
 from ipywidgets import (HBox, VBox, IntSlider, Label, Layout, Button, Image as ImageWidget, 
-                        Output, SelectMultiple, HTML)
+                        Output, SelectMultiple, HTML, CallbackDispatcher)
 import jupyter_bokeh as jbk
 import matplotlib.style as mplstyle
 import matplotlib.pyplot as plt
@@ -57,40 +57,50 @@ hv.extension('bokeh')  # type: ignore
 BokehPalette = Callable[[int], Sequence[str]]
 
 
-def make_button_with_feedback(button_text: str, callback: Callable[[Any], None]) -> HBox:
-    """Make a button that shows a loading indicator and check/X emoji to give feedback on progress of the callback"""
-    button = Button(description=button_text)
-    feedback = Output()
+class ButtonWithFeedback(HBox):
+    """a button that shows a loading indicator and check/X emoji to give feedback on progress of the callback"""
     loading_gif_path = Path(next(iter(cmcode.__path__))).parent / 'assets' / 'loading.gif'
-    with open(loading_gif_path, 'rb') as loading_gif:
-        loading_gif_data = loading_gif.read()
-    loading = ImageWidget(value=loading_gif_data, format='gif', layout=Layout(width='28px'))
-    done = Label(value='\u2714', style={'color': 'green', 'font-size': '28px'})
-    failed = HBox([
-        Label(value='\u2716', style={'color': 'red', 'font-size': '28px'}),
-        Label(value='See console for details')
-    ])
 
-    def button_cb(obj: Any) -> None:
-        feedback.clear_output()
-        with feedback:
-            display(loading)
-        try:
-            callback(obj)
-        except:
-            # show X and directions to look at console
-            feedback.clear_output()
-            with feedback:
-                display(failed)
-        else:
-            feedback.clear_output()
-            with feedback:
-                display(done)
+    def __init__(self, button_text: str):
+        self.button = Button(description=button_text)
+        self.feedback = Output()
+        super().__init__([self.button, self.feedback])
+
+        with open(self.loading_gif_path, 'rb') as loading_gif:
+            loading_gif_data = loading_gif.read()
+        self.loading = ImageWidget(value=loading_gif_data, format='gif', layout=Layout(width='28px'))
+        self.done = Label(value='\u2714', style={'color': 'green', 'font-size': '28px'})
+        self.failed = HBox([
+            Label(value='\u2716', style={'color': 'red', 'font-size': '28px'}),
+            Label(value='See console for details')
+        ])
+
+        self.click_handlers = CallbackDispatcher()
+        self.button.on_click(self.button_cb)
+
+    def on_click(self, callback: Callable[[Any], None], remove=False):
+        self.click_handlers.register_callback(callback, remove=remove)
+
+    def button_cb(self, obj: Any) -> None:
+        self.feedback.clear_output()
+        with self.feedback:
+            display(self.loading)
+
+        for callback in self.click_handlers.callbacks:
+            try:
+                callback(obj)
+            except:
+                # show X and directions to look at console
+                self.feedback.clear_output()
+                with self.feedback:
+                    display(self.failed)
+                    break
+        else:  # (if no break/error)
+            self.feedback.clear_output()
+            with self.feedback:
+                display(self.done)
             time.sleep(5)  # wait long enough to be seen, then disappear so next press also gets feedback
-            feedback.clear_output()
-    
-    button.on_click(button_cb)
-    return HBox([button, feedback])
+            self.feedback.clear_output()
 
 
 class ManualCurationController:
@@ -117,10 +127,11 @@ class ManualCurationController:
         self._reject_selector = SelectMultiple()
         self._reject_pane = VBox([Label('Rejected cells:'), self._reject_buttons, self._reject_selector])
 
-        #self._save_button = Button(description='Save to disk')
-        self._save_eval: Optional[Callable[[Any], None]] = None
-        self._save_button = make_button_with_feedback(
-            'Save to disk', lambda obj: self._save_eval(obj) if self._save_eval is not None else None)
+        self._save_button = ButtonWithFeedback('Save to disk')
+        # add callback initially to say that save_eval callback is not set yet
+        def dummy_cb(_):
+            raise RuntimeError('Save callback has not been set yet')
+        self._save_button.on_click(dummy_cb)
 
         self.widget = VBox([HBox([self._accept_pane, self._reject_pane]), self._save_button])
 
@@ -130,7 +141,8 @@ class ManualCurationController:
 
     def set_viz(self, viz: CNMFVizContainer):
         self._viz_container = viz
-        self._save_eval = viz._save_eval
+        # use the same callbacks as the eval save button for the manual curation save button
+        self._save_button.click_handlers = viz._eval_controller.button_save_eval._click_handlers
 
     def set_data_from_cnmf(self, cnmf_obj: CNMFExt):
         """Grap accepted/rejected lists from CNMF object (e.g. after selecting a new run)"""
@@ -390,6 +402,9 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
         self._manual_curation_controller.set_viz(self)
 
+        # add callback to clear my CNMF cache
+        self.on_save(lambda _: clear_cnmf_cache())
+
         # update eval controller to handle non-finite values correctly
         self._eval_controller.set_limits = partial(my_set_limits, self._eval_controller)
 
@@ -478,9 +493,9 @@ class CNMFVizWideContainer(CNMFVizContainer):
         self._eval_controller.set_limits(cnmf_obj)
         self._eval_controller.use_cnn_checkbox.disabled = False
 
-    def _save_eval(self, obj):
-        super()._save_eval(obj)
-        clear_cnmf_cache()
+    def on_save(self, callback: Callable[[Any], None], remove=False):
+        """Register callback for eval and manual curation save buttons"""
+        self._eval_controller.button_save_eval.on_click(callback, remove=remove)
 
     def _row_changed(self, *args):
         super()._row_changed(*args)
@@ -721,7 +736,8 @@ class RawDataPreviewContainer:
         if offset_save_callback is not None:
             def save_cb(_obj):
                 offset_save_callback(self.curr_offset)
-            self.save_button = make_button_with_feedback('Save offset', save_cb)
+            self.save_button = ButtonWithFeedback('Save offset')
+            self.save_button.on_click(save_cb)
         else:
             self.save_button = None
 
