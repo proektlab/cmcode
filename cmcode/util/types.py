@@ -1,7 +1,7 @@
 from typing import Optional, Union, TYPE_CHECKING, TypeVar, Type, Callable
 
 import numpy as np
-from optype.numpy import Array2D
+import optype.numpy as onp
 from scipy import sparse
 import pandas as pd
 
@@ -38,8 +38,12 @@ class BadFitError(RuntimeError):
     pass
 
 
+# MaybeSparse type that can contain any number or boolean
 ST = TypeVar('ST', bound=Union[np.number, np.bool_])
-MaybeSparse = Union[Array2D[ST], sparse.csc_matrix[ST], sparse.csc_array[ST]]
+MaybeSparse = Union[onp.Array2D[ST], sparse.csc_matrix[ST], sparse.csc_array[ST]]
+
+# we need moar dimensions
+Array4D = onp.Array[tuple[int, int, int, int], onp._array._SCT]
 
 
 # helpers for mesmerize-core

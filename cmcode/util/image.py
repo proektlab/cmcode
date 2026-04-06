@@ -156,7 +156,7 @@ class BorderSpec:
             return BorderSpec(top=new_top, bottom=new_bottom, left=self.left, right=self.right)
 
 
-    def slices(self, shape: tuple[int, ...]) -> tuple[slice, slice]:
+    def slices(self, shape: Sequence[int]) -> tuple[slice, slice]:
         """Make indexing slices for these borders given an image shape"""
         shape2d = shape[:2]
         return (slice(self.top, shape2d[0]-self.bottom), slice(self.left, shape2d[1]-self.right))

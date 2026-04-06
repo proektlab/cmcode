@@ -384,43 +384,33 @@ class SessionAnalysis:
         self.metadata = meta
 
 
-    def invalidate_from_stage(self, stage: AnalysisStage) -> dict[str, Any]:
+    def invalidate_from_stage(self, stage: AnalysisStage):
         """
         Remove info relating to given and later analysis stages,
         so it must be reloaded or recomputed with current parameters
-        Returns the removed or modified attributes in a dictionary.
         """
         if stage > self.last_valid_stage:
-            return {}
+            return
 
         logging.info(f'Invalidating results from {stage.name} onwards')
-        removed_attrs = {}
 
         if stage <= AnalysisStage.CONVERT:
-            removed_attrs['plane_tifs'] = self.plane_tifs
             self.plane_tifs = None
         
         if stage <= AnalysisStage.MCORR:
-            removed_attrs['mc_result'] = self.mc_result
             self.mc_result = None
         
         if stage <= AnalysisStage.TRANSPOSE:
-            removed_attrs['mmap_file_transposed'] = self.mmap_file_transposed
             self.mmap_file_transposed = None
         
         if stage <= AnalysisStage.CNMF:
-            removed_attrs['cnmf_fit_filename'] = self.cnmf_fit_filename
             self.cnmf_fit_filename = None
-            removed_attrs['_cnmf_fit'] = self._cnmf_fit
             self._cnmf_fit = None
 
         elif stage <= AnalysisStage.EVAL and self.cnmf_fit is not None:
-            removed_attrs['_cnmf_fit'] = self._cnmf_fit
             self.cnmf_fit.estimates.idx_components_eval = None
             self.cnmf_fit.estimates.idx_components_bad_eval = None
             self._cnmf_changed_flag = True
-        
-        return removed_attrs
 
     
     def process_stage(self, stage: AnalysisStage, load: Optional[bool] = None):
@@ -486,7 +476,7 @@ class SessionAnalysis:
         self.params.write_params(path=params_path, stage=stage)
 
 
-    def update_params(self, param_changes: Mapping[str, Mapping[str, Any]]) -> dict[str, Any]:
+    def update_params(self, param_changes: Mapping[str, Mapping[str, Any]]):
         """
         Update params, also allowing changes to some things that are not part of CNMFParams:
 
@@ -498,13 +488,10 @@ class SessionAnalysis:
 
         All other sub-fields of CNMFParams may also be present as keys.
         Results that are not compatible with the new parameters will be invalidated (set to None).
-        Returns dict of removed or modifed attributes.
         """
         self.params, invalid_stage = self.params.change_params_and_get_stage_to_invalidate(param_changes, self.metadata)
         if invalid_stage is not None:
-            return self.invalidate_from_stage(invalid_stage)
-        else:
-            return {}
+            self.invalidate_from_stage(invalid_stage)
 
 
     def save(self, save_cnmf: Optional[bool] = None):
@@ -888,6 +875,15 @@ class SessionAnalysis:
             fig_mean, fig_corr = self.make_mc_comparison_summary_plots()
             fig_mean.savefig(os.path.join(self.data_dir, 'mcorr', fname_prefix + '_meanproj.png'), dpi=200)
             fig_corr.savefig(os.path.join(self.data_dir, 'mcorr', fname_prefix + '_corr.png'), dpi=200)
+
+
+    def view_mcorr_pcs(self):
+        """Make plot to visualize the movie PCs after motion correction of each plane"""
+        if self.mc_result is None:
+            raise RuntimeError('Motion correction not done')
+
+        plane_pc_metrics = [self.mc_result.get_pc_metrics(plane=k) for k in range(self.metadata['num_planes'])]
+        return caiman_viz.view_mcorr_pcs(plane_pc_metrics, sample_rate=self.sample_rate)
 
 
     # ------------------------------- PLANE CONCATENATION/TRANSPOSITION ------------------------#

@@ -21,3 +21,4 @@ dependencies:
 - pip:
   - mesmerize-viz
   - fastplotlib ~= 0.1.0.a17
+  - suite2p

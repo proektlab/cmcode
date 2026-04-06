@@ -14,7 +14,8 @@ install_requires = [
     "nest-asyncio",
     "opencv-python",
     "optype[numpy]",
-    "pydantic"
+    "pydantic",
+    "suite2p"
 ]
 
 

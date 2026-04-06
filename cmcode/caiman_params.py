@@ -546,7 +546,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         eval_extra: EvalParamsExtra = EvalParamsExtra()
         ):
 
-        return cls(
+        obj = cls(
             conversion=conversion,
             motion=cnmf.motion,
             mcorr_extra=mcorr_extra,
@@ -564,6 +564,9 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             quality=cnmf.quality,
             eval_extra=eval_extra
         )
+
+        obj._cnmf = cnmf
+        return obj
 
     @classmethod
     def from_metadata(
@@ -597,6 +600,12 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         )
 
 
+    def _update_refs_to_cnmf_params(self):
+        """Ensure all GroupParams fields refer to a sub-object of self._cnmf"""
+        for group in self._cnmf.groups:
+            setattr(self, group, getattr(self._cnmf, group))
+
+
     def get_first_nonmatching_stage(self, other: 'SessionAnalysisParams', metadata: dict[str, Any]) -> AnalysisStage:
         """Just identify the first invalid/nonmatching stage compared to another params object"""
         for stage_num in range(int(AnalysisStage.START) + 1, int(AnalysisStage.FINAL)):
@@ -610,7 +619,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
 
     # Updating, safely
     def change_params_and_get_stage_to_invalidate(
-            self, changes: Mapping[str, Mapping[str, Any]], metadata: dict[str, Any]
+            self, changes: Mapping[str, dict[str, Any]], metadata: dict[str, Any]
             ) -> tuple['SessionAnalysisParams', Optional[AnalysisStage]]:
         """
         Make a copy with new parameters, and also return which analysis stage should be invalidated
@@ -628,30 +637,44 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         while stage < AnalysisStage.FINAL:
             stage = AnalysisStage(stage + 1)
 
+            stage_cnmf_updates: dict[str, dict[str, Any]] = {}
+
             for key in stage_only_params[stage].model_fields.keys() & changes.keys():
                 change_subparams = changes.pop(key)
-                if not isinstance(change_subparams, Mapping):
+                if not isinstance(change_subparams, dict):
                         raise TypeError('Changes should always be dicts to avoid replacing non-specified params')
 
-                # set new_params attribute to an updated copy
                 curr_subparams: Union[params.GroupParams, StageParams] = getattr(new_params, key)
-                new_subparams = curr_subparams.replace(**change_subparams)
-                setattr(new_params, key, new_subparams)
+                if isinstance(curr_subparams, params.GroupParams):
+                    # update _cnmf field with this at end
+                    stage_cnmf_updates[key] = change_subparams
+                else:
+                    # set new_params attribute to an updated copy
+                    new_subparams = curr_subparams.replace(**change_subparams)
+                    setattr(new_params, key, new_subparams)
 
-                # special case: unset _indices_are_adjusted flag if necessary
-                if isinstance(curr_subparams, ConversionParams):
-                    assert isinstance(new_subparams, ConversionParams)
-                    for differing_param in curr_subparams.get_differing_params(new_subparams, metadata=metadata):
-                        if differing_param in ['crop', 'odd_row_offset', 'odd_row_ndead']:
-                            # add to mcorr_extra changes to apply in future loop iteration
-                            if 'mcorr_extra' not in changes:
-                                changes['mcorr_extra'] = {'_indices_are_adjusted': False}
-                            else:  # note we make a new dict since the value is not guaranteed to be mutable
-                                changes['mcorr_extra'] = {**changes['mcorr_extra'], '_indices_are_adjusted': False}
-                            break
+                    # special case: unset _indices_are_adjusted flag if necessary
+                    if isinstance(curr_subparams, ConversionParams):
+                        assert isinstance(new_subparams, ConversionParams)
+                        for differing_param in curr_subparams.get_differing_params(new_subparams, metadata=metadata):
+                            if differing_param in ['crop', 'odd_row_offset', 'odd_row_ndead']:
+                                # add to mcorr_extra changes to apply in future loop iteration
+                                if 'mcorr_extra' not in changes:
+                                    changes['mcorr_extra'] = {'_indices_are_adjusted': False}
+                                else:  # note we make a new dict since the value is not guaranteed to be mutable
+                                    changes['mcorr_extra'] = {**changes['mcorr_extra'], '_indices_are_adjusted': False}
+                                break
+
+            if stage_cnmf_updates:
+                new_params._cnmf.change_params(stage_cnmf_updates)
 
             if invalid_stage is None and not self.do_params_match(new_params, metadata=metadata, stage=stage, ignore_prereq_stages=True):
                 invalid_stage = stage
+
+        # update self.<cnmf_group> to refer to self._cnmf.<cnmf_group>
+        # this could be done automatically with a property maybe, but I think for now this is cleaner
+        # to also allow the class to be instantiated by pydantic from a combined nested dict.
+        new_params._update_refs_to_cnmf_params()
 
         if changes:
             raise RuntimeError('These groups in change dict did not match: ' + ', '.join(changes.keys()))

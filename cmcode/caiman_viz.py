@@ -26,6 +26,7 @@ import jupyter_bokeh as jbk
 import matplotlib.style as mplstyle
 import matplotlib.pyplot as plt
 import numpy as np
+import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 import panel as pn
@@ -49,12 +50,13 @@ from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_x
                                     map_footprints, maxproj_per_cell, footprint_interpolator_per_cell)
 from cmcode.util.image import remap_image, make_merge, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files
-from cmcode.util.types import MaybeSparse
+from cmcode.util.types import MaybeSparse, Array4D
 
 pn.extension()
 hv.extension('bokeh')  # type: ignore
 
 BokehPalette = Callable[[int], Sequence[str]]
+preferred_bokeh_tools = ['pan', 'box_zoom', 'reset', 'save']
 
 
 class ButtonWithFeedback(HBox):
@@ -842,7 +844,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
             lower=hv.dim('shift') - hv.dim('minshift')
         )
         range_holomap = shifts_w_range.to(hv.Spread, kdims='frame', vdims=['shift', 'lower', 'upper']).opts(
-            fill_alpha=0.45, line_alpha=0
+            fill_alpha=0.45, line_alpha=0, tools=preferred_bokeh_tools
         )
         shift_holomap = shift_holomap * range_holomap
 
@@ -853,7 +855,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
                 this_mag_and_angle = cast(hv.Dataset, shifts_els_mag_and_angle.select(plane=plane, frame=frame))
                 return this_mag_and_angle.reindex().to(
                     hv.VectorField, kdims=['xpatch', 'ypatch'], vdims=['shift_angle', 'shift_mag'],
-                    group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True)
+                    group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True, tools=preferred_bokeh_tools)
 
             kdims = ['plane', 'frame']
             quiver_dmap = hv.DynamicMap(quiver, kdims=kdims).redim.values(
@@ -879,7 +881,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
     return widget
 
 
-def make_rgb_frame_apply(rgb_image: np.ndarray) -> tuple[np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+def make_rgb_frame_apply(rgb_image: onp.Array3D) -> tuple[onp.Array2D, Callable[[onp.Array2D], np.ndarray]]:
     """
     Hack to make RGB images work with ImageWidget for fastplotlib <v0.2
     Input should be an image where the last dimension is channels (i.e. of length 3 or 4)
@@ -893,9 +895,52 @@ def make_rgb_frame_apply(rgb_image: np.ndarray) -> tuple[np.ndarray, Callable[[n
         raise RuntimeError('Number of channels (last dimension) of RGB image must be 3 or 4.')
     
     image_flat = np.reshape(rgb_image, rgb_image.shape[:-2] + (rgb_image.shape[-2] * n_chan,), order='C')
-    def rgb_frame_apply(frame: np.ndarray) -> np.ndarray:
+    def rgb_frame_apply(frame: onp.Array2D) -> np.ndarray:
         return np.reshape(frame, frame.shape[:-1] + (frame.shape[-1] // n_chan, n_chan), order='C')
     return image_flat, rgb_frame_apply
+
+
+def view_plane_mcorr_pcs(tPC: onp.Array2D[np.floating], regPC: Array4D[np.floating], sample_rate=1.):
+    """
+    Make visualization for principal components of motion-corrected video for each plane.
+    Inputs are the same as the outputs of suite2p.registration.metrics.get_pc_metrics.
+    """
+    top_minus_bottom = regPC[1] - regPC[0]  # now nPC x Y x X
+    
+    n_pcs = tPC.shape[1]
+    time = 1/sample_rate * np.arange(tPC.shape[0])
+    n_y = top_minus_bottom.shape[1]
+    n_x = top_minus_bottom.shape[2]
+
+    def make_plot(pc: int):
+        temporal_plot = hv.Curve(
+            {'time': time, 'PC value': tPC[:, pc]}, kdims=['time'], vdims=['PC value']
+            ).opts(aspect=1.8, tools=preferred_bokeh_tools)
+        
+        spatial_plot = hv.Image(
+            {'x': range(n_x), 'y': range(n_y), 'top-bottom': top_minus_bottom[pc]},
+            kdims=['x', 'y'], vdims=['top-bottom']
+            ).opts(
+                cmap='bwr', symmetric=True, tools=preferred_bokeh_tools,
+                xaxis='bare', yaxis='bare', aspect=1.)
+
+        return temporal_plot + spatial_plot  # type: ignore
+    return hv.DynamicMap(make_plot, kdims=['PC']).opts(framewise=True).redim.values(PC=range(n_pcs))
+
+
+def view_mcorr_pcs(pc_metrics: Sequence[tuple[onp.Array2D[np.floating], Array4D[np.floating]]], sample_rate=1.):
+    """Make stack of principal components visualizations for each plane"""
+    plots = [
+        view_plane_mcorr_pcs(*metrics, sample_rate=sample_rate).opts(title=f'Plane {k_plane}')
+        for k_plane, metrics in enumerate(pc_metrics)
+    ]
+    plot_column = column([hv.render(plot) for plot in plots])
+    
+    # apply dark theme
+    doc = Document(theme=built_in_themes['dark_minimal'])
+    doc.add_root(plot_column)
+
+    return jbk.BokehModel(plot_column)
 
 
 def my_check_register_ROIs(matched1: list[int],

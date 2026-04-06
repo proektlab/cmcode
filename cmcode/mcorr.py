@@ -22,11 +22,15 @@ import holoviews as hv
 from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel
 from mesmerize_core.utils import Border
 import numpy as np
+import optype.numpy as onp
+from suite2p.registration.metrics import get_pc_metrics
+import torch
+from torch.cuda import is_available
 
 from cmcode import caiman_analysis as cma, caiman_params as cmp
 from cmcode.util import paths
 from cmcode.util.image import BorderSpec
-from cmcode.util.types import NoMatchingResultError
+from cmcode.util.types import NoMatchingResultError, Array4D
 
 
 @dataclass
@@ -45,8 +49,8 @@ class MCResult(paths.CustomPathMappable):
     mmap_files: list[str]
     border_to_0: int
     border_asym: list[BorderSpec]  # border on each side (old results just repeat border_to_0)
-    shifts_rig: list[np.ndarray]
-    shifts_els: Optional[list[np.ndarray]] = None
+    shifts_rig: list[onp.Array2D]
+    shifts_els: Optional[list[onp.Array3D]] = None
     dims: Optional[tuple[int, int]] = None
     motion_params: Optional[MotionParams] = None
     mmap_file_transposed: Optional[str] = None  # deprecated, keep for unpickling
@@ -113,7 +117,7 @@ class MCResult(paths.CustomPathMappable):
     def shifts_rig_hv(self) -> hv.Dataset:
         """Make HoloViews dataset from rigid shifts"""
         if self._shifts_rig_hv is None:
-            shifts_all = np.stack(self.shifts_rig)
+            shifts_all: onp.Array3D = np.stack(self.shifts_rig)
             nplanes, ndims, nframes = shifts_all.shape
             assert ndims == 2, 'Only 2D shifts supported'
             data_dims = {
@@ -143,7 +147,7 @@ class MCResult(paths.CustomPathMappable):
             npatch_y = len(patch_centers_y)
             npatch_x = len(patch_centers_x)
 
-            shifts_all_els = np.stack(self.shifts_els)
+            shifts_all_els: Array4D = np.stack(self.shifts_els)
             nplanes, ndims, nframes, _ = shifts_all_els.shape
             assert ndims == 2, 'Only 2D shifts supported'
 
@@ -210,6 +214,32 @@ class MCResult(paths.CustomPathMappable):
                     mcorr_obj.z_shifts_els = list(shifts_els[2])
             mcorr_objs.append(mcorr_obj)
         return mcorr_objs
+
+    def get_pc_metrics(self, plane: int) -> tuple[onp.Array2D[np.floating], Array4D[np.floating]]:
+        """
+        Compute principal components and averages of top/bottom-weighted frames
+            of motion-corrected movie for a single plane, using suite2p
+        See: https://suite2p.readthedocs.io/en/latest/api/registration/#suite2p.registration.metrics.get_pc_metrics
+        Outputs:
+            - tPC:      Temporal PC weights of shape (n_samples, nPC), describing how each PC varies
+                        across the subsampled frames.
+            - regPC:    Average of top and bottom weighted frames for each PC, shape (2, nPC, Ly_crop, Lx_crop)
+                        where index 0 is pclow and index 1 is pchigh.
+        """
+        if plane < 0 or plane >= self.n_planes:
+            raise ValueError(f'Plane must be from 0 to {self.n_planes - 1}, inclusive.')
+
+        mov = cm.load(self.mmap_files[plane])
+        _T, *dims = mov.shape
+        slices = self.border_asym[plane].slices(dims)
+        mov_center = mov[:, *slices]
+
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+        
+        return get_pc_metrics(mov_center, device=device)[:2]
 
 
 def _build_motion_correct_basename(filepath: str, is_piecewise=True, with_dt=False) -> str:
@@ -482,7 +512,7 @@ def blur_forder_movie(input_mmap_path: str, output_mmap_path: str, ksize: int):
         return
 
     input_mov: cm.movie = cm.load(input_mmap_path)
-    T, *dims = input_mov.shape
+    T, *dims = input_mov.shape  # type: ignore
     n_pix = int(np.prod(dims))
 
     # create output file

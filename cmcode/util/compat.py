@@ -306,10 +306,13 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
             # assume here that any params not saved with CNMF match what is in the object.
             cnmf_params = cmp.load_params_from_cnmf_h5(sessdata.cnmf_fit_filename)
             cnmf_params_dict = cnmf_params.to_dict()
+            # make each subparam really a dict (not arbitrary mapping) to get around prohibition
+            # in change_params function (meant to prevent accidentally changing more params than intended)
+            dict_of_dicts = {group: {**subparams} for group, subparams in cnmf_params_dict.items()}
 
             # write out params for this CNMF run and get stage of mismatch
             cnmf_run_params, invalid_stage = sessdata.params.change_params_and_get_stage_to_invalidate(
-                cnmf_params_dict, metadata=sessdata.metadata
+                dict_of_dicts, metadata=sessdata.metadata
             )
             params_file = params_file_for_result(sessdata.cnmf_fit_filename)
             logging.info('Writing missing parameters for CNMF')
