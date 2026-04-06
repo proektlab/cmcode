@@ -476,7 +476,7 @@ class SessionAnalysis:
         self.params.write_params(path=params_path, stage=stage)
 
 
-    def update_params(self, param_changes: Mapping[str, Mapping[str, Any]]):
+    def update_params(self, param_changes: Union[Mapping[str, dict[str, Any]], str, Path]):
         """
         Update params, also allowing changes to some things that are not part of CNMFParams:
 
@@ -488,8 +488,14 @@ class SessionAnalysis:
 
         All other sub-fields of CNMFParams may also be present as keys.
         Results that are not compatible with the new parameters will be invalidated (set to None).
+        
+        Also supports changing from a path to a CNMF HDF5 file.
         """
-        self.params, invalid_stage = self.params.change_params_and_get_stage_to_invalidate(param_changes, self.metadata)
+        if isinstance(param_changes, (str, Path)):
+            self.params, invalid_stage = self.params.change_from_cnmf_h5_and_get_stage_to_invalidate(param_changes, self.metadata)
+        else:
+            self.params, invalid_stage = self.params.change_params_and_get_stage_to_invalidate(param_changes, self.metadata)
+
         if invalid_stage is not None:
             self.invalidate_from_stage(invalid_stage)
 
@@ -1564,8 +1570,7 @@ class SessionAnalysis:
         except FileNotFoundError:
             # load partial params from CNMF object
             logging.info('CNMF params file not found - assuming params not specified in the CNMF object match current params.')
-            cnmf_params = cmp.load_params_from_cnmf_h5(cnmf_path)
-            self.update_params(cnmf_params.to_dict())
+            self.update_params(cnmf_path)
 
         # try loading or running prerequisites to fill in invalidated data
         try:

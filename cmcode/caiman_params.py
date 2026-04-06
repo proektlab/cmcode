@@ -682,6 +682,18 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         return new_params, invalid_stage
 
     
+    def change_from_cnmf_h5_and_get_stage_to_invalidate(
+        self, path_hdf5: Union[Path, str], metadata: dict[str, Any]) -> tuple['SessionAnalysisParams', Optional[AnalysisStage]]:
+        """
+        Make a copy that is updated to match those saved along with a CNMF run in the HDF5 results file
+        (used if full params were not saved in an accompanying JSON flie)
+        """
+        cnmf_params = load_params_from_cnmf_h5(path_hdf5)
+        # convert to actual dict of dicts so it will be accepted by change_params_and_get_stage_to_invalidate
+        dict_of_dicts = {group: {**getattr(cnmf_params, group)} for group in cnmf_params.groups}
+        return self.change_params_and_get_stage_to_invalidate(dict_of_dicts, metadata=metadata)
+
+    
     def read_cnmf_params(self) -> params.CNMFParams:
         """Copy and return CNMFParams object"""
         # fix some fields that aren't relevant/depend on current environment
@@ -870,9 +882,17 @@ def round_to_odd(x: Union[float, np.ndarray]):
 
 # more utilities for loading
 
-def load_params_from_cnmf_h5(filename: Union[Path, str]) -> params.CNMFParams:
+def load_params_from_cnmf_h5(path_hdf5: Union[Path, str]) -> params.CNMFParams:
     """Load just params from CNMF HDF5 file"""
-    with h5py.File(filename, 'r') as h5file:
+    path_bytes = os.fsencode(path_hdf5)
+    try:
+        valid_hdf5 = h5py.h5f.is_hdf5(path_bytes)
+    except FileNotFoundError:
+        valid_hdf5 = False
+    if not valid_hdf5:
+        raise ValueError(f'Cannot load params from {path_hdf5} - not a valid HDF5 file')
+
+    with h5py.File(path_hdf5, 'r') as h5file:
         params_grp = recursively_load_dict_contents_from_group(h5file, '/params/')
     loaded_params = params.CNMFParams(**params_grp)
     # blank out fnames to avoid data validation issue
