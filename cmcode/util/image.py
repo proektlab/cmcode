@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
 from typing import Union, Sequence, Optional, Callable, Any
+from typing_extensions import Self
 
 import cv2
 from matplotlib.axes import Axes
@@ -13,6 +14,8 @@ import optype.numpy as onp
 import pandas as pd
 from scipy import ndimage, interpolate
 from scipy.ndimage import median_filter
+
+from mesmerize_core.utils import Border2D
 
 from cmcode.util.scaled import ScaledDataFrame, ScaledSeries, ScaledPixels
 
@@ -80,19 +83,24 @@ class BorderSpec:
         self.__dict__.update(state)
 
     
-    def _arithmetic_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> 'BorderSpec':
+    def ceil(self) -> Border2D:
+        """Convert to dict with each side converted to next highest int"""
+        return Border2D(left=self.left, right=self.right, top=self.top, bottom=self.bottom)
+
+    
+    def _arithmetic_op(self, op: str, other: Union[CanFloat, Self]) -> Self:
         """Apply arithmetic operation to all sides"""
         sides = ['left', 'right', 'top', 'bottom']
         op_method = getattr(float, op)
         if isinstance(other, CanFloat):
-            res = BorderSpec(**{side: op_method(getattr(self, side + '_subpix'), float(other)) for side in sides})
+            res = type(self)(**{side: op_method(getattr(self, side + '_subpix'), float(other)) for side in sides})
         else:
-            res = BorderSpec(**{side: op_method(
+            res = type(self)(**{side: op_method(
                 getattr(self, side + '_subpix'), getattr(other, side + '_subpix')
                 ) for side in sides})
-        return BorderSpec.max(res, BorderSpec.equal(0))
+        return type(self).max(res, type(self).equal(0))
 
-    def _comparison_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> bool:
+    def _comparison_op(self, op: str, other: Union[CanFloat, Self]) -> bool:
         """Delegate comparisons to int comparisons of all sides"""
         sides = ['left_subpix', 'right_subpix', 'top_subpix', 'bottom_subpix']
         op_method = getattr(float, op)
@@ -105,16 +113,16 @@ class BorderSpec:
         vars()[op] = partialmethod(_comparison_op, op)
 
     @classmethod
-    def equal(cls, border: CanFloat) -> 'BorderSpec':
+    def equal(cls, border: CanFloat) -> Self:
         return cls(left=border, right=border, top=border, bottom=border)
     
     @classmethod
-    def maximal(cls, shape: tuple[int, int]) -> 'BorderSpec':
+    def maximal(cls, shape: tuple[int, int]) -> Self:
         return cls(left=shape[1], right=shape[1], top=shape[0], bottom=shape[0])
     
     @classmethod
     def combine(cls, fn: Callable[[float, float], float],
-                border1: Union[None, CanFloat, 'BorderSpec'], border2: Union[None, CanFloat, 'BorderSpec']) -> 'BorderSpec':
+                border1: Union[None, CanFloat, Self], border2: Union[None, CanFloat, Self]) -> Self:
         """Combine 2 borders into a BorderSpec by applying the given function to each pair of matching dimensions.""" 
         if isinstance(border1, CanFloat):
             border1 = cls.equal(border1)
@@ -128,7 +136,7 @@ class BorderSpec:
         if border2 is None:
             return border1
         
-        return BorderSpec(
+        return cls(
             left=fn(border1.left_subpix, border2.left_subpix),
             right=fn(border1.right_subpix, border2.right_subpix),
             top=fn(border1.top_subpix, border2.top_subpix),
@@ -136,14 +144,14 @@ class BorderSpec:
         )
 
     @classmethod
-    def max(cls, first: Union[CanFloat, 'BorderSpec'], *others: Union[CanFloat, 'BorderSpec']) -> 'BorderSpec':
+    def max(cls, first: Union[CanFloat, Self], *others: Union[CanFloat, Self]) -> Self:
         """Make a BorderSpec for the maximum border along each side"""
         if isinstance(first, CanFloat):
             first = cls.equal(first)
         return reduce(partial(cls.combine, max), others, first)
 
     @classmethod
-    def min(cls, first: Union[CanFloat, 'BorderSpec'], *others: Union[CanFloat, 'BorderSpec']) -> 'BorderSpec':
+    def min(cls, first: Union[CanFloat, Self], *others: Union[CanFloat, Self]) -> Self:
         """Make a BorderSpec for the minimum border along each side"""
         if isinstance(first, CanFloat):
             first = cls.equal(first)
@@ -154,18 +162,18 @@ class BorderSpec:
         center_shape = self.center_shape(shape)
         return center_shape[0] > 0 and center_shape[1] > 0
     
-    def increased(self, other: Union[CanFloat, 'BorderSpec'], shape: Optional[tuple[int, int]] = None) -> 'BorderSpec':
+    def increased(self, other: Union[CanFloat, Self], shape: Optional[tuple[int, int]] = None) -> Self:
         """Increase borders, limiting result to maximal borders if shape is given"""
         res = self._arithmetic_op('__add__', other)
         if shape is not None:
-            res = BorderSpec.min(self, BorderSpec.maximal(shape=shape))
+            res = type(self).min(self, type(self).maximal(shape=shape))
         return res
     
-    def decreased(self, other: Union[CanFloat, 'BorderSpec']) -> 'BorderSpec':
+    def decreased(self, other: Union[CanFloat, Self]) -> Self:
         """Decrease borders"""
         return self._arithmetic_op('__sub__', other)
     
-    def enclosing_square(self, shape: tuple[int, int]) -> 'BorderSpec':
+    def enclosing_square(self, shape: tuple[int, int]) -> Self:
         """
         Transform into another BorderSpec that removes fewer or equal rows and columns than this one
         and has a square center, if possible. Does nothing if the center is empty.
@@ -194,10 +202,10 @@ class BorderSpec:
 
         if height > width:
             new_left, new_right = distribute_difference(height - width, self.left_subpix, self.right_subpix)
-            return BorderSpec(top=self.top_subpix, bottom=self.bottom_subpix, left=new_left, right=new_right)
+            return type(self)(top=self.top_subpix, bottom=self.bottom_subpix, left=new_left, right=new_right)
         else:
             new_top, new_bottom = distribute_difference(width - height, self.top_subpix, self.bottom_subpix)
-            return BorderSpec(top=new_top, bottom=new_bottom, left=self.left_subpix, right=self.right_subpix)
+            return type(self)(top=new_top, bottom=new_bottom, left=self.left_subpix, right=self.right_subpix)
 
 
     def slices(self, shape: Sequence[int]) -> tuple[slice, slice]:

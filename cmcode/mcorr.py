@@ -338,7 +338,7 @@ def compute_adjusted_indices(params_for_mcorr: cmp.UpToMcorrParamStruct) -> Opti
     n_to_clip = ndead_max + shift_max
     curr_x_indices = indices[1]
     curr_start = 0 if curr_x_indices.start is None else int(curr_x_indices.start)
-    n_clipped = curr_start + crop.left  # number of pixels currently removed from original image
+    n_clipped = curr_start + crop['left']  # number of pixels currently removed from original image
 
     if n_to_clip > n_clipped:
         # figure out how to modify slice to clip out n_to_clip pixels

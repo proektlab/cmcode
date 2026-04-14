@@ -15,7 +15,7 @@ import warnings
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
 from caiman.utils.utils import recursively_load_dict_contents_from_group
-from mesmerize_core.caiman_extensions._batch_exceptions import BatchItemNotRunError, BatchItemUnsuccessfulError
+from mesmerize_core.utils import Border2D
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
@@ -24,7 +24,6 @@ from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 from typing_extensions import Self
 
 from cmcode.util import types, paths
-from cmcode.util.image import BorderSpec
 
 
 # pydantic helpers
@@ -116,7 +115,7 @@ class StageParams:
 @dataclass(kw_only=True, frozen=True)
 class ConversionParams(StageParams):
     """Settings for convert_to_tif"""
-    crop: BorderSpec = BorderSpec()           # borders to crop out of image
+    crop: Border2D = Field(default_factory=lambda: {'left': 0, 'right': 0, 'top': 0, 'bottom': 0})  # borders to crop out of image
     downsample_factor: Optional[int] = None
     keep_3d: bool = False
 
@@ -273,7 +272,7 @@ class SeedParams(StageParams):
     type: str = 'none' # e.g. "mean", "skew"; "none" means don't use a seed at all
     norm_medw: Optional[int] = None
     blur_size: int = 1  # 1 = blurring in projection disabled
-    borders: Optional[list[BorderSpec]] = None  # None = auto-fill from mcorr
+    borders: Optional[list[Border2D]] = None  # None = auto-fill from mcorr
 
     # defaults from my_extract_binary_masks_from_structural_channel
     gSig: Annotated[Union[None, int, Sequence[int]], ReadNDArray] = 5  # neuron pixel size (None = same as CNMF gSig)

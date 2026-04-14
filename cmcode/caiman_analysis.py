@@ -343,7 +343,7 @@ class SessionAnalysis:
 
     @property
     def crop(self) -> BorderSpec:
-        return self.params.conversion.crop
+        return BorderSpec(**self.params.conversion.crop)
     
     @property
     def plane_size(self) -> tuple[int, int]:
@@ -1299,8 +1299,13 @@ class SessionAnalysis:
 
         if seed_params.type != 'none':
             # actually make and save seed
+            if seed_params.borders is not None:
+                borders = [BorderSpec(**plane_borders) for plane_borders in seed_params.borders]
+            else:
+                borders = None
+
             proj, seed_params_extra = self.get_projection_for_seed(
-                type=seed_params.type, blur_size=seed_params.blur_size, norm_medw=seed_params.norm_medw, borders=seed_params.borders)
+                type=seed_params.type, blur_size=seed_params.blur_size, norm_medw=seed_params.norm_medw, borders=borders)
             np.save(output_dir / 'projection_for_seed.npy', proj)
 
             if seed_params.use_cellpose:

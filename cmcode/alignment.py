@@ -1923,8 +1923,8 @@ def get_zmax_templates_and_borders_multisession(
 
         if include_dead_pixel_border:
             # add border on left corresponding to dead pixels
-            ndead = sessinfo.odd_row_ndeads
-            offset = sessinfo.odd_row_offset
+            ndead = sessinfo.params.conversion.odd_row_ndead
+            offset = sessinfo.params.conversion.odd_row_offset
             crop = sessinfo.crop
 
             ndead_max = 0 if ndead is None else max(ndead)
