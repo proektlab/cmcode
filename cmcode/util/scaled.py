@@ -2,8 +2,8 @@ from typing import Union, Sequence, Literal, Optional, Type, Iterable, Hashable,
 import numpy as np
 import numpy.typing as npt
 import pandas as pd
-from pandas.core.dtypes.dtypes import NumpyEADtype  # type: ignore
-from pandas.core.arrays import NumpyExtensionArray  # type: ignore
+from pandas.core.dtypes.dtypes import NumpyEADtype
+from pandas.arrays import NumpyExtensionArray
 
 
 class ScaledArray(NumpyExtensionArray):

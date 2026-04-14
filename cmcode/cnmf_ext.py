@@ -1,21 +1,25 @@
 """Wrappers for CNMF and Estimates classes"""
 from copy import copy
 from dataclasses import dataclass, asdict
+from functools import lru_cache
 import logging
 import math
 import os
+from pathlib import Path
 from tempfile import NamedTemporaryFile
-from typing import Optional, Literal
+from typing import Optional, Literal, Union
 
 import numpy as np
 from numpy.typing import NDArray
+import optype.numpy as onp
 from pandas import NA
 from scipy import sparse
 from scipy.interpolate import PchipInterpolator, interp1d
 from caiman.source_extraction.cnmf import cnmf, params, merging
 
-from cmcode import alignment
+from cmcode import alignment, caiman_params as cmp
 from cmcode.cmcustom import compute_snr_gamma
+from cmcode.util import paths, types
 
 @dataclass
 class MetricInfo:
@@ -30,8 +34,8 @@ class EstimatesExt(cnmf.Estimates):
     I wrote this in a weird way that behaves like inheritance externally but is actually composition
     to satisfy static type checkers while keeping the base Estimates object available
     """
-    __slots__ = ('estimates', 'accepted_list', 'rejected_list',
-                 'structural_reg_res', 'F_dff_denoised', 'snr_type', 'snr_gamma_vals')
+    __slots__ = ('estimates', 'accepted_list', 'rejected_list', 'structural_reg_res',
+                 'F_dff_denoised', 'snr_type', 'snr_gamma_vals', 'crossplane_merge_thr_used')
 
     def __new__(cls, _: cnmf.Estimates):
         self = object.__new__(cls)  # don't actually create an estimates object under the hood
@@ -43,12 +47,13 @@ class EstimatesExt(cnmf.Estimates):
         if hasattr(base_obj, 'Cn'):
             logging.info('Ignoring saved correlation image (deprecated)')
 
-        self.accepted_list = getattr(base_obj, 'accepted_list', np.array([], dtype=int))
-        self.rejected_list = getattr(base_obj, 'rejected_list', np.array([], dtype=int))
+        self.accepted_list: onp.Array1D[np.integer] = getattr(base_obj, 'accepted_list', np.array([], dtype=int))
+        self.rejected_list: onp.Array1D[np.integer] = getattr(base_obj, 'rejected_list', np.array([], dtype=int))
         self.structural_reg_res: Optional[alignment.RegisterROIsResults] = getattr(base_obj, 'structural_reg_res', None)
         self.F_dff_denoised: Optional[np.ndarray] = getattr(base_obj, 'F_dff_denoised', None)
         self.snr_type: Literal['normal', 'gamma'] = getattr(base_obj, 'snr_type', 'normal')
         self.snr_gamma_vals: Optional[np.ndarray] = getattr(base_obj, 'snr_gamma_vals', None)
+        self.crossplane_merge_thr_used: Optional[float] = getattr(base_obj, 'crossplane_merge_thr_used', None)
     
     def __getattribute__(self, name):
         """defer to estimates object"""
@@ -64,7 +69,25 @@ class EstimatesExt(cnmf.Estimates):
             object.__setattr__(self.estimates, name, val)
 
     @property
-    def idx_components(self) -> Optional[np.ndarray]:
+    def A(self) -> Optional[types.MaybeSparse[np.floating]]:
+        """Just provide more precise type for estimates.A"""
+        return self.estimates.A  # type: ignore
+
+    @A.setter
+    def A(self, val):
+        self.estimates.A = val
+
+    @property
+    def C(self) -> Optional[onp.Array2D[np.floating]]:
+        """Just provide more precise type for estimates.C"""
+        return self.estimates.C  # type: ignore
+
+    @C.setter
+    def C(self, val):
+        self.estimates.C = val
+
+    @property
+    def idx_components(self) -> Optional[onp.Array1D[np.integer]]:
         """Combines automatic evaluation and manual curation to produce idx_components"""
         if self.idx_components_eval is None:
             return None
@@ -75,7 +98,7 @@ class EstimatesExt(cnmf.Estimates):
         raise NotImplementedError('idx_components is a read-only property on EstimatesExt; use idx_components_eval')
     
     @property
-    def idx_components_bad(self) -> Optional[np.ndarray]:
+    def idx_components_bad(self) -> Optional[onp.Array1D[np.integer]]:
         """Combines automatic evaluation and manual curation to produce idx_components_bad"""
         if self.idx_components_bad_eval is None:
             return None
@@ -86,7 +109,7 @@ class EstimatesExt(cnmf.Estimates):
         raise NotImplementedError('idx_components_bad is a read-only property on EstimatesExt; use idx_components_bad_eval')
 
     @property
-    def idx_components_eval(self) -> Optional[np.ndarray]:
+    def idx_components_eval(self) -> Optional[onp.Array1D[np.integer]]:
         return self.estimates.idx_components
     
     @idx_components_eval.setter
@@ -94,7 +117,7 @@ class EstimatesExt(cnmf.Estimates):
         self.estimates.idx_components = val
     
     @property
-    def idx_components_bad_eval(self) -> Optional[np.ndarray]:
+    def idx_components_bad_eval(self) -> Optional[onp.Array1D[np.integer]]:
         return self.estimates.idx_components_bad
     
     @idx_components_bad_eval.setter
@@ -111,14 +134,14 @@ class EstimatesExt(cnmf.Estimates):
             return np.arange(self.A.shape[1])
 
     @property
-    def idx_components_marked(self) -> Optional[np.ndarray]:
+    def idx_components_marked(self) -> Optional[onp.Array1D[np.integer]]:
         comps_used = self.structural_reg_idx_used
         if comps_used is None or self.structural_reg_res is None:
             return None
         return comps_used[self.structural_reg_res.matched1]
     
     @property
-    def idx_components_unmarked(self) -> Optional[np.ndarray]:
+    def idx_components_unmarked(self) -> Optional[onp.Array1D[np.integer]]:
         comps_used = self.structural_reg_idx_used
         if comps_used is None or self.structural_reg_res is None:
             return None
@@ -247,6 +270,7 @@ class EstimatesExt(cnmf.Estimates):
             logging.info('Estimates have already been interpolated')
             return
 
+        logging.info(f'Upsampling (interpolating) results by a factor of {upsample_factor}')
         frames_per_trial_ds = [math.ceil(frames / upsample_factor) for frames in frames_per_trial]
         if sum(frames_per_trial_ds) != total_frames_ds:
             raise RuntimeError('Number of frames in results does not match what is expected from downsampling')
@@ -255,7 +279,7 @@ class EstimatesExt(cnmf.Estimates):
         split_indices_ds = np.cumsum(frames_per_trial_ds[:-1])
         
         # create replacement for each variable with time dimension
-        def interpolate_each_trial(var: np.ndarray, method: str, axis=1) -> np.ndarray:
+        def interpolate_each_trial(var: onp.Array2D[np.floating], method, axis=1) -> onp.Array2D[np.floating]:
             var_out = np.empty((var.shape[0], total_frames), dtype=var.dtype)
             var_trials = np.split(var, split_indices_ds, axis=axis)
             var_out_trials = np.split(var_out, split_indices, axis=axis)
@@ -289,13 +313,21 @@ class EstimatesExt(cnmf.Estimates):
         if self.F_dff_denoised is not None:
             self.F_dff_denoised = interpolate_each_trial(self.F_dff_denoised, method=method)
     
-    def merge_components_crossplane(self, n_planes: int, params: params.CNMFParams, thr=0.7) -> int:
+    def merge_components_crossplane(self, n_planes: int, params: params.CNMFParams, thr: Optional[float] = 0.7) -> int:
         """
         Merge components across planes as if they were in the same plane, by flattening A
         Returns number of sets that were merged.
         """
+        if self.crossplane_merge_thr_used is not None:
+            raise RuntimeError(f'Crossplane merging already run with threshold {self.crossplane_merge_thr_used}; cannot re-run.')
+        
+        self.crossplane_merge_thr_used = thr
+
+        if thr is None:
+            return 0
+
         est = self.estimates
-        assert est.A is not None and est.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'
+        assert est.A is not None and self.C is not None and est.R is not None and est.S is not None, 'CNMF not run?'
         A = est.A
         if not isinstance(A, sparse.csc_matrix):
             A = sparse.csc_matrix(A)
@@ -304,7 +336,7 @@ class EstimatesExt(cnmf.Estimates):
         A_flat = sparse.csc_matrix((A.data, A.indices % plane_pixels, A.indptr), shape=(plane_pixels, A.shape[1]))
 
         # find which components to merge
-        rois_to_merge = merging.get_ROIs_to_merge(A_flat, est.C, thr=thr)[0]
+        rois_to_merge = merging.get_ROIs_to_merge(A_flat, self.C, thr=thr)[0]
 
         # only keep groups that span more than one plane
         rois_to_merge = [group for group in rois_to_merge if not np.all(np.diff(plane_per_comp[group]) == 0)]
@@ -422,14 +454,39 @@ class CNMFExt(cnmf.CNMF):
             cnmf.save_dict_to_hdf5(obj_dict, filename)
 
 
-def load_CNMFExt(filename: str, n_processes=1, dview=None, quiet=True) -> CNMFExt:
-    logger = logging.getLogger()
+def load_CNMFExt(filename: Union[Path, str], dview=None, quiet=True) -> CNMFExt:
+    logger = logging.getLogger('caiman')
     old_level = logger.level
     if quiet:
         logger.setLevel(logging.WARNING)
-    cnmf_obj = cnmf.load_CNMF(filename, n_processes=n_processes, dview=dview)
+    cnmf_obj_ext = _load_CNMFExt(str(filename))
     if quiet:
         logger.setLevel(old_level)
 
-    cnmf_obj_ext = CNMFExt(copy_from=cnmf_obj)
+    if dview is not None:
+        cnmf_obj_ext.dview = dview
+
     return cnmf_obj_ext
+
+
+@lru_cache(maxsize=10)
+def _load_CNMFExt(filename: str) -> CNMFExt:
+    """Cached version of load_CNMFExt"""
+    cnmf_obj = cnmf.load_CNMF(filename)
+    cnmf_obj_ext = CNMFExt(copy_from=cnmf_obj)
+
+    # to account for not setting crossplane_merge_thr_used previously, set it here if needed
+    if hasattr(cnmf_obj, 'estimates_ext') and 'crossplane_merge_thr_used' not in getattr(cnmf_obj, 'estimates_ext'):
+        params_path = paths.params_file_for_result(filename)
+        try:
+            saved_params = cmp.UpToEvalParamStruct.read_from_file(params_path)
+        except FileNotFoundError:
+            pass
+        else:
+            cnmf_obj_ext.estimates.crossplane_merge_thr_used = saved_params.cnmf_extra.crossplane_merge_thr
+
+    return cnmf_obj_ext
+
+
+def clear_cnmf_cache():
+    _load_CNMFExt.cache_clear()

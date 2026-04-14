@@ -3,15 +3,23 @@ from setuptools import setup, find_packages
 install_requires = [
     "asyncssh",
     "caiman>=1.10.0",
+    "cellpose",
     "dask",
+    "fastplotlib~=0.1.0.a17",
+    "h5py",
     "hdf5storage",
     "ipympl",
     "mesmerize-core",
     "mesmerize-viz",
     "mslex",
     "nest-asyncio",
-    "optype",
-    "roipoly",
+    "opencv-python",
+    "optype[numpy]",
+    "pydantic",
+    "scipy-stubs",
+    "suite2p",
+    "torch",
+    "typing_extensions"
 ]
 
 

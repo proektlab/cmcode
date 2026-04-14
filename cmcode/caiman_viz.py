@@ -1,5 +1,5 @@
 from copy import deepcopy
-from functools import partial, cache
+from functools import partial
 import logging
 import math
 import time
@@ -21,11 +21,13 @@ from holoviews.operation import Operation
 from holoviews.streams import Stream, param
 from IPython.display import display
 from ipywidgets import (HBox, VBox, IntSlider, Label, Layout, Button, Image as ImageWidget, 
-                        Output, SelectMultiple, HTML)
+                        Output, SelectMultiple, HTML, CallbackDispatcher)
 import jupyter_bokeh as jbk
+from matplotlib.axes import Axes
 import matplotlib.style as mplstyle
 import matplotlib.pyplot as plt
 import numpy as np
+import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 import panel as pn
@@ -41,57 +43,67 @@ from mesmerize_core import MCorrExtensions, CaimanSeriesExtensions
 from mesmerize_viz._cnmf import CNMFVizContainer, CNMFDataFrameVizExtension, EvalController
 
 import cmcode
-from cmcode import caiman_analysis as cma, alignment
-from cmcode.cnmf_ext import CNMFExt, MetricInfo
+from cmcode import caiman_analysis as cma, alignment, mcorr
+from cmcode.cnmf_ext import CNMFExt, MetricInfo, clear_cnmf_cache
 from cmcode.cmcustom import my_get_contours, my_plot_contours, compute_matching_performance
-from cmcode.mcorr import MCResult
 from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_xy,
                                     map_footprints, maxproj_per_cell, footprint_interpolator_per_cell)
 from cmcode.util.image import remap_image, shift_image_location, make_merge, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files
-from cmcode.util.types import MaybeSparse
+from cmcode.util.types import MaybeSparse, Array4D
 from cmcode.util.scaled import ScaledDataFrame
 
 pn.extension()
 hv.extension('bokeh')  # type: ignore
 
 BokehPalette = Callable[[int], Sequence[str]]
+preferred_bokeh_tools = ['pan', 'box_zoom', 'reset', 'save']
 
 
-def make_button_with_feedback(button_text: str, callback: Callable[[Any], None]) -> HBox:
-    """Make a button that shows a loading indicator and check/X emoji to give feedback on progress of the callback"""
-    button = Button(description=button_text)
-    feedback = Output()
+class ButtonWithFeedback(HBox):
+    """a button that shows a loading indicator and check/X emoji to give feedback on progress of the callback"""
     loading_gif_path = Path(next(iter(cmcode.__path__))).parent / 'assets' / 'loading.gif'
-    with open(loading_gif_path, 'rb') as loading_gif:
-        loading_gif_data = loading_gif.read()
-    loading = ImageWidget(value=loading_gif_data, format='gif', layout=Layout(width='28px'))
-    done = Label(value='\u2714', style={'color': 'green', 'font-size': '28px'})
-    failed = HBox([
-        Label(value='\u2716', style={'color': 'red', 'font-size': '28px'}),
-        Label(value='See console for details')
-    ])
 
-    def button_cb(obj: Any) -> None:
-        feedback.clear_output()
-        with feedback:
-            display(loading)
-        try:
-            callback(obj)
-        except:
-            # show X and directions to look at console
-            feedback.clear_output()
-            with feedback:
-                display(failed)
-        else:
-            feedback.clear_output()
-            with feedback:
-                display(done)
+    def __init__(self, button_text: str):
+        self.button = Button(description=button_text)
+        self.feedback = Output()
+        super().__init__([self.button, self.feedback])
+
+        with open(self.loading_gif_path, 'rb') as loading_gif:
+            loading_gif_data = loading_gif.read()
+        self.loading = ImageWidget(value=loading_gif_data, format='gif', layout=Layout(width='28px'))
+        self.done = Label(value='\u2714', style={'color': 'green', 'font-size': '28px'})
+        self.failed = HBox([
+            Label(value='\u2716', style={'color': 'red', 'font-size': '28px'}),
+            Label(value='See console for details')
+        ])
+
+        self.click_handlers = CallbackDispatcher()
+        self.button.on_click(self.button_cb)
+
+    def on_click(self, callback: Callable[[Any], None], remove=False):
+        self.click_handlers.register_callback(callback, remove=remove)
+
+    def button_cb(self, obj: Any) -> None:
+        self.feedback.clear_output()
+        with self.feedback:
+            display(self.loading)
+
+        for callback in self.click_handlers.callbacks:
+            try:
+                callback(obj)
+            except:
+                # show X and directions to look at console
+                self.feedback.clear_output()
+                with self.feedback:
+                    display(self.failed)
+                    break
+        else:  # (if no break/error)
+            self.feedback.clear_output()
+            with self.feedback:
+                display(self.done)
             time.sleep(5)  # wait long enough to be seen, then disappear so next press also gets feedback
-            feedback.clear_output()
-    
-    button.on_click(button_cb)
-    return HBox([button, feedback])
+            self.feedback.clear_output()
 
 
 class ManualCurationController:
@@ -118,10 +130,11 @@ class ManualCurationController:
         self._reject_selector = SelectMultiple()
         self._reject_pane = VBox([Label('Rejected cells:'), self._reject_buttons, self._reject_selector])
 
-        #self._save_button = Button(description='Save to disk')
-        self._save_eval: Optional[Callable[[Any], None]] = None
-        self._save_button = make_button_with_feedback(
-            'Save to disk', lambda obj: self._save_eval(obj) if self._save_eval is not None else None)
+        self._save_button = ButtonWithFeedback('Save to disk')
+        # add callback initially to say that save_eval callback is not set yet
+        def dummy_cb(_):
+            raise RuntimeError('Save callback has not been set yet')
+        self._save_button.on_click(dummy_cb)
 
         self.widget = VBox([HBox([self._accept_pane, self._reject_pane]), self._save_button])
 
@@ -131,7 +144,8 @@ class ManualCurationController:
 
     def set_viz(self, viz: CNMFVizContainer):
         self._viz_container = viz
-        self._save_eval = viz._save_eval
+        # use the same callbacks as the eval save button for the manual curation save button
+        self._save_button.click_handlers = viz._eval_controller.button_save_eval._click_handlers
 
     def set_data_from_cnmf(self, cnmf_obj: CNMFExt):
         """Grap accepted/rejected lists from CNMF object (e.g. after selecting a new run)"""
@@ -391,6 +405,9 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
         self._manual_curation_controller.set_viz(self)
 
+        # add callback to clear my CNMF cache
+        self.on_save(lambda _: clear_cnmf_cache())
+
         # update eval controller to handle non-finite values correctly
         self._eval_controller.set_limits = partial(my_set_limits, self._eval_controller)
 
@@ -479,9 +496,9 @@ class CNMFVizWideContainer(CNMFVizContainer):
         self._eval_controller.set_limits(cnmf_obj)
         self._eval_controller.use_cnn_checkbox.disabled = False
 
-    def _save_eval(self, obj):
-        super()._save_eval(obj)
-        cma.load.cache_clear()
+    def on_save(self, callback: Callable[[Any], None], remove=False):
+        """Register callback for eval and manual curation save buttons"""
+        self._eval_controller.button_save_eval.on_click(callback, remove=remove)
 
     def _row_changed(self, *args):
         super()._row_changed(*args)
@@ -552,6 +569,17 @@ class CNMFVizWideContainer(CNMFVizContainer):
         assert isinstance(colors, str), 'Dropdown value should be a string'
         self.set_component_colors(colors)
 
+    def _manual_toggle_component(self, ev):
+        """Override a/r keyboard shortcut to use my manual curation controller"""
+        if not hasattr(ev, "key"):
+            return
+
+        if ev.key == "a":
+            self._manual_curation_controller._add_cell(b_accept=True)
+        elif ev.key == "r":
+            self._manual_curation_controller._add_cell(b_accept=False)
+
+
     def get_cnmf_data_mapping(self, series: pd.Series, input_movie_kwargs: dict, temporal_kwargs: dict
                               ) -> dict[str, Callable[[], np.ndarray]]:
         mapping = CNMFVizContainer.get_cnmf_data_mapping(series, input_movie_kwargs, temporal_kwargs)
@@ -579,10 +607,11 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
         # add brightness-equalized images
         border = series.params['main']['patch']['border_pix']
+        borders = [BorderSpec.equal(border)] * self.n_planes
 
         def get_equalized_projection(proj_type: str):
             proj = mapping[proj_type]()
-            return preprocess_proj_for_seed(proj, border=border, concat_planes=self.n_planes)
+            return preprocess_proj_for_seed(proj, borders=borders)
 
         for proj_type in ['mean', 'max']:
             mapping[proj_type + '_equalized'] = partial(get_equalized_projection, proj_type)
@@ -683,7 +712,8 @@ class CNMFDataFrameVizWideExtension(CNMFDataFrameVizExtension):
 class RawDataPreviewContainer:
     """Widget that shows a mean projection of n frames of the raw data and allows bidirectional correction"""
 
-    def __init__(self, sbx_files: list[str], frames: Union[int, slice], curr_offset: Optional[int],
+    def __init__(self, sbx_files: list[str], frames: Union[int, slice], *,
+                 subinds_spatial: Sequence[sbx_utils.DimSubindices]=(), curr_offset: Optional[int],
                  offset_save_callback: Optional[Callable[[int], None]] = None, channel: Optional[int] = 0,
                  title: Optional[str] = None):
         # check whether bidirectional
@@ -696,7 +726,7 @@ class RawDataPreviewContainer:
             raise RuntimeError('Cannot preview combination of uni- and birectional files')
         
         self.mean_data_3d = average_raw_frames(sbx_files, frames, channel=channel, crop_dead=self.bidi,
-                                               dview=cma.cluster.dview)
+                                               subinds_spatial=subinds_spatial, dview=cma.cluster.dview)
         self.offset_data_3d = np.copy(self.mean_data_3d, order='F')  # pre-allocate
         self.curr_offset = 0 if curr_offset is None else curr_offset
 
@@ -709,7 +739,8 @@ class RawDataPreviewContainer:
         if offset_save_callback is not None:
             def save_cb(_obj):
                 offset_save_callback(self.curr_offset)
-            self.save_button = make_button_with_feedback('Save offset', save_cb)
+            self.save_button = ButtonWithFeedback('Save offset')
+            self.save_button.on_click(save_cb)
         else:
             self.save_button = None
 
@@ -795,7 +826,7 @@ class patch_shift_mag_and_angle(Operation):
             )
 
 
-def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: MCResult,
+def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: 'mcorr.MCResult',
                    show_quiver_plot=False):
     # make upper figure with histograms of mcorr shifts
     shifts_rig_ds = mc_result.shifts_rig_hv
@@ -814,7 +845,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
             lower=hv.dim('shift') - hv.dim('minshift')
         )
         range_holomap = shifts_w_range.to(hv.Spread, kdims='frame', vdims=['shift', 'lower', 'upper']).opts(
-            fill_alpha=0.45, line_alpha=0
+            fill_alpha=0.45, line_alpha=0, tools=preferred_bokeh_tools
         )
         shift_holomap = shift_holomap * range_holomap
 
@@ -825,7 +856,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
                 this_mag_and_angle = cast(hv.Dataset, shifts_els_mag_and_angle.select(plane=plane, frame=frame))
                 return this_mag_and_angle.reindex().to(
                     hv.VectorField, kdims=['xpatch', 'ypatch'], vdims=['shift_angle', 'shift_mag'],
-                    group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True)
+                    group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True, tools=preferred_bokeh_tools)
 
             kdims = ['plane', 'frame']
             quiver_dmap = hv.DynamicMap(quiver, kdims=kdims).redim.values(
@@ -851,7 +882,7 @@ def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: M
     return widget
 
 
-def make_rgb_frame_apply(rgb_image: np.ndarray) -> tuple[np.ndarray, Callable[[np.ndarray], np.ndarray]]:
+def make_rgb_frame_apply(rgb_image: onp.Array3D) -> tuple[onp.Array2D, Callable[[onp.Array2D], np.ndarray]]:
     """
     Hack to make RGB images work with ImageWidget for fastplotlib <v0.2
     Input should be an image where the last dimension is channels (i.e. of length 3 or 4)
@@ -865,9 +896,52 @@ def make_rgb_frame_apply(rgb_image: np.ndarray) -> tuple[np.ndarray, Callable[[n
         raise RuntimeError('Number of channels (last dimension) of RGB image must be 3 or 4.')
     
     image_flat = np.reshape(rgb_image, rgb_image.shape[:-2] + (rgb_image.shape[-2] * n_chan,), order='C')
-    def rgb_frame_apply(frame: np.ndarray) -> np.ndarray:
+    def rgb_frame_apply(frame: onp.Array2D) -> np.ndarray:
         return np.reshape(frame, frame.shape[:-1] + (frame.shape[-1] // n_chan, n_chan), order='C')
     return image_flat, rgb_frame_apply
+
+
+def view_plane_mcorr_pcs(tPC: onp.Array2D[np.floating], regPC: Array4D[np.floating], sample_rate=1.):
+    """
+    Make visualization for principal components of motion-corrected video for each plane.
+    Inputs are the same as the outputs of suite2p.registration.metrics.get_pc_metrics.
+    """
+    top_minus_bottom = regPC[1] - regPC[0]  # now nPC x Y x X
+    
+    n_pcs = tPC.shape[1]
+    time = 1/sample_rate * np.arange(tPC.shape[0])
+    n_y = top_minus_bottom.shape[1]
+    n_x = top_minus_bottom.shape[2]
+
+    def make_plot(pc: int):
+        temporal_plot = hv.Curve(
+            {'time': time, 'PC value': tPC[:, pc]}, kdims=['time'], vdims=['PC value']
+            ).opts(aspect=1.8, tools=preferred_bokeh_tools)
+        
+        spatial_plot = hv.Image(
+            {'x': range(n_x), 'y': range(n_y), 'top-bottom': top_minus_bottom[pc]},
+            kdims=['x', 'y'], vdims=['top-bottom']
+            ).opts(
+                cmap='bwr', symmetric=True, tools=preferred_bokeh_tools,
+                xaxis='bare', yaxis='bare', aspect=1.)
+
+        return temporal_plot + spatial_plot  # type: ignore
+    return hv.DynamicMap(make_plot, kdims=['PC']).opts(framewise=True).redim.values(PC=range(n_pcs))
+
+
+def view_mcorr_pcs(pc_metrics: Sequence[tuple[onp.Array2D[np.floating], Array4D[np.floating]]], sample_rate=1.):
+    """Make stack of principal components visualizations for each plane"""
+    plots = [
+        view_plane_mcorr_pcs(*metrics, sample_rate=sample_rate).opts(title=f'Plane {k_plane}')
+        for k_plane, metrics in enumerate(pc_metrics)
+    ]
+    plot_column = column([hv.render(plot) for plot in plots])
+    
+    # apply dark theme
+    doc = Document(theme=built_in_themes['dark_minimal'])
+    doc.add_root(plot_column)
+
+    return jbk.BokehModel(plot_column)
 
 
 def make_template_registration_gridplot(
@@ -909,12 +983,13 @@ def make_template_registration_gridplot(
         z_projections.append(sessinfo.get_zmax_projection(projection_params))
     
     # make each plot
-    with mplstyle.context('dark_background'):
+    with mplstyle.context('dark_background'):  # type: ignore
         fig, axss = plt.subplots(len(sess_ids), len(sess_ids), sharex=True, sharey=True, squeeze=False)
         fig.suptitle(f'Mouse {mouse_id}, {rec_type}, {corrected_str}')
         for kFrom, (axs, from_proj) in enumerate(zip(axss, z_projections)):
             for kTo, (ax, to_proj) in enumerate(zip(axs, z_projections)):
                 if kFrom == kTo:
+                    ax = cast(Axes, ax)
                     ax.imshow(from_proj, cmap='gray',
                               vmin=float(np.percentile(from_proj, 40)),
                               vmax=float(np.percentile(from_proj, 99.7)))
@@ -974,8 +1049,8 @@ def my_check_register_ROIs(matched1: list[int],
     titles =[
         f'{contour1_name} ({pct_1:.2f}% matched)',
         f'{contour2_name} ({pct_2:.2f}% matched)',
-        f'Matched',
-        f'Unmatched'
+        'Matched',
+        'Unmatched'
     ]
 
     if isinstance(xrange, slice):
@@ -1050,7 +1125,9 @@ def my_check_register_ROIs(matched1: list[int],
             #     vals[1] if len(vals) > 1 else vals[0],
             #     vals[-1]
             # )
-            return tuple(np.percentile(data[~np.isnan(data)], [1, 99.96]))
+            pcts = np.percentile(data[~np.isnan(data)], [1, 99.96])
+            return float(pcts[0]), float(pcts[1])
+
         clims1 = infer_clims_robust(background1)
         clims2 = infer_clims_robust(background2)
     else:
@@ -1147,7 +1224,7 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
     lws2 = np.full(len(coordinates2), 1.)
     lws2[highlight2] = 2.
 
-    with mplstyle.context('dark_background'):
+    with mplstyle.context('dark_background'):  # type: ignore
         fig, axs = plt.subplots(2, 2, sharex=sharexy, sharey=sharexy)
         # top plots
         for ax, clims, image, coords, matched, unmatched, contour_color, title, lws in zip(
@@ -1435,7 +1512,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
 
     # convert cells_to_highlight to session indices
     def get_highlight_sess_ids(matchings: pd.DataFrame) -> list[int]:
-        b_take = np.in1d(matchings.index, cells_to_highlight)
+        b_take = np.isin(matchings.index, cells_to_highlight)
         if sum(b_take) < len(cells_to_highlight):
             logging.warning('Not all highlighted cells found in session')
         return list(matchings.loc[b_take, 'session_cell_id'])
@@ -1731,13 +1808,13 @@ def plot_mean_in_square_region(sessinfo: 'cma.SessionAnalysis', center: tuple[in
     bg_img: background image to plot; if None uses the mean projection
     plot_options: passed on to my_plot_contours (e.g. can override accept/reject colors, vmin, vmax)
     """
-    if sessinfo.mc_result is None:
-        raise RuntimeError('Motion correction not run')
+    if sessinfo.mmap_file_transposed is None:
+        raise RuntimeError('Motion correction or transpose not run')
 
     if sessinfo.cnmf_fit is None:
         raise RuntimeError('CNMF not run or not selected')
 
-    Yr, dims, T = caiman.load_memmap(sessinfo.mc_result.mmap_file_transposed)
+    Yr, dims, T = caiman.load_memmap(sessinfo.mmap_file_transposed)
     Yr_3d = np.reshape(Yr, dims + (T,), order='F')
     if bg_img is None:
         bg_img = sessinfo.get_projection('mean')
@@ -1815,3 +1892,35 @@ def make_plots_taller(plots: VBox, new_max_height = 3000):
     for child in plots.children:
         if isinstance(child, JupyterOutputContext):
             child.frame.canvas.layout.max_height = max_height
+
+
+def plot_background_components(f: np.ndarray, b: np.ndarray, dims: tuple[int, int]):
+    n_comps = len(f)
+
+    with mplstyle.context('dark_background'):  # type: ignore
+        fig = plt.figure(figsize=(20, 4.5 * n_comps))
+        gs = fig.add_gridspec(n_comps, 2)
+        first_im_ax = None
+        first_t_ax = None
+
+        for i, (comp_s, comp_t) in enumerate(zip(b.T, f)):  # type: ignore
+            im_ax = fig.add_subplot(gs[i, 0], sharex=first_im_ax, sharey=first_im_ax)
+            if first_im_ax is None:
+                first_im_ax = im_ax
+            im_ax.imshow(
+                comp_s.reshape(dims, order='F'), cmap='gray',
+                vmin=np.percentile(comp_s, 10), vmax=np.percentile(comp_s, 99.5))
+            im_ax.set_title(f'Component {i+1}')
+            im_ax.set_frame_on(False)
+
+            t_ax = fig.add_subplot(gs[i, 1], sharex=first_t_ax)
+            if first_t_ax is None:
+                first_t_ax = t_ax
+            t_ax.plot(comp_t, lw=1)
+            t_ax.set_xticks([])
+            t_ax.set_xlabel('Time')
+            t_ax.set_frame_on(False)
+
+        fig.suptitle('Background components')
+        fig.tight_layout()
+    return fig

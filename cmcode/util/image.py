@@ -200,7 +200,7 @@ class BorderSpec:
             return BorderSpec(top=new_top, bottom=new_bottom, left=self.left_subpix, right=self.right_subpix)
 
 
-    def slices(self, shape: tuple[int, ...]) -> tuple[slice, slice]:
+    def slices(self, shape: Sequence[int]) -> tuple[slice, slice]:
         """Make indexing slices for these borders given an image shape"""
         shape2d = shape[:2]
         return (slice(self.top, shape2d[0]-self.bottom), slice(self.left, shape2d[1]-self.right))
@@ -224,7 +224,7 @@ class BorderSpec:
 @dataclass(frozen=True)
 class BorderedImage:
     """Image that also keeps track of some border through shifts and remaps"""
-    image: np.ndarray
+    image: onp.Array2D
     border: BorderSpec
 
     def __post_init__(self):
@@ -298,15 +298,15 @@ class BorderedImage:
         return BorderedImage(image=remapped_image, border=remapped_border)
 
 
-def colorize(im: np.ndarray, color: Union[Sequence[float], str],
-             clip_percentile: Union[float, tuple[float, float]] = (40, 99.7)) -> np.ndarray:
+def colorize(im: onp.Array2D[np.number], color: Union[Sequence[float], str],
+             clip_percentile: Union[float, tuple[float, float]] = (40, 99.7)) -> onp.Array3D[np.float32]:
     """
     Helper function to create an RGB image from a single-channel image using a 
     specific color.
     Source: https://bioimagebook.github.io/chapters/1-concepts/4-colors/python.html
     """
     # Check that we do just have a 2D image
-    if im.ndim > 2 and im.shape[2] != 1:
+    if len(s := im.shape) > 2 and s[2] != 1:
         raise ValueError('This function expects a single-channel image!')
 
     # Check string colors
@@ -322,8 +322,9 @@ def colorize(im: np.ndarray, color: Union[Sequence[float], str],
         clip_percentile = (clip_percentile, 100-clip_percentile)
 
     # Rescale the image according to how we want to display it
-    im_scaled = im.astype(np.float32) - np.percentile(im, clip_percentile[0])
-    im_scaled = im_scaled / np.percentile(im_scaled, clip_percentile[1])
+    im_scaled = im.astype(np.float32)
+    im_scaled -= np.percentile(im_scaled, clip_percentile[0])
+    im_scaled /= np.percentile(im_scaled, clip_percentile[1])
     im_scaled = np.clip(im_scaled, 0, 1)
     
     # Need to make sure we have a channels dimension for the multiplication to work
@@ -358,7 +359,7 @@ def shift_image_location(image: onp.ToFloat2D, start_loc: ScaledDataFrame, end_l
     start_pixels = start_loc.to_pixels().loc[:, ['x', 'y']].to_numpy().ravel()
     end_pixels = end_loc.to_pixels().loc[:, ['x', 'y']].to_numpy().ravel()
     x_shift, y_shift = end_pixels - start_pixels
-    return shift_image(image, x_shift=x_shift, y_shift=y_shift)
+    return shift_image(image, x_shift=float(x_shift), y_shift=float(y_shift))
 
 
 def remap_image(image: np.ndarray, x_remap: Optional[onp.Array2D[np.floating]], y_remap: Optional[onp.Array2D[np.floating]]):
@@ -382,8 +383,8 @@ def invert_mapping(x_remap: onp.Array2D[np.floating], y_remap: onp.Array2D[np.fl
     return x_remap_inv, y_remap_inv
 
 
-def compose_mappings(*xy_remaps: Union[tuple[np.ndarray, np.ndarray], tuple[None, None]]
-                     ) -> Union[tuple[np.ndarray, np.ndarray], tuple[None, None]]:
+def compose_mappings(*xy_remaps: Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]
+                     ) -> Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]:
     """
     Compose together all of the passed mappings, each of which should be an (X, Y)
     tuple and have the same shape. e.g. [A -> B, B -> C, C -> D] becomes A -> D.
@@ -401,7 +402,7 @@ def compose_mappings(*xy_remaps: Union[tuple[np.ndarray, np.ndarray], tuple[None
     return cum_remap_x, cum_remap_y
 
 
-def inverse_remap_image(image: np.ndarray, x_remap: Optional[np.ndarray], y_remap: Optional[np.ndarray]):
+def inverse_remap_image(image: np.ndarray, x_remap: Optional[onp.Array2D], y_remap: Optional[onp.Array2D]):
     """Use CV2 to inverse-remap an image according to remap function as returned from register_ROIs"""
     if x_remap is None or y_remap is None:
         if y_remap is not None or x_remap is not None:
@@ -410,7 +411,7 @@ def inverse_remap_image(image: np.ndarray, x_remap: Optional[np.ndarray], y_rema
     return remap_image(image, *invert_mapping(x_remap=x_remap, y_remap=y_remap))
 
 
-def remap_points(points: ArrayLike, x_remap: Optional[np.ndarray], y_remap: Optional[np.ndarray]) -> np.ndarray:
+def remap_points(points: onp.Array2D, x_remap: Optional[onp.Array2D], y_remap: Optional[onp.Array2D]) -> np.ndarray:
     """
     Map a set of points from one coordinate system to another using a nonrigid mapping
     There must be 2 columns and they are assumed to be (Y, X).
@@ -476,14 +477,13 @@ def remap_points_from_df(df: pd.DataFrame, x_remap: Optional[np.ndarray],
 
 
 def preprocess_proj_for_seed(mean_img: np.ndarray, med_w: int = 25,
-                         border: Union[int, BorderSpec] = 0, concat_planes = 1) -> np.ndarray:
+                             borders: list[BorderSpec] = [BorderSpec.equal(0)]) -> np.ndarray:
     """Make a brightness-normalized mean image for CNMF seed calculation"""
-    if isinstance(border, int):
-        border = BorderSpec.equal(border)
+    concat_planes = len(borders)
 
     mean_frac_img_planes: list[np.ndarray] = []
     # split apart to process each plane separately
-    for plane in np.split(mean_img, concat_planes, axis=1):
+    for plane, border in zip(np.split(mean_img, concat_planes, axis=1), borders):
         # exclude the border, if any, for normalization
         center_slices = border.slices(plane.shape)
         center_part = plane[center_slices]
@@ -518,6 +518,6 @@ def calc_weighted_median(data: np.ndarray, weights: np.ndarray, axis=0):
 def imshow_scaled(ax: Axes, image: ArrayLike, vmin_pct=40., vmax_pct=99.7, axes_off=True, **kwargs):
     """Convenience function b/c I'm tired of typing np.percentile"""
     vmin, vmax = np.percentile(np.ravel(image), [vmin_pct, vmax_pct])
-    ax.imshow(image, vmin=vmin, vmax=vmax, **kwargs)
+    ax.imshow(image, vmin=float(vmin), vmax=float(vmax), **kwargs)
     if axes_off:
         ax.set_axis_off()

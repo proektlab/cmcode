@@ -1,37 +1,36 @@
 """
 Motion correction utilities
-TODO integrate this with mesmerize-core to facilitate trying multiple parameter combinations
 """
 from contextlib import contextmanager
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import logging
-from multiprocessing import parent_process
+import math
 import os
-import psutil
+from pathlib import Path
 import re
-import shutil
-from typing import Optional, Generator, ParamSpec, cast
+import tempfile
+from typing import Optional, Union, Generator, ParamSpec, TypedDict, Any, cast
 
 import caiman as cm
 from caiman.base.movies import get_file_size
 from caiman.motion_correction import MotionCorrect, get_patch_centers
 from caiman.paths import decode_mmap_filename_dict, memmap_frames_filename
-from caiman.source_extraction.cnmf.params import CNMFParams
+from caiman.source_extraction.cnmf.params import MotionParams
 import cv2
 import holoviews as hv
+from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel, make_projection_parallel
+from mesmerize_core.utils import Border
 import numpy as np
-from numpy.typing import DTypeLike
-from scipy import signal
+import optype.numpy as onp
+import scipy.ndimage as ndi
+from suite2p.registration.metrics import get_pc_metrics
+import torch
 
-from cmcode import in_jupyter, caiman_analysis as cma
+from cmcode import caiman_analysis as cma, caiman_params as cmp
+from cmcode.util import paths
 from cmcode.util.image import BorderSpec
-from cmcode.util.paths import PathMapper, CustomPathMappable
-
-if in_jupyter():
-    from tqdm.notebook import tqdm_notebook as tqdm
-else:
-    from tqdm import tqdm
+from cmcode.util.types import NoMatchingResultError, Array4D
 
 
 @dataclass
@@ -46,15 +45,15 @@ class PiecewiseMCInfo:
             self.patch_xy_inds = None
 
 @dataclass
-class MCResult(CustomPathMappable):
+class MCResult(paths.CustomPathMappable):
     mmap_files: list[str]
-    mmap_file_transposed: str
     border_to_0: int
     border_asym: list[BorderSpec]  # border on each side (old results just repeat border_to_0)
-    shifts_rig: list[np.ndarray]
-    shifts_els: Optional[list[np.ndarray]] = None
+    shifts_rig: list[onp.Array2D]
+    shifts_els: Optional[list[onp.Array3D]] = None
     dims: Optional[tuple[int, int]] = None
-    motion_params: Optional[dict] = None
+    motion_params: Optional[MotionParams] = None
+    mmap_file_transposed: Optional[str] = field(default=None, repr=False)  # deprecated, keep for unpickling
 
     # cached datasets
     _shifts_rig_hv: Optional[hv.Dataset] = field(init=False, default=None)
@@ -94,6 +93,9 @@ class MCResult(CustomPathMappable):
 
         if 'border_asym' not in state:
             state['border_asym'] = [BorderSpec.equal(state['border_to_0'])] * len(state['mmap_files'])
+        
+        if 'motion_params' in state and isinstance(state['motion_params'], dict):
+            state['motion_params'] = MotionParams(**state['motion_params'])
 
         self.__dict__.update(state)
 
@@ -104,12 +106,18 @@ class MCResult(CustomPathMappable):
         elif name == 'shifts_els':
             self._shifts_els_hv = None
         super().__setattr__(name, val)
+    
+    def __getattribute__(self, name):
+        """Make sure we don't read mmap_file_transposed"""
+        if name == 'mmap_file_transposed':
+            raise AttributeError('MCResult.mmap_file_transposed is deprecated, read from SessionAnalysis')
+        return object.__getattribute__(self, name)
 
     @property
     def shifts_rig_hv(self) -> hv.Dataset:
         """Make HoloViews dataset from rigid shifts"""
         if self._shifts_rig_hv is None:
-            shifts_all = np.stack(self.shifts_rig)
+            shifts_all: onp.Array3D = np.stack(self.shifts_rig)
             nplanes, ndims, nframes = shifts_all.shape
             assert ndims == 2, 'Only 2D shifts supported'
             data_dims = {
@@ -132,17 +140,16 @@ class MCResult(CustomPathMappable):
                 raise RuntimeError('Must set dims and motion_params before getting shifts_els as HoloView dataset')
 
             # find patch locations
-            indices = cast(tuple[slice, ...], self.motion_params['indices'])
-            effective_dims = tuple(len(range(d)[dim_inds]) for d, dim_inds in zip(self.dims, indices))
+            effective_dims = tuple(len(range(d)[dim_inds]) for d, dim_inds in zip(self.dims, self.motion_params.indices))
 
             patch_centers_orig = get_patch_centers(
-                effective_dims, strides=self.motion_params['strides'], overlaps=self.motion_params['overlaps'],
-                upsample_factor_grid=self.motion_params['upsample_factor_grid'], shifts_opencv=self.motion_params['shifts_opencv'])
+                effective_dims, strides=self.motion_params.strides, overlaps=self.motion_params.overlaps,
+                upsample_factor_grid=self.motion_params.upsample_factor_grid, shifts_opencv=self.motion_params.shifts_opencv)
 
             # if only a portion of the original image was used, offset/multiply patch centers to now apply to the whole movie
             # compute one dimension at a time. Copied from caiman.motion_correction.apply_shifts_movie.
             patch_centers = tuple([] for _ in patch_centers_orig)
-            for dim_inds, dim_centers_orig, dim_centers in zip(indices, patch_centers_orig, patch_centers):
+            for dim_inds, dim_centers_orig, dim_centers in zip(self.motion_params.indices, patch_centers_orig, patch_centers):
                 start = dim_inds.start if dim_inds.start is not None else 0
                 step = dim_inds.step if dim_inds.step is not None else 1
                 dim_centers.extend([start + step * center for center in dim_centers_orig])
@@ -151,7 +158,7 @@ class MCResult(CustomPathMappable):
             npatch_y = len(patch_centers_y)
             npatch_x = len(patch_centers_x)
 
-            shifts_all_els = np.stack(self.shifts_els)
+            shifts_all_els: Array4D = np.stack(self.shifts_els)
             nplanes, ndims, nframes, _ = shifts_all_els.shape
             assert ndims == 2, 'Only 2D shifts supported'
 
@@ -178,12 +185,10 @@ class MCResult(CustomPathMappable):
         return self.shifts_els is not None
 
     P = ParamSpec('P')
-    def apply_path_mapper(self, path_mapper: PathMapper[P], *args: P.args, **kwargs: P.kwargs) -> 'MCResult':
+    def apply_path_mapper(self, path_mapper: paths.PathMapper[P], *args: P.args, **kwargs: P.kwargs) -> 'MCResult':
         """Implements CustomPathMappable by normalizing paths to memmap files"""
         res_norm = deepcopy(self)
-        for path_field in ['mmap_files', 'mmap_file_transposed']:
-            norm_path = path_mapper(getattr(res_norm, path_field), *args, **kwargs)
-            setattr(res_norm, path_field, norm_path)
+        res_norm.mmap_files = path_mapper(res_norm.mmap_files, *args, **kwargs)
         return res_norm
 
     def has_same_shifts_as(self, other: 'MCResult') -> bool:
@@ -216,54 +221,69 @@ class MCResult(CustomPathMappable):
                 shifts_els = self.shifts_els[kplane]
                 mcorr_obj.x_shifts_els = list(shifts_els[0])
                 mcorr_obj.y_shifts_els = list(shifts_els[1])
-                if self.motion_params['is3D']:
+                if self.motion_params.is3D:
                     mcorr_obj.z_shifts_els = list(shifts_els[2])
             mcorr_objs.append(mcorr_obj)
         return mcorr_objs
 
+    def get_pc_metrics(self, plane: int) -> tuple[onp.Array2D[np.floating], Array4D[np.floating]]:
+        """
+        Compute principal components and averages of top/bottom-weighted frames
+            of motion-corrected movie for a single plane, using suite2p
+        See: https://suite2p.readthedocs.io/en/latest/api/registration/#suite2p.registration.metrics.get_pc_metrics
+        Outputs:
+            - tPC:      Temporal PC weights of shape (n_samples, nPC), describing how each PC varies
+                        across the subsampled frames.
+            - regPC:    Average of top and bottom weighted frames for each PC, shape (2, nPC, Ly_crop, Lx_crop)
+                        where index 0 is pclow and index 1 is pchigh.
+        """
+        if plane < 0 or plane >= self.n_planes:
+            raise ValueError(f'Plane must be from 0 to {self.n_planes - 1}, inclusive.')
 
-def _build_motion_correct_filename(filepath: str, is_piecewise: bool = True) -> str:
-    """Determine what caiman will save the motion-corrected movie as (to find if previously calculated)"""
+        mov = cm.load(self.mmap_files[plane])
+        _T, *dims = mov.shape
+        slices = self.border_asym[plane].slices(dims)
+        mov_center = mov[:, *slices]
+
+        if torch.cuda.is_available():
+            device = torch.device('cuda')
+        else:
+            device = torch.device('cpu')
+        
+        return get_pc_metrics(mov_center, device=device)[:2]
+
+
+def _build_motion_correct_basename(filepath: str, is_piecewise=True, with_dt=False) -> str:
+    """
+    Determine correct motion correction base name for given input file path (without the dims, T, order parts)
+    If with_dt is true, returns a template for a filename with a timestamp (see paths.make_timestamped_filename)
+    """
+    file_path = Path(filepath)
+    base_name = file_path.stem
+    if with_dt:
+        base_name += '_%dt'
+    if is_piecewise:
+        base_name += '_els_'
+    else:
+        base_name += '_rig_'
+    return str(file_path.parent.parent / 'mcorr' / base_name)
+
+def _build_motion_correct_path(filepath: str, is_piecewise=True, with_dt=False) -> Path:
+    """
+    Determine what caiman will save the motion-corrected movie as (to find if previously calculated)
+    If with_dt is true, returns a template for a filename with a timestamp (see paths.make_timestamped_filename)
+    """
+    base_name = _build_motion_correct_basename(filepath, is_piecewise=is_piecewise, with_dt=with_dt)
+
     dims, T = get_file_size(filepath)
     assert isinstance(T, int), 'T should be int when taking file size of one movie'
-    filedir, filename = os.path.split(filepath)
-    base_name = os.path.splitext(filename)[0] + ('_els_' if is_piecewise else '_rig_')
+
     fname_tot = memmap_frames_filename(base_name, dims, T, order='F')
-    dir_mcorr = re.sub(r'\bconversion\b', 'mcorr', filedir)
-    fname_tot = os.path.join(dir_mcorr, fname_tot)
-    return fname_tot
-
-
-def _to_transposed_flattened_mmap_name(orig_mmap_names: list[str], do_transpose=True,
-                                       blur_kernel_size=1, highpass_cutoff=0.) -> str:
-    if len(orig_mmap_names) > 1:
-        # remove the _planeN part of the name b/c we're concatenating
-        orig_mmap_name = re.sub(r'_plane\d+(_[^/\\]*)$', r'\1', orig_mmap_names[0])
-    else:
-        orig_mmap_name = orig_mmap_names[0]
-    orig_mmap_name = orig_mmap_name
-    mmap_dir, mmap_basename = os.path.split(orig_mmap_name)
-    mmap_t_basename = mmap_basename.replace('__', '_')
-    if do_transpose:
-        mmap_t_basename = mmap_t_basename.replace('order_F', 'order_C')
-    fn_params = decode_mmap_filename_dict(mmap_t_basename)
-
-    # increase d2 (X) to reflect # of planes
-    if len(orig_mmap_names) > 1:
-        new_d2 = fn_params['d2'] * len(orig_mmap_names)
-        mmap_t_basename = re.sub(r'd2_\d+_d3_\d+', f'd2_{new_d2}_d3_1', mmap_t_basename)
-    
-    if blur_kernel_size != 1:
-        mmap_t_basename = re.sub(r'^(.*)_d1_', f'\\1_blur{blur_kernel_size}_d1_', mmap_t_basename)
-
-    if highpass_cutoff != 0:
-        mmap_t_basename = re.sub(r'^(.*)_d1_', f'\\1_highpass{highpass_cutoff:.2g}_d1_', mmap_t_basename)
-
-    return os.path.join(mmap_dir, mmap_t_basename)
+    return Path(fname_tot)
 
 
 @contextmanager
-def set_output_location(output_path: str) -> Generator[None, None, None]:
+def set_output_location(output_path: Union[str, Path]) -> Generator[None, None, None]:
     """
     Context manager that sets the temp directory to the output location
     to save to the given output file. Idempotent.
@@ -283,6 +303,14 @@ def set_output_location(output_path: str) -> Generator[None, None, None]:
             del os.environ['CAIMAN_TEMP']
 
 
+class PlaneMcorrResult(TypedDict):
+    mmap_path: str                    # path to corrected movie
+    shifts_rig: np.ndarray            # rigid shifts
+    shifts_els: Optional[np.ndarray]  # nonrigid shifts, if using
+    border_to_0: int                  # max border on any side
+    border_asym: BorderSpec           # max border on each side
+
+
 def compute_border_asym(shifts: np.ndarray) -> BorderSpec:
     """
     Given shifts array with dimension along the first axis, compute asymmetric border
@@ -295,76 +323,102 @@ def compute_border_asym(shifts: np.ndarray) -> BorderSpec:
     return BorderSpec(top=max_top, bottom=max_bottom, left=max_left, right=max_right)
 
 
-def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optional[dict] = None, force: bool = False
-                         ) -> tuple[str, np.ndarray, int, BorderSpec, Optional[np.ndarray], bool]:
+def compute_adjusted_indices(params_for_mcorr: cmp.UpToMcorrParamStruct) -> Optional[tuple[slice, ...]]:
     """
-    Runs motion correction on the given file and returns:
-        - path(s) to the mmap file(s),
-        - rigid shifts
-        - border pixels
-        - BorderSpec for border on each side (border_asym)
-        - nonrigid shifts (if doing pw_rigid)
-        - whether a new result was computed (always True if force is True)
+    Compute indices (sub-region to motion correct) corrected for crop, ndead and offset (to exclude dead pixels)
     """
-    expected_file = _build_motion_correct_filename(tif_file, params.motion['pw_rigid'])
-    expected_info_file = re.sub(r'.mmap$', '.npz', expected_file)
-    requested_indices = cast(tuple[slice, ...], params.motion['indices'])
-
-    # whether to first fit to subwindow and then apply to whole movie
-    use_apply = any(s != slice(None) for s in requested_indices)
-
-    if not force and os.path.exists(expected_file) and os.path.exists(expected_info_file):
-        logging.info('Using existing motion correction results from ' + expected_file)
-        with np.load(expected_info_file, allow_pickle=True) as info:
-            if 'indices' in info:
-                indices_match = info['indices'].item() == requested_indices
-            else:
-                logging.warning('No indices information - assuming it is from the whole FOV.')
-                indices_match = not use_apply
-
-            if not indices_match:  # TODO in new version, it will be possible to save multiple versions
-                logging.info('Indices (FOV) from saved data do not match - re-running')
-            else:
-                shifts_rig = info['shifts_rig']
-                border_to_0 = int(info['border_to_0'].item())
-                if 'shifts_els' in info:
-                    shifts_els = info['shifts_els']
-                    if shifts_els.ndim == 0:
-                        shifts_els = shifts_els.item()
-                elif 'piecewise_info' in info:
-                    logging.warning('PiecewiseMCInfo will be removed soon, making this field un-unpicklable')
-                    piecewise_info: Optional[PiecewiseMCInfo] = info['piecewise_info'].item()
-                    shifts_els = piecewise_info.shifts_els if piecewise_info is not None else None
-                else:
-                    shifts_els = None
-
-                if 'border_asym' in info:
-                    border_asym = cast(BorderSpec, info['border_asym'].item())
-                else:
-                    # compute from shifts
-                    if shifts_els is None:
-                        border_asym = compute_border_asym(shifts_rig)
-                    else:
-                        border_asym = compute_border_asym(shifts_els)
-
-                return expected_file, shifts_rig, border_to_0, border_asym, shifts_els, False
+    indices = params_for_mcorr.motion.indices
+    ndead = params_for_mcorr.conversion.odd_row_ndead
+    offset = params_for_mcorr.conversion.odd_row_offset
+    crop = params_for_mcorr.conversion.crop
     
-    if parent_process() is None and cluster_args is not None:
-        cma.cluster.start(**cluster_args)
+    # compute left border and exclude, if not already cropped out
+    ndead_max = 0 if ndead is None else max(ndead)
+    shift_max = 0 if offset is None else math.ceil(abs(offset) / 2)
+    n_to_clip = ndead_max + shift_max
+    curr_x_indices = indices[1]
+    curr_start = 0 if curr_x_indices.start is None else int(curr_x_indices.start)
+    n_clipped = curr_start + crop.left  # number of pixels currently removed from original image
 
-    params.change_params({'data': {'fnames': [tif_file]}})
+    if n_to_clip > n_clipped:
+        # figure out how to modify slice to clip out n_to_clip pixels
+        # while maintaining the same phase if step != 1
+        diff = n_to_clip - n_clipped  # minimum number of pixels to add to indices[1].start
+        step = 1 if curr_x_indices.step is None else curr_x_indices.step
+        new_start = curr_start + step * math.ceil(diff / step)
+        new_x_indices = slice(new_start, curr_x_indices.stop, curr_x_indices.step)
+        return indices[:1] + (new_x_indices,) + indices[2:]
 
-    with set_output_location(expected_file):
-        mcorr_obj = MotionCorrect(tif_file, **params.motion, dview=cma.cluster.dview)
-        if use_apply:
-            mcorr_obj.motion_correct(save_movie=False)
-            expected_file = apply_mcorr_to_file(mcorr_obj, tif_file)
+
+def get_candidate_mcorr_result_files(tif_path: str, is_piecewise: bool) -> list[str]:
+    """Get a list of possible filenames for motion correct results"""
+    path_pattern_withdate = _build_motion_correct_path(tif_path, is_piecewise=is_piecewise, with_dt=True)
+    path_nodate = _build_motion_correct_path(tif_path, is_piecewise=is_piecewise, with_dt=False)
+    files_to_try = paths.get_all_timestamped_files(path_pattern_withdate.parent, path_pattern_withdate.name)
+    if path_nodate.exists():
+        files_to_try.append(str(path_nodate))
+    return files_to_try
+
+def load_mcorr_result(mmap_path: str) -> PlaneMcorrResult:
+    info_file = os.path.splitext(mmap_path)[0] + '.npz'
+    with np.load(info_file, allow_pickle=True) as info:
+        shifts_rig = cast(np.ndarray, info['shifts_rig'])
+        border_to_0 = int(info['border_to_0'].item())
+        
+        if 'shifts_els' in info:
+            shifts_els = info['shifts_els']
+            if shifts_els.ndim == 0:
+                shifts_els = shifts_els.item()
+            shifts_els = cast(np.ndarray, shifts_els)
+        elif 'piecewise_info' in info:
+            logging.warning('PiecewiseMCInfo will be removed soon, making this field un-unpicklable')
+            piecewise_info: Optional[PiecewiseMCInfo] = info['piecewise_info'].item()
+            shifts_els = piecewise_info.shifts_els if piecewise_info is not None else None
         else:
-            mcorr_obj.motion_correct(save_movie=True)
+            shifts_els = None
+        
+        if 'border_asym' in info:
+            border_asym = cast(BorderSpec, info['border_asym'].item())
+        else:
+            border_asym = None
+    
+    # compute border_asym if None
+    if border_asym is None:
+        # compute from shifts
+        if shifts_els is None:
+            border_asym = compute_border_asym(shifts_rig)
+        else:
+            border_asym = compute_border_asym(shifts_els)
+    
+    return PlaneMcorrResult(
+        mmap_path=mmap_path, shifts_rig=shifts_rig, shifts_els=shifts_els,
+        border_to_0=border_to_0, border_asym=border_asym
+    )
+
+
+def motion_correct_file(tif_file: str, motion_params: MotionParams, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
+    """Runs motion correction on the given file (does not attempt to load)"""
+    # First, make a link to the tif_file with the current date, so that the mmap file will have it too
+    with paths.linked_timestamped_path(tif_file) as tif_file_link:
+        # Get path to output file we want to be created in the mcorr folder
+        expected_file = _build_motion_correct_path(tif_file_link, is_piecewise=motion_params.pw_rigid)
+
+        # whether to first fit to subwindow and then apply to whole movie
+        with set_output_location(expected_file):
+            mcorr_obj = MotionCorrect(tif_file_link, **motion_params, dview=dview)
+            # if we have indices, first compute using indices, then apply to the original movie.
+            if any(s != slice(None) for s in motion_params.indices):
+                mcorr_obj.motion_correct(save_movie=False)
+                actual_file = apply_mcorr_to_file(mcorr_obj, tif_file_link)
+                if expected_file != actual_file:
+                    logging.debug(f'apply_mcorr_to_file expected to save to {expected_file}, but saved to {actual_file} instead')
+            else:
+                mcorr_obj.motion_correct(save_movie=True)
+                actual_file = expected_file
 
     # extract shifts
     shifts_rig = np.array(mcorr_obj.shifts_rig).T  # transpose to dims x frames
-    if params.motion["pw_rigid"]:
+    if motion_params.pw_rigid:
         x_shifts = mcorr_obj.x_shifts_els
         y_shifts = mcorr_obj.y_shifts_els
         shifts = [x_shifts, y_shifts]
@@ -376,65 +430,155 @@ def motion_correct_file(tif_file: str, params: CNMFParams, cluster_args: Optiona
         shifts_els = None
         border_asym = compute_border_asym(shifts_rig)
     
-    np.savez(expected_info_file, shifts_rig=shifts_rig, border_to_0=mcorr_obj.border_to_0,
-             shifts_els=np.array(shifts_els), border_asym=np.array(border_asym),
-             indices=np.array(requested_indices))
+    info_file = actual_file.parent / (actual_file.stem + '.npz')
+    np.savez(info_file,
+             shifts_rig=shifts_rig,
+             border_to_0=mcorr_obj.border_to_0,
+             shifts_els=np.array(shifts_els),
+             border_asym=np.array(border_asym))
 
-    return expected_file, shifts_rig, int(mcorr_obj.border_to_0),  border_asym, shifts_els, True
+    return PlaneMcorrResult(
+        mmap_path=str(expected_file), shifts_rig=shifts_rig, shifts_els=shifts_els,
+        border_to_0=mcorr_obj.border_to_0, border_asym=border_asym
+    )
 
 
-def apply_mcorr_to_file(mcorr_obj: MotionCorrect, input_file: str) -> str:
+def apply_mcorr_to_file(mcorr_obj: MotionCorrect, input_file: str) -> Path:
     """Apply shifts from a MotionCorrect object to the given input file (returns output filename)"""
-    expected_file = _build_motion_correct_filename(input_file, mcorr_obj.pw_rigid)
-    with set_output_location(expected_file):
-        saved_file = mcorr_obj.apply_shifts_movie(input_file, save_memmap=True, remove_min=False)
+    tif_path_with_timestamp = paths.add_timestamp_to_path(input_file)
+    basename = _build_motion_correct_basename(tif_path_with_timestamp, is_piecewise=mcorr_obj.pw_rigid)
+
+    saved_file = mcorr_obj.apply_shifts_movie(
+        input_file, save_memmap=True, save_base_name=basename, remove_min=False)
     assert isinstance(saved_file, str), 'path returned when save_memmap is true'
-    if os.path.exists(expected_file):
-        os.remove(expected_file)
-    shutil.move(saved_file, expected_file)
-    return expected_file
+    return Path(saved_file)
 
 
-def make_highpass_filter(cutoff: float, sample_rate: float, dtype: Optional[DTypeLike] = None
-                         ) -> tuple[tuple[np.ndarray, np.ndarray], int]:
-    """
-    Make high-pass filter for filtering movie across time.
-        - cutoff: cutoff frequency in Hz
-        - sample_rate: sample rate of movie in Hz
-    Returns ((b, a), npad): coefficients in tf format and the number of samples to pad/trim the input.
-    """
-    cutoff_lam_samps = sample_rate / cutoff  # samples per cycle at cutoff frequency
-    npad = round(cutoff_lam_samps)
-    n_taps = 2 * npad + 1
-    b = signal.firwin(n_taps, cutoff, pass_zero=False, fs=sample_rate)
-    a = np.array([1.])
-    if dtype is not None:
-        b = b.astype(dtype)
-        a = a.astype(dtype)
-    return (b, a), npad
+# ------------- transposition step ------------------- #
 
 
-def filter_worker(args: tuple[tuple[np.ndarray, np.ndarray], np.ndarray, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Parallel kernel for high-pass filtering.
-    Inputs:
-        - filter_coeffs: (b, a) coefficients in tf format
-        - Yr_in: pixels x time chunk of data
-        - zi: initial conditions
+def get_transposed_mmap_name(orig_mmap_names: list[str], trans_params: cmp.TranspositionParams) -> str:
+    if len(orig_mmap_names) > 1:
+        # remove the _planeN part of the name b/c we're concatenating
+        orig_mmap_name = re.sub(r'_plane\d+(_[^/\\]*)$', r'\1', orig_mmap_names[0])
+    else:
+        orig_mmap_name = orig_mmap_names[0]
+
+    mmap_dir, mmap_basename = os.path.split(orig_mmap_name)
+    mmap_t_basename = mmap_basename.replace('__', '_')
+    mmap_t_basename = mmap_t_basename.replace('order_F', 'order_C')
+    fn_params = decode_mmap_filename_dict(mmap_t_basename)
+
+    # increase d2 (X) to reflect # of planes
+    if len(orig_mmap_names) > 1:
+        new_d2 = fn_params['d2'] * len(orig_mmap_names)
+        mmap_t_basename = re.sub(r'd2_\d+_d3_\d+', f'd2_{new_d2}_d3_1', mmap_t_basename)
     
-    Outputs:
-        - Yr_out: pixels x time filtered data
-        - zf: final conditions
-    """
-    filter_coeffs, Yr, z = args
-    Yr, z = signal.lfilter(*filter_coeffs, Yr, axis=1, zi=z)
-    return Yr, z
+    # collect param strings to add to the filename to disambiguate
+    # note this is just for convenience; actual decision for whether it can be used is from the params file
+    extra_param_strings = []
+
+    if trans_params.blur_kernel_size != 1:
+        extra_param_strings.append(f'blur{trans_params.blur_kernel_size}')
+
+    if trans_params.highpass_cutoff != 0:
+        extra_param_strings.append(f'highpass{trans_params.highpass_cutoff:g}')
+     
+        if trans_params.highpass_order != 4:  # only relevant if we are doing highpass filter
+            extra_param_strings.append(f'order{trans_params.highpass_order}')
+    
+    if trans_params.add_to_mov != 0:
+        extra_param_strings.append(f'add{trans_params.add_to_mov:g}')
+
+    if trans_params.remove_bg_mean:
+        extra_param_strings.append('bgremoved')
+
+        if trans_params.bg_filter_size != 20:  # only relevant if background-remove step is on
+            extra_param_strings.append(f'filtersize{trans_params.bg_filter_size}')
+        
+        if trans_params.bg_mean_scale != 1.:
+            extra_param_strings.append(f'scale{trans_params.bg_mean_scale:g}')
+
+    if len(extra_param_strings) > 0:
+        # insert strings for non-default params into filename
+        mmap_t_basename = re.sub(r'^(.*)_d1_', '\\1_' + '_'.join(extra_param_strings) + '_d1_', mmap_t_basename)
+
+    return os.path.join(mmap_dir, mmap_t_basename)
 
 
-def transpose_flatten_mc_mmap(mmap_files: list[str], mc_border: int, sample_rate: float, force: bool = False,
-                              do_transpose=True, blur_kernel_size=1, highpass_cutoff=0.) -> str:
+def blur_forder_movie(input_mmap_path: str, output_mmap_path: str, ksize: int):
+    """Gaussian-blur each frame of the given input F-order mmap file, saving to another mmap file"""
+    if ksize < 1 or ksize % 2 != 1:
+        raise ValueError('ksize must be an odd positive integer')
+    elif ksize == 1:
+        logging.warning('blur call with ksize = 1 should be eliminated')
+        # just make hard link to output file
+        os.link(input_mmap_path, output_mmap_path)
+        return
+
+    input_mov: cm.movie = cm.load(input_mmap_path)
+    T, *dims = input_mov.shape  # type: ignore
+    n_pix = int(np.prod(dims))
+
+    # create output file
+    output_mmap = np.memmap(output_mmap_path, dtype=np.float32, mode='w+', shape=(n_pix, T), order='F')
+    for i, frame in enumerate(input_mov):
+        sm_frame = cv2.GaussianBlur(
+            frame, ksize=(ksize, ksize), sigmaX=ksize / 4, sigmaY=ksize / 4, borderType=cv2.BORDER_REPLICATE)
+        output_mmap[:, i] = sm_frame.ravel(order='F')
+    
+    output_mmap.flush()
+    del output_mmap
+
+
+@contextmanager
+def blurred_movies(input_mmap_files: list[str], ksize=1) -> Generator[list[str], None, None]:
     """
-    Saves motion-corrected data, flattened from 3D to 2D and transposed to iterate over time last.
+    Context manager that just yields the input files if ksize (kernel size) == 1. If ksize is an odd integer
+    greater than 1, it puts blurred versions of each input movie into temporary files and
+    yields the paths of these files, which are deleted when the context manager exits.
+    """
+    if ksize == 1:
+        yield input_mmap_files
+    else:
+        output_paths: list[str] = []
+        for input_path in input_mmap_files:
+            logging.info(f'Using Gaussian blur of size {ksize}')
+            file = tempfile.NamedTemporaryFile(suffix='.mmap', delete=False)
+            output_path = file.name
+            output_paths.append(output_path)
+            file.close()
+            blur_forder_movie(input_path, output_path, ksize=ksize)
+        
+        yield output_paths
+        # on exit, delete each file
+        for path in output_paths:
+            os.remove(path)         
+
+
+def get_background_estimate(
+    plane_mmap_path: str, border: BorderSpec, filter_size: int, return_center_only=True,
+    dview: Optional[Cluster] = None) -> onp.Array2D[np.floating]:
+    """Make estimate of local background level based on min-filtering the mean projection"""
+    # get mean projection
+    plane_mean = make_projection_parallel(plane_mmap_path, 'mean', dview=dview)
+    slices = border.slices(plane_mean.shape)
+    center = plane_mean[slices]
+    center_filtered = ndi.minimum_filter(center, filter_size)
+    center_filtered = ndi.gaussian_filter(center_filtered, filter_size // 2)
+    if return_center_only:
+        return center_filtered
+    else:
+        filtered = np.zeros_like(plane_mean)
+        filtered[slices] = center_filtered
+        return filtered
+
+
+def transpose_flatten_mc_mmap(
+        mc_result: MCResult, trans_params: cmp.TranspositionParams, fr: float,
+        dview: Optional[Cluster] = None) -> str:
+    """
+    Saves motion-corrected data, flattened from 3D to 2D and transposed to iterate over time first (C-order).
     Note: I am breaking the usual rule in software that each function should do one thing for space and time efficiency.
     Since this involves iterating over and re-saving the entire post-motion-correction movie, it is the best time
         to do any other operations on the movie that work better on chunks of frames than patches of pixels.
@@ -445,143 +589,92 @@ def transpose_flatten_mc_mmap(mmap_files: list[str], mc_border: int, sample_rate
         - Gaussian blur, enabled by setting blur_kernel_size > 1.
         - High-pass filtering, enabled by setting highpass_cutoff (in Hz) > 0.
     """
-    expected_file = _to_transposed_flattened_mmap_name(
-        mmap_files, do_transpose=do_transpose, blur_kernel_size=blur_kernel_size, highpass_cutoff=highpass_cutoff)
+    mmap_files = mc_result.mmap_files
+    highpass_cutoff = trans_params.highpass_cutoff
+    highpass_order = trans_params.highpass_order
+    add_to_movie = trans_params.add_to_mov
 
-    if not force and os.path.exists(expected_file):
-        logging.info('Using existing transposed file: ' + expected_file)
-    else:
-        logging.info(f'Saving transposed memmap to {os.path.basename(expected_file)}')
-        logging.info(f'Using border of {mc_border} pixels')
-        if blur_kernel_size != 1:
-            logging.info(f'Using Gaussian blur of size {blur_kernel_size}')
+    expected_file = get_transposed_mmap_name(mmap_files, trans_params)
+    logging.info(f'Saving transposed memmap to {os.path.basename(expected_file)}')
 
-        # do in chunks to avoid running out of memory
-        dims, T = get_file_size(mmap_files[0])
-        assert isinstance(T, int), 'get_file_size with 1 input should return int for T'
-        synchronous_limit = psutil.virtual_memory()[1]
-        chunks_serial = int(np.ceil(np.prod(dims) / synchronous_limit * T * 8))  # order of ops is important to avoid overflow!!
-        chunks_parallel = chunks_serial * cma.cluster.ncores
+    with blurred_movies(mmap_files, ksize=trans_params.blur_kernel_size) as mmap_files:
+        dims, T = get_file_size(mmap_files)
+        if not isinstance(T, int):  # returns tuple of T for each file
+            if any(t != T[0] for t in T):
+                raise RuntimeError('Files should all have the same number of frames')
+            T = int(T[0])
 
-        if len(mmap_files) == 1 and do_transpose and blur_kernel_size == 1 and highpass_cutoff == 0:  # (only supports C order)
-            base_name = os.path.basename(expected_file)
-            base_name = base_name[:base_name.index('_d1')]
+        n_planes = len(mmap_files)
+        pixels_per_plane = int(np.prod(dims))
+        n_pix = pixels_per_plane * n_planes
 
-            n_chunks = chunks_parallel
-            while True:
-                try:
-                    saved_name = cm.save_memmap_join(mmap_files, base_name=base_name, save_npz=False, border_to_0=mc_border,
-                                                     n_chunks=n_chunks, dview=cma.cluster.dview)
-                    break
-                except MemoryError:
-                    logging.info('Doubling number of chunks and trying again')
-                    n_chunks *= 2
+        # create output file for transposed data to allocate disk space, then immediately close
+        big_mov = np.memmap(expected_file, dtype=np.float32, mode='w+', shape=(n_pix, T), order='C')
+        bytes_per_pixel = big_mov.dtype.itemsize
+        big_mov.flush()
+        del big_mov
 
-            shutil.move(saved_name, expected_file)  # necessary to flatten - shape interpretation becomes (d1, d2*d3, 1) based on filename
-        else:
-            # manually concatenate along non-time axis while saving
-
-            # make filter if filtering
-            if highpass_cutoff != 0:
-                filter_coeffs, delay = make_highpass_filter(highpass_cutoff, sample_rate, dtype=np.float32)
+        for k_plane, input_path in enumerate(mmap_files):
+            byte_offset = pixels_per_plane * k_plane * bytes_per_pixel * T
+            
+            # use plane-specific border if possible
+            if mc_result.border_asym is not None:
+                border_spec = mc_result.border_asym[k_plane]
             else:
-                filter_coeffs = None
-                delay = 0
+                border_spec = BorderSpec.equal(mc_result.border_to_0)
 
-            # create file to save to
-            rows_per_file = int(np.prod(dims))
-            rows_total = len(mmap_files) * rows_per_file
-            mmap_out = np.memmap(expected_file, dtype=np.float32, mode='w+', shape=(rows_total, T),
-                                 order=('C' if do_transpose else 'F'))
+            if trans_params.remove_bg_mean:
+                filter_size = trans_params.bg_filter_size
+                bg_mean_center = get_background_estimate(input_path, border_spec, filter_size, dview=dview)
+                add_to_movie = add_to_movie - trans_params.bg_mean_scale * bg_mean_center
 
-            try:
-                # make chunks of frames
-                chunk_boundaries = np.unique(np.linspace(0, T, chunks_serial + 1, dtype=int))
-                chunks = [slice(b1, b2) for b1, b2 in zip(chunk_boundaries[:-1], chunk_boundaries[1:])]
+            border = cast(Border, asdict(border_spec))
 
-                # for filter parallel processing
-                pixel_chunk_boundaries = np.unique(np.linspace(0, rows_per_file, cma.cluster.ncores, dtype=int))
-                pixel_chunks = [slice(b1, b2) for b1, b2 in zip(pixel_chunk_boundaries[:-1], pixel_chunk_boundaries[1:])]
+            save_c_order_mmap_parallel(
+                movie_path=input_path,
+                base_name="",  # unused
+                dview=dview,
+                fr=fr,
+                add_to_movie=add_to_movie,
+                border_pixels=border,
+                highpass_cutoff=highpass_cutoff,
+                highpass_order=highpass_order,
+                existing_output_path=expected_file,
+                existing_output_offset=byte_offset
+            )
 
-                for idx, mmap_file in tqdm(enumerate(mmap_files), total=len(mmap_files), unit='plane'):
-                    Yr, dims, _ = cm.load_memmap(mmap_file)
-                    mmap_out_plane = mmap_out[(rows_per_file*idx):(rows_per_file*(idx+1))]
-
-                    if filter_coeffs is not None:
-                        # prepare for filtering
-                        zi_base = signal.lfilter_zi(*filter_coeffs)
-                        zis = [zi_base[np.newaxis, :] * Yr[pixel_chunk, [0]] for pixel_chunk in pixel_chunks]
-                        chunks.append(slice(T, T + delay))
-                    else:
-                        zis = None
-
-                    for chunk in tqdm(chunks, unit='chunk', leave=False):
-                        if chunk.stop > T:
-                            # zeros for last bit of filtering
-                            assert filter_coeffs is not None and chunk.start == T, f'Unexpected chunk out of bounds (T = {T}, chunk = {(chunk.start, chunk.stop)})'
-                            Yr_chunk = np.zeros((Yr.shape[0], delay), dtype=Yr.dtype)
-                        else:
-                            Yr_chunk = Yr[:, chunk].copy(order='K') # load chunk into memory (incl. transfer from NAS) all at once
-
-                        if filter_coeffs is not None:
-                            assert zis is not None
-                            # filter
-                            dview = cma.cluster.dview
-                            if dview is None:
-                                assert len(pixel_chunks) == 1, 'Multiple pixel chunks but no dview?'
-                                Yr_chunk, zis[0] = signal.lfilter(*filter_coeffs, Yr_chunk, axis=1, zi=zis[0])
-                            else:
-                                arg_list = [(filter_coeffs, Yr_chunk[pixel_chunk, :], zi) for pixel_chunk, zi in zip(pixel_chunks, zis)]
-                                Yr_chunk = np.empty_like(Yr_chunk)  # allocate output buffer
-                                pbar = tqdm(range(len(pixel_chunks)), desc='High-pass filtering', unit='chunk', leave=False)
-                                map_fn = dview.imap if 'multiprocessing' in str(type(dview)) else dview.map_async
-                                for i, res in zip(pbar, map_fn(filter_worker, arg_list)):
-                                    Yr_chunk[pixel_chunks[i], :], zis[i] = res
-                                pbar.close()
-                            
-                            # account for delay when writing
-                            write_slice = slice(chunk.start - delay, chunk.stop - delay)
-                            if write_slice.stop <= 0:
-                                # discard the whole chunk
-                                continue
-
-                            if write_slice.start < 0:
-                                # discard up to the sample corresponding to 0 in the output
-                                Yr_chunk = Yr_chunk[:, -write_slice.start:]
-                                write_slice = slice(0, write_slice.stop)
-                        else:
-                            write_slice = chunk
-
-                        if mc_border == 0 and blur_kernel_size == 1:
-                            # don't have to reshape
-                            mmap_out_plane[:, write_slice] = Yr_chunk
-                        else:
-                            border = BorderSpec.equal(mc_border)
-                            center_slices = border.slices(dims)
-                            rows, cols = dims                            
-                            chunk_out_3d = mmap_out_plane[:, write_slice].reshape((rows, cols, -1), order='F')
-                            chunk_out_3d[:mc_border] = 0
-                            chunk_out_3d[rows-mc_border:] = 0
-                            chunk_out_3d[:, :mc_border] = 0
-                            chunk_out_3d[:, cols-mc_border:] = 0
-
-                            chunk_in_3d = Yr_chunk.reshape((rows, cols, -1), order='F')
-                            center_3d = chunk_in_3d[center_slices]
-
-                            if blur_kernel_size == 1:
-                                chunk_out_3d[center_slices] = center_3d
-                            else:
-                                center_out = np.empty_like(center_3d)
-                                for k_frame in tqdm(range(chunk_out_3d.shape[2]), unit='frame', leave=False):
-                                    center_out[..., k_frame] = cv2.GaussianBlur(
-                                        center_3d[..., k_frame], ksize=(blur_kernel_size, blur_kernel_size),
-                                        sigmaX=blur_kernel_size//4, sigmaY=blur_kernel_size//4, borderType=cv2.BORDER_REPLICATE)
-                                chunk_out_3d[center_slices] = center_out
-                mmap_out.flush()
-            except:
-                # write failed, cleanup
-                del mmap_out
-                if os.path.exists(expected_file):
-                    os.remove(expected_file)
-                raise
     return expected_file
+
+
+def do_or_load_transpose(
+        mc_result: MCResult, params: cmp.UpToTransposeParamStruct, fr: float, metadata: dict[str, Any],
+        dview: Optional[Cluster] = None, load: Optional[bool] = None) -> str:
+    """
+    Either load existing result or do the transpose, saving a params file along with it
+
+    load: Whether to try loading previously-computed results.
+            None: use previous results if params match, otherwise compute anew
+            True: use previous results if params match, otherwise raise NoMatchingResultError
+            False: recompute results even if they already exist.
+    """
+    if load is not False:   # try to load existing results
+        expected_file = get_transposed_mmap_name(mc_result.mmap_files, params.transposition)
+        params_file = paths.params_file_for_result(expected_file)
+        try:
+            loaded_params = cmp.UpToTransposeParamStruct.read_from_file(params_file)
+            if loaded_params.do_params_match(params, metadata=metadata, stage=cmp.AnalysisStage.TRANSPOSE):
+                if load is None:  # only log if we were unsure whether to load
+                    logging.info('Using existing transposed file: ' + expected_file)
+                return expected_file
+        except FileNotFoundError:
+            pass
+        
+    if load is True:
+        raise NoMatchingResultError('Cannot find matching transposed file.')
+    else:
+        # we are doing the transpose
+        res_file = transpose_flatten_mc_mmap(mc_result, params.transposition, fr=fr, dview=dview)
+        # write params file as well
+        params_file = paths.params_file_for_result(res_file)
+        params.write_params(params_file, stage=cmp.AnalysisStage.TRANSPOSE)
+        return res_file

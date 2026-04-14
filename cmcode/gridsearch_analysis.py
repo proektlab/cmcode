@@ -1,22 +1,17 @@
 """
 Functions for doing grid searches of parameters using mesmerize-core
-For now, this picks up after motion correction, from the transposed/concatenated mmap file.
 """
 from itertools import product
-import logging
 import os
 from pathlib import Path
-import time
-import traceback
-from typing import Optional, Iterable, Union, Mapping, Sequence, Any
+from typing import Any, Optional, Iterable, Union, Mapping, Sequence, cast
 
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from mesmerize_core.caiman_extensions.common import Waitable
 
-from cmcode import caiman_analysis as cma, cmcustom
-from cmcode.cnmf_ext import load_CNMFExt
+from cmcode import caiman_analysis as cma, caiman_params as cmp, cmcustom
+from cmcode.util import types
 
 
 ParamGrid = Mapping[tuple[str, str], Iterable]
@@ -49,34 +44,26 @@ def do_cnmf_gridsearch(sessdata: 'cma.SessionAnalysis', params_to_search: Union[
     elif n_procs_var in os.environ:
         del os.environ[n_procs_var]
 
-    dview = None
-    if backend in ['local', 'local_async']:
-        dview = cma.cluster.dview
-
     procs: list[Waitable] = []
     uuids = []
 
     for param_dict in param_dicts:
-        param_changes = {}
-        is3D = False
-        seed_params = None
+        param_changes: dict[str, dict[str, Any]] = {}
         for (group, key), val in param_dict.items():
-            if group != 'special':
-                if group not in param_changes:
-                    param_changes[group] = {}
-                param_changes[group][key] = val
-            elif key == '3D':
-                is3D = val
-            elif key in ['mask_in_args', 'seed'] and val is not None:
-                if key == 'mask_in_args':
-                    logging.warning("deprecated key 'mask_in_args'; use ('special', 'seed')")
-                # save seed_params to use after we have the rest of the params
-                seed_params = val
+            if group not in param_changes:
+                param_changes[group] = {}
+            param_changes[group][key] = val
         
-        sessdata.cnmf_params.change_params(param_changes)
+        sessdata.update_params(param_changes)
 
-        uuid, proc = sessdata.start_cnmf_with_mescore(is3D=is3D, backend=backend, wait=False, partition=partition,
-                                                      seed_params=seed_params, dview=dview)
+        # get up to the point of doing CNMF for these parameters if necessary
+        if sessdata.last_valid_stage < cmp.AnalysisStage.CONVERT:
+            sessdata.convert_to_tif()
+        
+        if sessdata.last_valid_stage < cmp.AnalysisStage.TRANSPOSE:
+            sessdata.do_motion_correction()
+
+        uuid, proc = sessdata.start_cnmf_with_mescore(backend=backend, wait=False, partition=partition)
 
         uuids.append(uuid)
         procs.append(proc)
@@ -96,9 +83,9 @@ def do_cnmf_gridsearch(sessdata: 'cma.SessionAnalysis', params_to_search: Union[
 
 class GridsearchError(RuntimeError):
     """Error shown after a gridsearch has failed, which displays the traceback of the first failed run if possible."""
-    def __init__(self, batch: pd.DataFrame, orig_nruns: int):
+    def __init__(self, batch: 'types.MescoreBatch', orig_nruns: int):
         """orig_nruns: How many runs were in the batch before this gridsearch."""
-        new_runs: pd.DataFrame = batch.iloc[orig_nruns:, :]
+        new_runs = batch.iloc[orig_nruns:, :]
         error_ind = None
         any_not_run = False
         for ind, row in new_runs.iterrows():
@@ -111,7 +98,8 @@ class GridsearchError(RuntimeError):
         if error_ind is not None:
             # get backtrace
             err_uuid = new_runs.at[ind, 'uuid']
-            err_bt = new_runs.at[ind, 'outputs']['traceback']
+            err_outputs = cast(dict, new_runs.at[ind, 'outputs'])
+            err_bt = err_outputs['traceback']
             super().__init__(f'Error running gridsearch - first error in UUID {err_uuid}. Backtrace:\n' + err_bt)
         elif not any_not_run:
             super().__init__('CNMF succeeded, but another error was raised in run script - see above.')
@@ -119,9 +107,9 @@ class GridsearchError(RuntimeError):
             super().__init__('Error running gridsearch, but no error is saved in the dataframe - check log files.')
 
 
-def make_contour_pdf(batch: pd.DataFrame, uuid: str):
+def make_contour_pdf(batch: types.MescoreBatch, uuid: str):
     """Produce PDF of contours for a given batch item, with accepted/rejected ROIs marked."""
-    res_series = batch.loc[batch.uuid == uuid, :].iloc[0]
+    res_series: types.MescoreSeries = batch.loc[batch.uuid == uuid, :].iloc[0]  # type: ignore
     corr_bg = res_series.caiman.get_corr_image()
     cnmf = res_series.cnmf.get_output()
     output_dir = Path(res_series.cnmf.get_output_path()).parent
