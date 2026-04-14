@@ -270,6 +270,7 @@ class EstimatesExt(cnmf.Estimates):
             logging.info('Estimates have already been interpolated')
             return
 
+        logging.info(f'Upsampling (interpolating) results by a factor of {upsample_factor}')
         frames_per_trial_ds = [math.ceil(frames / upsample_factor) for frames in frames_per_trial]
         if sum(frames_per_trial_ds) != total_frames_ds:
             raise RuntimeError('Number of frames in results does not match what is expected from downsampling')

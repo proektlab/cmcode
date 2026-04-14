@@ -4,6 +4,7 @@ channels:
 dependencies:
 - asyncssh
 - caiman >= 1.10.0
+- cellpose
 - dask
 - distributed
 - h5py
@@ -16,8 +17,10 @@ dependencies:
 - optype-numpy
 - pip
 - pydantic
+- pytorch
 - setuptools < 82.0.0  # for mesmerize-viz (pkg_resources dependency in pygfx version)
 - scipy-stubs
+- typing_extensions
 - pip:
   - mesmerize-viz
   - fastplotlib ~= 0.1.0.a17

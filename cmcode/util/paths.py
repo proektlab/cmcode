@@ -1,4 +1,5 @@
 """Path utilities"""
+from contextlib import contextmanager
 from datetime import datetime
 import logging
 import os
@@ -6,7 +7,7 @@ from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import re
 import sys
 from string import Template
-from typing import (Optional, Protocol, Union, Literal, Sequence, Callable, Generic,
+from typing import (Optional, Protocol, Union, Literal, Sequence, Callable, Generic, Generator,
                     Iterable, TypeVar, ParamSpec, Concatenate, runtime_checkable, overload)
 
 import numpy as np
@@ -305,6 +306,7 @@ def get_processed_dir(mouse_id: Union[int, str], rec_type: str = 'learning_ppc',
 class PctTemplate(Template):
     """String template that uses the % symbol instead of $, so that re escaping doesn't affect it"""
     delimiter = '%'
+    idpattern = r'(?a:[a-z][a-z0-9]*)'  # don't allow underscores as part of identifiers
 
 
 def make_timestamped_filename(file_pattern: str) -> str:
@@ -328,7 +330,10 @@ def get_all_timestamped_files(parent_dir: Union[str, Path], file_pattern: str) -
     file_re = PctTemplate(file_pattern_escaped).substitute({'dt': dt_re}) + '$'
 
     # find files in the dir that match and sort by date
-    all_files = os.listdir(parent_dir)
+    try:
+        all_files = os.listdir(parent_dir)
+    except FileNotFoundError:
+        return []
     match_objs = [re.match(file_re, f) for f in all_files]
     matches = sorted(filter(None, match_objs), key=lambda m: m[1], reverse=True)
     return [os.path.join(parent_dir, match[0]) for match in matches]
@@ -347,3 +352,25 @@ def get_latest_timestamped_file(parent_dir: Union[str, Path], file_pattern: str)
 
 def params_file_for_result(result_file: Union[str, Path]) -> str:
     return os.path.splitext(result_file)[0] + '_params.json'
+
+
+def add_timestamp_to_path(path: str) -> str:
+    """Add the current timestamp to an existing path right before the extension"""
+    start, ext = os.path.splitext(path)
+    path_template = start + '_%dt' + ext
+    dir, name_template = os.path.split(path_template)
+    link_path = os.path.join(dir, make_timestamped_filename(name_template))
+    return link_path
+
+
+@contextmanager
+def linked_timestamped_path(path: str) -> Generator[str, None, None]:
+    """
+    Hard-link a version of the path with the timestamp added and delete the link
+    when the context manager exits. This is useful for some caiman function(s)
+    (motion correction) that determine the output path based on the input.
+    """
+    link_path = add_timestamp_to_path(path)
+    os.link(src=path, dst=link_path)
+    yield link_path
+    os.unlink(link_path)

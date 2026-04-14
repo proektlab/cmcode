@@ -16,6 +16,7 @@ import shutil
 from subprocess import CalledProcessError
 from typing import Optional, Union, Any, cast, Literal, overload, TYPE_CHECKING
 
+import cellpose.models
 import cv2
 from hdf5storage import savemat
 import matplotlib.pyplot as plt
@@ -26,6 +27,7 @@ import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 from scipy import sparse
+import torch
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
@@ -43,7 +45,7 @@ from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, 
 from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
-# from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
+from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
 from cmcode.util import footprints, paths
 from cmcode.util.cluster import Cluster
 from cmcode.util.compat import reconstruct_sessdata_obj
@@ -109,16 +111,19 @@ def get_spatial_seed_name(seed_params: cmp.SeedParams) -> str:
     proj_name = get_projection_name(seed_params)
 
     Ain_name = f'Ain_caiman_from_{proj_name}'
-    if seed_params.gSig is not None:  # just leave out of name if default
-        gSig = seed_params.gSig
-        if isinstance(gSig, int) or not hasattr(gSig, '__len__'):
-            gSig = [gSig]
-        else:
-            gSig = list(gSig)
-        Ain_name += '_gSig_' + ','.join(str(gs) for gs in gSig)
+    if seed_params.use_cellpose:
+        Ain_name += '_cellpose'  # don't encode other params in filename, we have params file
+    else:
+        if seed_params.gSig is not None:  # just leave out of name if default
+            gSig = seed_params.gSig
+            if isinstance(gSig, int) or not hasattr(gSig, '__len__'):
+                gSig = [gSig]
+            else:
+                gSig = list(gSig)
+            Ain_name += '_gSig_' + ','.join(str(gs) for gs in gSig)
 
-    if seed_params.blur_gSig_multiple is not None:
-        Ain_name += f'_blurmult_{seed_params.blur_gSig_multiple:.2f}'
+        if seed_params.blur_gSig_multiple is not None:
+            Ain_name += f'_blurmult_{seed_params.blur_gSig_multiple:.2f}'
     return Ain_name
 
 
@@ -155,10 +160,9 @@ class SessionAnalysis:
                    'mc_result', 'mmap_file_transposed', 'cnmf_fit2_filename', 'cnmf_fit_filename']
 
     def __init__(self, mouse_id: Union[int, str] = 0, sess_id=0, trials_to_include: Optional[Sequence[int]] = None, *,
-                 rec_type='learning_ppc', channel=0, tag: Optional[str] = None, loaded_info: Optional[dict[str, Any]] = None,
+                 rec_type='learning_ppc', tag: Optional[str] = None, loaded_info: Optional[dict[str, Any]] = None,
                  sess_filename: Optional[str] = None, param_overrides: Optional[dict[str, dict[str, Any]]] = None,
-                 downsample_factor: Optional[int] = None, trials_to_exclude: Optional[Sequence[int]] = None,
-                 highpass_cutoff=0.):
+                 downsample_factor: Optional[int] = None, trials_to_exclude: Optional[Sequence[int]] = None):
         """
         Make an object to manage analyzing one session (or part of a session, if trials_to_include is given)
         If loaded_info is not none, ignores all other arguments and constructs from the passed dict.
@@ -221,10 +225,8 @@ class SessionAnalysis:
 
             self.read_metadata()
 
-            self.params = SessionAnalysisParams.from_metadata(
-                metadata=self.metadata, dims=2, downsample_factor=downsample_factor, channel=channel,
-                snr_type=snr_type, highpass_cutoff=highpass_cutoff
-            )
+            self.params = SessionAnalysisParams.defaults(
+                metadata=self.metadata, ndim=2, downsample_factor=downsample_factor, snr_type=snr_type)
 
             # now apply overrides on top of defaults (can ignore invalidation info since we're at the START stage already)
             if mouse_params:
@@ -413,33 +415,33 @@ class SessionAnalysis:
             self._cnmf_changed_flag = True
 
     
-    def process_stage(self, stage: AnalysisStage, load: Optional[bool] = None):
-        """Run or load a given stage of the pipeline"""
+    def process_stage(self, stage: AnalysisStage, load: Optional[bool] = None, save=True):
+        """Run or load a given stage of the pipeline. Save to pkl file if save is True."""
         match stage:
             case AnalysisStage.START:
                 pass
             case AnalysisStage.CONVERT:
-                self.convert_to_tif(load=load)
+                self.convert_to_tif(load=load, save=save)
             case AnalysisStage.MCORR:
-                self.do_mcorr_only(load=load)
+                self.do_mcorr_only(load=load, save=save)
             case AnalysisStage.TRANSPOSE:
-                self.concat_and_transpose(load=load)
+                self.concat_and_transpose(load=load, save=save)
             case AnalysisStage.CNMF:
-                self.do_cnmf(load=load)
+                self.do_cnmf(load=load, save=save)
             case AnalysisStage.EVAL:
                 self.do_cnmf_evaluation(recalc=(load is False))
             case AnalysisStage.FINAL:
                 pass
 
-    def process_up_to_stage(self, stage: AnalysisStage, load: Optional[bool] = None):
+    def process_up_to_stage(self, stage: AnalysisStage, load: Optional[bool] = None, save=True):
         """Run or load pipeline from the last valid stage through the given stage"""
         curr_stage = self.last_valid_stage
         for stage_num in range(curr_stage + 1, stage + 1):
             next_stage = AnalysisStage(stage_num)
-            self.process_stage(next_stage, load=load)
+            self.process_stage(next_stage, load=load, save=save)
 
-    def run_to_end(self):
-        self.process_up_to_stage(AnalysisStage.FINAL)
+    def run_to_end(self, save=True):
+        self.process_up_to_stage(AnalysisStage.FINAL, save=save)
 
 
     def get_nonmatching_params_for_result_file(
@@ -500,31 +502,32 @@ class SessionAnalysis:
             self.invalidate_from_stage(invalid_stage)
 
 
-    def save(self, save_cnmf: Optional[bool] = None):
+    def save(self, save_cnmf: Optional[bool] = None, save_analysis=True):
         if save_cnmf is None:
             save_cnmf = self._cnmf_changed_flag
 
-        if self.sess_filename == '':
-            file_pattern = get_session_analysis_file_pattern(self.mouse_id, self.sess_id, tag=self.tag)  
-            filename = paths.make_timestamped_filename(file_pattern)
-            self.sess_filename = os.path.join(self.data_dir, filename)
+        if save_analysis:
+            if self.sess_filename == '':
+                file_pattern = get_session_analysis_file_pattern(self.mouse_id, self.sess_id, tag=self.tag)
+                filename = paths.make_timestamped_filename(file_pattern)
+                self.sess_filename = os.path.join(self.data_dir, filename)
 
-        logging.info(f'Saving session analysis to {self.sess_filename}')
-        fields_to_skip = ['sess_filename', 'cluster_args', 'cnmf_fit1', 'cnmf_fit2',
-                          'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit', 'tag_base']
-        fields_to_save = {name: val for (name, val) in vars(self).items() if name not in fields_to_skip}
+            logging.info(f'Saving session analysis to {self.sess_filename}')
+            fields_to_skip = ['sess_filename', 'cluster_args', 'cnmf_fit1', 'cnmf_fit2',
+                            'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit', 'tag_base']
+            fields_to_save = {name: val for (name, val) in vars(self).items() if name not in fields_to_skip}
 
-        # relativize paths
-        for field in self.PATH_FIELDS:
-            if field in fields_to_save:
-                fields_to_save[field] = paths.relativize_path(fields_to_save[field])
+            # relativize paths
+            for field in self.PATH_FIELDS:
+                if field in fields_to_save:
+                    fields_to_save[field] = paths.relativize_path(fields_to_save[field])
 
-        with open(self.sess_filename, 'wb') as info_file:
-            pickle.dump(fields_to_save, info_file)
-        
-        # also save params file
-        params_filename = os.path.splitext(self.sess_filename)[0] + '.json'
-        self.params.write_params(params_filename)
+            with open(self.sess_filename, 'wb') as info_file:
+                pickle.dump(fields_to_save, info_file)
+
+            # also save params file
+            params_filename = os.path.splitext(self.sess_filename)[0] + '.json'
+            self.params.write_params(params_filename)
 
         if save_cnmf and self.cnmf_fit is not None and self.cnmf_fit_filename is not None:
             logging.info(f'Saving CNMF to {self.cnmf_fit_filename}')
@@ -555,7 +558,7 @@ class SessionAnalysis:
         return widget.show()
 
 
-    def convert_to_tif(self, load: Optional[bool] = None, **convert_kwargs):
+    def convert_to_tif(self, load: Optional[bool] = None, save=True, **convert_kwargs):
         """
         Concatenate sbx files and convert each plane (by default) or the entire 3D movie to .tif file(s).
         To make sure the frame rate remains mostly correct, if subindices are passed, for each file the
@@ -566,6 +569,8 @@ class SessionAnalysis:
             None: load previous results if params match, otherwise compute anew
             True: load previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results if they already exist.
+
+        save: Whether to save updated paths to TIFs in pkl file (data file will be saved regardless)
         """
         # first update with passed-in params
         self.update_params({'conversion': convert_kwargs})
@@ -628,22 +633,24 @@ class SessionAnalysis:
                     convert_one(filename, plane=i)
         
         self.plane_tifs = tif_filenames
-        self.save(save_cnmf=False)
+        if save:
+            self.save(save_cnmf=False)
 
 
     #-------------------------- MOTION CORRECTION -----------------------------#
 
 
-    def do_mcorr_only(self, load: Optional[bool] = None):
+    def do_mcorr_only(self, load: Optional[bool] = None, save=True):
         """
         Do motion correction. 
         If results are already available, skip unless force is true.
-        Saves the SessionAnalysis object if motion correction is not skipped.
 
         load: Whether to try loading previously-computed results.
             None: load previous results if params match, otherwise compute anew
             True: load previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results if they already exist.
+
+        save: Whether to save new MCResult object in pkl file (data file will be saved regardless)
         """
         if self.plane_tifs is None:
             raise RuntimeError('Must convert to TIF before doing motion correction')
@@ -709,10 +716,11 @@ class SessionAnalysis:
             motion_params=self.params.motion
         )
 
-        self.save(save_cnmf=False)
+        if save:
+            self.save(save_cnmf=False)
     
 
-    def do_motion_correction(self, load: Optional[bool] = None):
+    def do_motion_correction(self, load: Optional[bool] = None, save=True):
         """"
         For convenience/compatibility, do motion correction and transpose in one function.
             
@@ -720,13 +728,15 @@ class SessionAnalysis:
             None: use previous results if params match, otherwise compute anew
             True: use previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results even if they already exist.
+
+        save: Whether to save pkl file (data files will be saved regardless)
         """
         # do motion correction if necessary
         if self.mc_result is None or load is False:
-            self.do_mcorr_only(load=load)
+            self.do_mcorr_only(load=load, save=save)
             assert self.mc_result is not None
 
-        self.concat_and_transpose(load=load)
+        self.concat_and_transpose(load=load, save=save)
 
     
     def apply_motion_correction(self, mc_result: 'mcorr.MCResult', do_transpose=False, force=False):
@@ -822,12 +832,10 @@ class SessionAnalysis:
         if self.mc_result is None:
             raise RuntimeError('Motion correction not run')
 
-        # local import b/c canvas might not be available
-        from .caiman_viz import check_mcorr_nb
         mov_orig, mov_corrected = self.get_original_and_corrected_movies(
             ds_ratio=ds_ratio, xy_ds_ratio=xy_ds_ratio)
 
-        return check_mcorr_nb(mov_orig, mov_corrected, self.mc_result)
+        return caiman_viz.check_mcorr_nb(mov_orig, mov_corrected, self.mc_result)
     
     
     def save_mc_comparison_movie(self, ds_ratio=5, xy_ds_ratio=1, compress=0):
@@ -856,7 +864,7 @@ class SessionAnalysis:
             fig.suptitle(f'Mouse {self.mouse_id}, session {self.sess_id}{tagstr}, {type_label}')
 
             for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
-                plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected)
+                plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected, from_transposed=False)
 
                 for k_plane, plane_proj in enumerate(plane_projs):
                     ax: Axes = axs[k_plane]
@@ -894,7 +902,7 @@ class SessionAnalysis:
 
     # ------------------------------- PLANE CONCATENATION/TRANSPOSITION ------------------------#
 
-    def concat_and_transpose(self, load: Optional[bool] = None):
+    def concat_and_transpose(self, load: Optional[bool] = None, save=True):
         """
         Concatenate motion-corrected planes and convert to C-order for CNMF.
         Also does blurring and high-pass filtering steps if requested.
@@ -903,6 +911,8 @@ class SessionAnalysis:
             None: use previous results if params match, otherwise compute anew
             True: use previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results even if they already exist.
+
+        save: Whether to save updated path to mmap file in pkl file (data file will be saved regardless)
         """
         if self.mc_result is None:
             raise RuntimeError('Must do motion correction before concatenating/transposing planes')
@@ -910,52 +920,78 @@ class SessionAnalysis:
         self.mmap_file_transposed = mcorr.do_or_load_transpose(
             self.mc_result, self.params, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview, load=load
         )
-        self.save(save_cnmf=False)
+
+        if save:
+            self.save(save_cnmf=False)
 
 
     #------------------------------------ SUMMARY IMAGES ----------------------------------------#
 
 
-    def make_projection(self, proj_type: str, blur_kernel_size: Optional[int] = None, motion_corrected=True) -> np.ndarray:
+    def make_projection(
+        self, proj_type: str, blur_kernel_size: Optional[int] = None, motion_corrected=True, from_transposed=True) -> np.ndarray:
         """
         Make correlation image or {mean/std/max}-projection
         If blur_kernel_size > 1, do gaussian blur on a downsampled copy of the movie before computing projection
             (defaults to the same as what is in the transpose params if motion_corrected=True, else 1)
-        Because it uses the transposed file, setting motion_corrected=True also includes the high-pass filter if any.
+        If from_transposed and motion_corrected are True, also includes the high-pass filter & other transposition processing steps if any.
+            If motion_corrected is False, from_transposed has no effect.
         """
         if motion_corrected:
             if self.mc_result is None:
                 raise RuntimeError('Motion correction not run')
+
+            if from_transposed:
+                curr_trans_params = self.params.transposition
+                if blur_kernel_size is None:
+                    blur_kernel_size = curr_trans_params.blur_kernel_size
+
+                blur_matches_params = blur_kernel_size == curr_trans_params.blur_kernel_size
+                # if mean, it's a linear projection; we can blur after projecting if the initial projection has no blur
+                post_blur = proj_type == 'mean' and curr_trans_params.blur_kernel_size == 1 and not blur_matches_params
+
+                if blur_matches_params or post_blur:
+                    if self.mmap_file_transposed is None:
+                        # move forward with the transpose step
+                        self.concat_and_transpose()
+                        assert self.mmap_file_transposed is not None
+                    mov_or_filename = self.mmap_file_transposed
+
+                else:  # do a one-off transposition for this call
+                    trans_params = curr_trans_params.replace(blur_kernel_size=blur_kernel_size)
+                    params_copy = copy(self.params)
+                    params_copy.transposition = trans_params
+
+                    mov_or_filename = mcorr.do_or_load_transpose(
+                        self.mc_result, params_copy, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview
+                    )
+
+                if proj_type == 'corr':
+                    proj = make_correlation_parallel(mov_or_filename, cluster.dview)
+                else:
+                    ignore_nan = self.params.motion.border_nan is True
+                    proj = make_projection_parallel(mov_or_filename, proj_type, cluster.dview, ignore_nan=ignore_nan)
             
-            curr_trans_params = self.params.transposition
-            if blur_kernel_size is None:
-                blur_kernel_size = curr_trans_params.blur_kernel_size
-
-            blur_matches_params = blur_kernel_size == curr_trans_params.blur_kernel_size
-            # if mean, it's a linear projection; we can blur after projecting if the initial projection has no blur
-            post_blur = proj_type == 'mean' and curr_trans_params.blur_kernel_size == 1 and not blur_matches_params
-
-            if blur_matches_params or post_blur:
-                if self.mmap_file_transposed is None:
-                    # move forward with the transpose step
-                    self.concat_and_transpose()
-                    assert self.mmap_file_transposed is not None
-                mov_or_filename = self.mmap_file_transposed
-
-            else:  # do a one-off transposition for this call
-                trans_params = curr_trans_params.replace(blur_kernel_size=blur_kernel_size)
-                params_copy = copy(self.params)
-                params_copy.transposition = trans_params
-
-                mov_or_filename = mcorr.do_or_load_transpose(
-                    self.mc_result, params_copy, fr=self.sample_rate, metadata=self.metadata, dview=cluster.dview
-                )                
-
-            if proj_type == 'corr':
-                proj = make_correlation_parallel(mov_or_filename, cluster.dview)
             else:
+                if blur_kernel_size is None:
+                    blur_kernel_size = 1
+
+                if blur_kernel_size > 1 and proj_type != 'mean':
+                    raise NotImplementedError('Blurring not supported for non-transposed movie (except for mean projection)')
+
+                post_blur = blur_kernel_size > 1
+
+                # do each pre-transposition/concatenation plane individually
+                plane_projs: list[np.ndarray] = []
                 ignore_nan = self.params.motion.border_nan is True
-                proj = make_projection_parallel(mov_or_filename, proj_type, cluster.dview, ignore_nan=ignore_nan)
+
+                for plane_mmap in self.mc_result.mmap_files:
+                    if proj_type == 'corr':
+                        plane_projs.append(make_correlation_parallel(plane_mmap, cluster.dview))
+                    else:
+                        plane_projs.append(make_projection_parallel(plane_mmap, proj_type, cluster.dview, ignore_nan=ignore_nan))
+
+                proj = np.concatenate(plane_projs, axis=1)
         else:
             if self.plane_tifs is None:
                 raise RuntimeError('Conversion to TIF not run')
@@ -1033,27 +1069,30 @@ class SessionAnalysis:
             return [BorderSpec.equal(0)] * len(self.plane_tifs)
 
 
-    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True) -> np.ndarray:        
-        if blur_kernel_size > 1:
-            logging.info('Cannot pull from mesmerize (blur_kernel_size > 1)')
-        elif not motion_corrected or proj_type not in ['corr', 'mean', 'std', 'max']:
-            pass
-        else:
-            try:
-                return self.load_projection_from_result(proj_type=proj_type)[0]
-            except NoMatchingResultError:
-                logging.info('No matching mesmerize items - computing projection anew')
+    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True, from_transposed=True) -> np.ndarray:
+        if motion_corrected and from_transposed and proj_type in ('corr', 'mean', 'std', 'max'):
+            # try loading from mesmerize
+            if blur_kernel_size > 1:
+                logging.info('Cannot pull from mesmerize (blur_kernel_size > 1)')
+            else:
+                try:
+                    return self.load_projection_from_result(proj_type=proj_type)[0]
+                except NoMatchingResultError:
+                    logging.info('No matching mesmerize items - computing projection anew')
 
-        return self.make_projection(proj_type, blur_kernel_size=blur_kernel_size, motion_corrected=motion_corrected)
+        return self.make_projection(
+            proj_type, blur_kernel_size=blur_kernel_size, motion_corrected=motion_corrected, from_transposed=from_transposed)
 
         
-    def get_projection_for_seed(self, type='mean', motion_corrected=True, blur_size=1, norm_medw: Optional[int] = None,
-                                borders: Optional[list[BorderSpec]] = None, **seed_params_extra) -> tuple[np.ndarray, dict]:
+    def get_projection_for_seed(
+        self, type='mean', motion_corrected=True, from_transposed=True, blur_size=1, norm_medw: Optional[int] = None,
+        borders: Optional[list[BorderSpec]] = None, **seed_params_extra) -> tuple[np.ndarray, dict]:
         """
         Make 2D projection image to use for making seed with given params.
         Returns the projection along with any unused params
         """
-        proj = self.get_projection(proj_type=type, blur_kernel_size=blur_size, motion_corrected=motion_corrected)
+        proj = self.get_projection(
+            proj_type=type, blur_kernel_size=blur_size, motion_corrected=motion_corrected, from_transposed=from_transposed)
 
         if borders is None:
             borders = self.get_borders(motion_corrected=motion_corrected)
@@ -1065,11 +1104,13 @@ class SessionAnalysis:
         return proj, seed_params_extra
     
 
-    def get_plane_projections(self, projection_params: Union[str, dict], motion_corrected=True, exclude_border=True) -> list[np.ndarray]:
+    def get_plane_projections(
+        self, projection_params: Union[str, dict], motion_corrected=True, from_transposed=True, exclude_border=True) -> list[np.ndarray]:
         if isinstance(projection_params, str):
             projection_params = {'type': projection_params}
 
-        proj, seed_params_extra = self.get_projection_for_seed(motion_corrected=motion_corrected, **projection_params)
+        proj, seed_params_extra = self.get_projection_for_seed(
+            motion_corrected=motion_corrected, from_transposed=from_transposed, **projection_params)
         borders: list[BorderSpec] = seed_params_extra['borders']
 
         plane_projs = np.split(proj, len(borders), axis=1)
@@ -1144,7 +1185,7 @@ class SessionAnalysis:
         patch_ax.set_title(f'width={patch_width}\noverlap={patch_overlap}')
     
 
-    def do_cnmf(self, load: Optional[bool] = None) -> None:
+    def do_cnmf(self, load: Optional[bool] = None, save=True) -> None:
         """
         Do or load CNMF.
 
@@ -1152,9 +1193,11 @@ class SessionAnalysis:
             None: use previous results if params match, otherwise compute anew
             True: use previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results even if they already exist.
+
+        save: Whether to save updated cnmf results path in pkl file (data file will be saved regardless)
         """
         uuid, _ = self.start_cnmf_with_mescore(load=load, backend='local', wait=True)
-        self.finish_cnmf_processing(uuid)
+        self.finish_cnmf_processing(uuid, save=save)
 
 
     def start_cnmf_with_mescore(self, load: Optional[bool] = None, backend='local_async', wait=False,
@@ -1245,14 +1288,32 @@ class SessionAnalysis:
 
         if seed_params.type != 'none':
             # actually make and save seed
-            seed_param_dict = asdict(seed_params)
-            # fill in default value of gSig
-            if seed_param_dict['gSig'] is None:
-                seed_param_dict['gSig'] = params_obj.init.gSig[0]
-
-            proj, seed_params_extra = self.get_projection_for_seed(**seed_param_dict)
+            proj, seed_params_extra = self.get_projection_for_seed(
+                type=seed_params.type, blur_size=seed_params.blur_size, norm_medw=seed_params.norm_medw, borders=seed_params.borders)
             np.save(output_dir / 'projection_for_seed.npy', proj)
-            Ain = footprints.make_spatial_seed_from_projection(proj, seed_params_extra)
+
+            if seed_params.use_cellpose:
+                cellparams = seed_params.cellpose_params
+                logging.info('Making spatial seed using cellpose')
+
+                use_gpu = torch.cuda.is_available()
+                if not use_gpu:
+                    logging.warning('GPU not available for torch (when running cellpose)')
+
+                model = cellpose.models.CellposeModel(gpu=use_gpu, **cellparams.get_constructor_params())
+                masks, _, _ = model.eval(proj, **cellparams.get_eval_params())
+                Ain = footprints.make_spatial_seed_from_masks(masks)
+
+            else:  # use my_extract_binary_masks_from_structural_channel
+                for extract_param in ('gSig', 'blur_type', 'blur_gSig_multiple', 'min_area_size', 'min_hole_size', 'expand_method', 'selem'):
+                    seed_params_extra[extract_param] = getattr(seed_params, extract_param)
+
+                # fill in default value of gSig
+                if seed_params_extra['gSig'] is None:
+                    seed_params_extra['gSig'] = params_obj.init.gSig[0]
+
+                Ain = footprints.make_spatial_seed_from_projection(proj, seed_params_extra)
+
             np.save(output_dir / f'{Ain_name}.npy', np.array(Ain))  # saves as object array
 
         if 'dview' not in run_args and backend in ['local', 'local_async']:
@@ -1262,15 +1323,17 @@ class SessionAnalysis:
         return uuid, proc
     
 
-    def finish_cnmf_processing(self, finished_or_loaded_cnmf_uuid: str):
+    def finish_cnmf_processing(self, finished_or_loaded_cnmf_uuid: str, save=True):
         """
         Post-processing to do after a mesmerize CNMF run has finished or been loaded,
         to select (load) the run and ensure results match cnmf_extra and eval parameters.
+
+        save: Whether to save selection/params changes to pkl file
         """
         # Load results from mesmerize. We want the params actually used to match current self.params
         # once this method is done.
         target_params = self.params
-        self.select_gridsearch_run(finished_or_loaded_cnmf_uuid, quiet=True)
+        self.select_gridsearch_run(finished_or_loaded_cnmf_uuid, quiet=True, save=save)
         assert self.cnmf_fit is not None, 'cnmf_fit must be assigned if select_gridsearch_run succeeds'
 
         # fix remaining differences
@@ -1310,10 +1373,10 @@ class SessionAnalysis:
 
         if self.downsample_factor is not None:
             assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
-            logging.info(f'Upsampling (interpolating) results by a factor of {self.downsample_factor}')
             self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)
         
-        self.save(save_cnmf=True)
+        if save:
+            self.save(save_cnmf=True)
 
 
     def do_cnmf_gridsearch(self, gridsearch_params: Union[ParamGrid, Sequence[ParamGrid]], wait=True,
@@ -1412,7 +1475,7 @@ class SessionAnalysis:
         if self.mmap_file_transposed is None:
             raise RuntimeError('Cannot do CNMF evaluation without input file (motion correction result)')
 
-        if self.cnmf_fit_filename is None:
+        if self.cnmf_fit_filename is None or self.cnmf_fit is None:
             raise RuntimeError('CNMF fit not found')
         
         if not recalc:  # if the eval params match, no need to redo.
@@ -1423,20 +1486,34 @@ class SessionAnalysis:
                 pass
             else:
                 if self.params.do_params_match(old_eval_params, self.metadata, stage=cmp.AnalysisStage.EVAL):
-                    logging.info('Eval params have not changed - skipping evaluation')
-                    return
+                    
+                    # reload CNMF object if necessary (if eval was previously invalidated)
+                    est = self.cnmf_fit.estimates
+                    if est.idx_components_eval is not None and est.idx_components_bad_eval is not None:
+                        loading_succeeded = True
+                    else:
+                        self._cnmf_fit is None  # trigger reload
+                        if self.cnmf_fit is None:
+                            loading_succeeded = False
+                            logging.warning('Reloading CNMF failed - invalidated from CNMF stage')
+                        else:
+                            est = self.cnmf_fit.estimates
+                            loading_succeeded = est.idx_components_eval is not None and est.idx_components_bad_eval is not None
+
+                    if loading_succeeded:
+                        logging.info('Eval params have not changed - skipping evaluation')
+                        return
 
         new_quality_params = self.params.quality
         snr_type = self.params.eval_extra.snr_type
 
         logging.info('Doing CNMF component evaluation')
-        assert (cnmf_fit := self.cnmf_fit) is not None
         evaluate_cnmf(cnmf_fit, self.mmap_file_transposed, snr_type=snr_type,
                       new_quality_params=new_quality_params.copy(), recalc=recalc, dview=cluster.dview)
 
         # re-save cnmf object with evaluation data added
         logging.info('Re-saving CNMF object with evaluation data')
-        self.save(save_cnmf=True)
+        self.save(save_cnmf=True, save_analysis=False)  # nothing should have changed in SessionAnalysis
 
     
     #--------------------- ACCESSING CNMF RESULTS -----------------------------#
@@ -1492,11 +1569,15 @@ class SessionAnalysis:
 
         for params in params_objs:
             for param_name in param_names:
-                group, key = param_name.split('.')
-                if hasattr(params, group):
-                    val = getattr(getattr(params, group), key)
-                else:  # (for CNMFParams where we don't have all the groups available)
-                    val = "<unknown>"
+                val = params
+                for part in param_name.split('.'):
+                    if hasattr(val, part):
+                        val = getattr(val, part)
+                    else:
+                        # (for CNMFParams where we don't have all the groups available)
+                        val = "<unknown>"
+                        break
+
                 records[param_name].append(val)
 
         records['uuid'] = sub_df.uuid
@@ -1504,7 +1585,7 @@ class SessionAnalysis:
             
 
     def select_gridsearch_run(self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
-                              allow_rerunning_prereqs=False) -> str:
+                              allow_rerunning_prereqs=False, save=True) -> str:
         """
         Select a CNMF gridsearch run by either UUID or index in the dataframe, and make it the current run
         Sets params and prerequisite and CNMF outputs to match the selected run
@@ -1512,6 +1593,8 @@ class SessionAnalysis:
 
         allow_rerunning_prereqs: Set to true to re-compute prerequisites (motion correction, etc.) 
             rather than just loading if outputs matching the saved params are not found (or if it's indeterminate)
+
+        save: Whether to save the selection in the pkl file (including any loaded/re-run data)
         """
         if index is not None and uuid is not None:
             raise ValueError('Cannot specify both uuid and index')
@@ -1575,7 +1658,7 @@ class SessionAnalysis:
         # try loading or running prerequisites to fill in invalidated data
         try:
             load = None if allow_rerunning_prereqs else True
-            self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load)
+            self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load, save=False)
 
         except NoMatchingResultError as e:
             logging.warning(
@@ -1586,6 +1669,10 @@ class SessionAnalysis:
         self.cnmf_fit_filename = cnmf_path
         cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
         self.cnmf_fit = cnmf_fit
+
+        if save:
+            self.save(save_cnmf=False)
+
         return uuid
     
     def select_successful_run(self, quiet=True) -> Optional[str]:
@@ -2014,29 +2101,10 @@ class SessionAnalysis:
         if self.cnmf_fit is None:
             raise RuntimeError('CNMF estimates not found')
         est = self.cnmf_fit.estimates
-        assert est.f is not None and est.b is not None, 'Estimates elements should not be None - has CNMF been run?'
-        
-        n_comps = len(est.f)
-        fig = plt.figure()
-        gs = fig.add_gridspec(2 * n_comps, 1, height_ratios=[3, 1] * n_comps)
-        image_dims = self.cnmf_fit.dims
+        assert est.f is not None and est.b is not None and est.dims is not None, \
+            'Estimates elements should not be None - has CNMF been run?'
 
-        for i, (comp_s, comp_t) in enumerate(zip(est.b.T, est.f)):  # type: ignore
-            im_ax = fig.add_subplot(gs[2*i, 0])
-            im_ax.imshow(
-                comp_s.reshape(image_dims, order='F'), cmap='gray',
-                vmin=np.percentile(comp_s, 10), vmax=np.percentile(comp_s, 99.5))
-            im_ax.set_title(f'Component {i+1}')
-
-            t_ax = fig.add_subplot(gs[2*i+1, 0])
-            t_ax.plot(comp_t, color='k')
-            t_ax.set_xticks([])    
-            t_ax.set_xlabel('Time')
-            t_ax.set_frame_on(False)
-
-        fig.suptitle('Background components')
-        fig.tight_layout()
-        return fig
+        return caiman_viz.plot_background_components(est.f, est.b, dims=est.dims)
 
 
     def show_cnmf_results(self, image_data_options: Optional[list[str]] = None, denoised_temporal=True):
@@ -2064,7 +2132,7 @@ class SessionAnalysis:
         if not denoised_temporal:
             temporal_kwargs['add_residuals'] = True
 
-        viz: 'caiman_viz.CNMFVizWideContainer' = completed_runs.cnmf.viz_wide(
+        viz: caiman_viz.CNMFVizWideContainer = completed_runs.cnmf.viz_wide(
             image_data_options=image_data_options, image_widget_kwargs={'cmap': 'gray'}, n_planes=self.metadata['num_planes'],
             start_index=completed_runs.iloc[start_i].name, temporal_kwargs=temporal_kwargs)
 
@@ -2087,12 +2155,12 @@ class SessionAnalysis:
 
         curr_uuid = self.get_selected_uuid()
         if viz_uuid == curr_uuid:
-            # update params and save - here we don't need to invalidate, since we're just updating it to reflect
-            # the processing that has already been done
-            self.params, _ = self.params.change_params_and_get_stage_to_invalidate(eval_updates, metadata=self.metadata)
-            self.write_params_for_result_file(cnmf_path, cmp.AnalysisStage.EVAL)
+            self.update_params(eval_updates)
+            # trigger reload of CNMF object with new idx_components next time cnmf_fit is accessed
+            self._cnmf_fit = None
 
-            # also save SessionAnalysis & params file, but don't re-save CNMF
+            # save updated params
+            self.write_params_for_result_file(cnmf_path, cmp.AnalysisStage.EVAL)
             self.save(save_cnmf=False)
         else:
             # only write out new params if a params file already exists; otherwise writing to CNMF file is sufficient

@@ -1,4 +1,4 @@
-from collections.abc import Container, Iterator, Sequence, Mapping
+from collections.abc import Container, Iterator, Collection, Sequence, Mapping
 from copy import deepcopy
 from datetime import date
 from enum import IntEnum
@@ -6,19 +6,22 @@ from functools import cache
 import h5py
 from itertools import pairwise
 import json
+import logging
 import os
 from pathlib import Path
-from typing import Optional, Literal, Union, Any, Type, TypeVar, Annotated, cast
+from typing import Optional, Literal, Union, Any, Type, Annotated, cast
 import warnings
 
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
 from caiman.utils.utils import recursively_load_dict_contents_from_group
+from mesmerize_core.caiman_extensions._batch_exceptions import BatchItemNotRunError, BatchItemUnsuccessfulError
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
 from pydantic.dataclasses import dataclass
 from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
+from typing_extensions import Self
 
 from cmcode.util import types, paths
 from cmcode.util.image import BorderSpec
@@ -32,8 +35,6 @@ def list_from_ndarray(obj: Any) -> Any:
 
 ReadNDArray = BeforeValidator(list_from_ndarray)
 
-
-Self = TypeVar('Self', bound='StageParams')
 
 @dataclass(kw_only=True, frozen=True)
 class StageParams:
@@ -62,15 +63,29 @@ class StageParams:
             return set(ta.json_schema(mode='serialization')['properties'].keys())
 
 
-    def get_differing_params(self: Self, other: Self, metadata: dict[str, Any]) -> Iterator[str]:
-        yield from ()
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
         """Find names of parameters that are different between self and other"""
+        for param in self.params():
+            if param in ignore:
+                continue
 
-    def matches(self: Self, other: Self, metadata: dict[str, Any]) -> bool:
+            mine = getattr(self, param)
+            others = getattr(other, param)
+            if isinstance(mine, StageParams):
+                if isinstance(others, type(mine)):
+                    for subparam in mine.get_differing_params(others, metadata):
+                        yield f'{param}.{subparam}'
+                else:
+                    yield param
+            elif not all_same(mine, others):
+                yield param
+
+
+    def matches(self, other: Self, metadata: dict[str, Any]) -> bool:
         """Find whether any parameters differ between self and other"""
         return not any(self.get_differing_params(other, metadata=metadata))
     
-    def replace(self: Self, **replacements) -> Self:
+    def replace(self, **replacements) -> Self:
         """Make copy with replacements; like dataclasses.replace but recursing on other StageParams"""
         ta = TypeAdapter(type(self))
         param_dict = ta.dump_python(self, round_trip=True)
@@ -118,10 +133,10 @@ class ConversionParams(StageParams):
     interp: bool = True
     dead_pix_mode: Union[bool, params.LitStr[Literal['copy', 'min']]] = 'copy'
 
-    def get_differing_params(self, other: 'ConversionParams', metadata: dict[str, Any]) -> Iterator[str]:
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
         """Determine whether loaded params are compatible with current ones"""
         # build list of fields that don't matter for outputs with current settings (or are checked separately)
-        irrelevant_fields = ['chunk_size', 'odd_row_offset', 'odd_row_ndead', 'force_estim_ndead_offset']
+        irrelevant_fields = {'chunk_size', 'odd_row_offset', 'odd_row_ndead', 'force_estim_ndead_offset'}.union(ignore)
 
         other_max_ndead = None if other.odd_row_ndead is None else max(other.odd_row_ndead)
         self_max_ndead = None if self.odd_row_ndead is None else max(self.odd_row_ndead)
@@ -144,22 +159,18 @@ class ConversionParams(StageParams):
         
         if self_max_ndead == 0 and other_max_ndead == 0 and self_offset == 0 and other_offset == 0:
             # no correction to be done, can ignore dead pixel fields
-            irrelevant_fields.extend(['interp', 'dead_pix_mode'])
+            irrelevant_fields |= {'interp', 'dead_pix_mode'}
 
         # if either is None, be permissive, assume that the other was correctly estimated
-        if self_max_ndead is not None and other_max_ndead is not None and self_max_ndead != other_max_ndead:
+        if ('odd_row_ndead' not in ignore and self_max_ndead is not None and 
+            other_max_ndead is not None and self_max_ndead != other_max_ndead):
             yield 'odd_row_ndead'
 
-        if self_offset is not None and other_offset is not None and self_offset != other_offset:
+        if ('odd_row_offset' not in ignore and self_offset is not None and
+            other_offset is not None and self_offset != other_offset):
             yield 'odd_row_offset'
 
-        for param in other.params():
-            if param in irrelevant_fields:
-                continue
-
-            # use all_same to compare without caring about e.g. the sequence type
-            if not all_same(getattr(other, param), getattr(self, param)):
-                yield param
+        yield from super().get_differing_params(other, metadata, ignore=irrelevant_fields)
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -189,14 +200,17 @@ class McorrParamsExtra(StageParams):
         return not self._mcorr_params.motion.pw_rigid
 
 
-    def get_differing_params(self, other: 'McorrParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
         # only care about indices_exclude_fringe if indices are out of date, meaning that
         # matching motion.indices can't be trusted.
+        if 'indices_exclude_fringe' not in ignore:
+            if self.indices_exclude_fringe and not other.indices_exclude_fringe and not self._indices_are_adjusted:
+                yield 'indices_exclude_fringe'
 
-        if self.indices_exclude_fringe and not other.indices_exclude_fringe and not self._indices_are_adjusted:
-            yield 'indices_exclude_fringe'
-        elif other.indices_exclude_fringe and not self.indices_exclude_fringe and not other._indices_are_adjusted:
-            yield 'indices_exclude_fringe'
+            elif other.indices_exclude_fringe and not self.indices_exclude_fringe and not other._indices_are_adjusted:
+                yield 'indices_exclude_fringe'
+
+        yield from super().get_differing_params(other, metadata, ignore={'indices_exclude_fringe', '_indices_are_adjusted'})
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -206,21 +220,51 @@ class TranspositionParams(StageParams):
     highpass_order: int = 4
     add_to_mov: float = 0.
     blur_kernel_size: int = 1  # same as blur_size in SeedParams
+    remove_bg_mean: bool = False  # remove min- and gaussian-filtered mean projection (background estimate)
+    bg_filter_size: int = Field(default=20, gt=1)  # size of square min filter (gaussian sigma is half this)
+    bg_mean_scale: float = 1.  # scalar to multiply by background mean before subtracting
 
-    def get_differing_params(self, other: 'TranspositionParams', metadata: dict[str, Any]) -> Iterator[str]:
-        irrelevant_fields = ['conversion_params', 'highpass_cutoff']
-        if self.highpass_cutoff != other.highpass_cutoff:
-            yield 'highpass_cutoff'
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
+        irrelevant_fields = set(ignore)
+
+        if self.highpass_cutoff == 0 and other.highpass_cutoff == 0:
+            irrelevant_fields.add('highpass_order')
         
-        if self.highpass_cutoff == 0:
-            irrelevant_fields.append('highpass_order')
+        if not self.remove_bg_mean and not other.remove_bg_mean:
+            irrelevant_fields |= {'bg_filter_size', 'bg_mean_scale'}
 
-        for param in self.params():
-            if param in irrelevant_fields:
-                continue
+        yield from super().get_differing_params(other, metadata, ignore=irrelevant_fields)
 
-            if not all_same(getattr(other, param), getattr(self, param)):
-                yield param
+
+@dataclass(kw_only=True, frozen=True)
+class CellposeParams(StageParams):
+    """Params for using cellpose for seed"""
+    # params to constructor
+    pretrained_model: str = 'cpsam'
+    diam_mean: Optional[float] = None
+
+    # params to eval method
+    normalize: Union[bool, dict] = True
+    invert: bool = False
+    rescale: Optional[float] = None
+    diameter: Union[None, float, list[float]] = None
+    flow_threshold: float = 0.8  # modified from cellpose default
+    cellprob_threshold: float = -3.  # modified from cellpose default
+    min_size: Optional[int] = 15
+    max_size_fraction: Optional[float] = 0.4
+    niter: Optional[int] = None
+    augment: bool = False
+    tile_overlap: Optional[float] = 0.1
+
+    @property
+    def _constr_params(self) -> tuple[str, ...]:
+        return ('pretrained_model', 'diam_mean')
+
+    def get_constructor_params(self) -> dict[str, Any]:
+        return {n: getattr(self, n) for n in self.params() if n in self._constr_params}
+
+    def get_eval_params(self) -> dict[str, Any]:
+        return {n: getattr(self, n) for n in self.params() if n not in self._constr_params}
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -240,8 +284,12 @@ class SeedParams(StageParams):
     expand_method: params.LitStr[Literal['closing', 'dilation']] = 'closing'
     selem: params.NDArray = Field(default_factory=lambda: np.ones((3, 3)))
 
+    # if set, uses cellpose instead of my_extract_binary_masks_from_structural_channel
+    use_cellpose: bool = False
+    cellpose_params: CellposeParams = CellposeParams()
+
     @classmethod
-    def infer_from_seed_path(cls, path_to_seed: Union[str, Path]) -> 'SeedParams':
+    def infer_from_seed_path(cls, path_to_seed: Union[str, Path]) -> Self:
         """Infer seed params from deprecated filename encoding, partially based on modification time"""
         mtime = date.fromtimestamp(os.stat(path_to_seed).st_mtime)
         # date when default changed and I did not otherwise save this info
@@ -266,31 +314,39 @@ class SeedParams(StageParams):
             elif key == 'blurmult':
                 seed_params['blur_gSig_multiple'] = float(val)
         return cls(**seed_params)
-    
+
     @classmethod
-    def default(cls, metadata: dict):
+    def default(cls, metadata: dict, use_cellpose=True):
         """Default seed parameters; use empty dict for non-seeded CNMF"""
         _, scale = get_dxy_and_scale(metadata)
         return cls(
             type='mean',
-            norm_medw=25,
+            norm_medw=None if use_cellpose else 25,
             gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
+            use_cellpose=use_cellpose,
+            cellpose_params=CellposeParams()
             )
 
-    def get_differing_params(self, other: 'SeedParams', metadata: dict[str, Any]) -> Iterator[str]:
-        if self.type != 'none' or other.type != 'none':
-            for param in self.params():
-                val1 = getattr(self, param)
-                val2 = getattr(other, param)
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
+        if self.type == 'none' and other.type == 'none':
+            yield from ()
+            return
 
-                if param == 'gSig':
-                    # treat 1-element sequences the same as scalars
-                    val1 = np.atleast_1d(val1)
-                    val2 = np.atleast_1d(val2)
-                    
-                # need to use array_equal because there is an ndarray
-                if not all_same(val1, val2):
-                    yield param
+        if self.use_cellpose and other.use_cellpose:
+            # ignore all params associated with my_extract_binary_masks_from_structural_channel
+            ignore = {
+                'gSig', 'blur_type', 'blur_gSig_multiple', 'min_area_size', 'min_hole_size', 'expand_method', 'selem'
+            }.union(ignore)
+
+        for diff_param in super().get_differing_params(other, metadata, ignore=ignore):
+            if diff_param == 'gSig':
+                # treat 1-element sequences the same as scalars
+                val1 = np.atleast_1d(getattr(self, 'gSig'))
+                val2 = np.atleast_1d(getattr(other, 'gSig'))
+                if all_same(val1, val2):
+                    continue
+
+            yield diff_param
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -299,22 +355,11 @@ class CNMFParamsExtra(StageParams):
     seed_params: SeedParams = SeedParams()
     crossplane_merge_thr: Optional[float] = None
 
-    def get_differing_params(self, other: 'CNMFParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
-        for param in self.seed_params.get_differing_params(
-            other.seed_params, metadata=metadata):
-            yield 'seed_params.' + param
-        if self.crossplane_merge_thr != other.crossplane_merge_thr:
-            yield 'crossplane_merge_thr'
-
 
 @dataclass(kw_only=True, frozen=True)
 class EvalParamsExtra(StageParams):
     """Extra parameters for CNMF evaluation (do not require redoing CNMF)"""
     snr_type: params.LitStr[Literal['normal', 'gamma']] = 'normal'
-
-    def get_differing_params(self, other: 'EvalParamsExtra', metadata: dict[str, Any]) -> Iterator[str]:
-        if self.snr_type != other.snr_type:
-            yield 'snr_type'
 
 
 class AnalysisStage(IntEnum):
@@ -346,11 +391,10 @@ class AnalysisStage(IntEnum):
 
 
 # recursive models for serializing/deserializing parameters for each stage
-SelfPS = TypeVar('SelfPS', bound='ParamStruct')
 
 class ParamStruct(BaseModel):
     @classmethod
-    def read_from_file(cls: Type[SelfPS], path: Union[str, Path]) -> SelfPS:
+    def read_from_file(cls, path: Union[str, Path]) -> Self:
         with open(path, mode='r') as file:
             data = file.read()
         return cls.model_validate_json(data)
@@ -468,7 +512,8 @@ class ConvertParamStruct(ParamStruct):
 
 UpToConvertParamStruct = ConvertParamStruct
 
-class McorrParamStruct(ParamStruct):
+class McorrParamStruct(ParamStruct, validate_assignment=True):
+    # validate assignment so the validator below runs whenever mcorr_extra is reassigned
     motion: params.MotionParams
     mcorr_extra: McorrParamsExtra
 
@@ -569,33 +614,24 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         return obj
 
     @classmethod
-    def from_metadata(
-        cls, metadata: dict, dims: int, tif_file: Optional[str] = None, channel=0, odd_row_offset: Optional[int] = None,
-        odd_row_ndead: Optional[list[int]] = None, crop: BorderSpec = BorderSpec(), downsample_factor: Optional[int] = None,
-        extra_conversion_params: Optional[dict[str, Any]] = None, seed_params: Optional[dict[str, Any]] = None,
-        snr_type: Optional[Literal['normal', 'gamma']] = None, crossplane_merge_thr: Optional[float] = 0.7,
-        highpass_cutoff: float = 0, highpass_order=4, add_to_mov=0
-        ) -> 'SessionAnalysisParams':
-        """Constructor that makes CNMFParams based on other params (ensuring it is consistent)"""
-        if extra_conversion_params is None:
-            extra_conversion_params = {}
-
-        if seed_params is None:
-            seed = SeedParams.default(metadata)
-        else:
-            seed = SeedParams(**seed_params)
-
+    def defaults(
+        cls, metadata: dict, ndim: int, tif_file: Optional[str] = None, downsample_factor: Optional[int] = None,
+        snr_type: Optional[Literal['normal', 'gamma']] = None) -> 'SessionAnalysisParams':
+        """
+        Constructor that makes CNMFParams based on other params (ensuring it is consistent)
+        When called with just required arguments, this makes an object with the current defaults,
+        as opposed to the normal constructor which always uses the values for new params that reproduce
+        behavior from before those params were introduced.
+        """
         if snr_type is None:
             snr_type = 'gamma'
 
         return cls.from_cnmf_params(
-            conversion=ConversionParams(
-                channel=channel, odd_row_offset=odd_row_offset, odd_row_ndead=odd_row_ndead, crop=crop,
-                downsample_factor=downsample_factor, **extra_conversion_params),
-            transposition=TranspositionParams(highpass_cutoff=highpass_cutoff, highpass_order=highpass_order, add_to_mov=add_to_mov),
+            conversion=ConversionParams(downsample_factor=downsample_factor),
+            transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True),
             cnmf=make_cnmf_params(
-                metadata, dims=dims, tif_file=tif_file, snr_type=snr_type, downsample_factor=downsample_factor),
-            cnmf_extra=CNMFParamsExtra(seed_params=seed, crossplane_merge_thr=crossplane_merge_thr),
+                metadata, ndim=ndim, tif_file=tif_file, snr_type=snr_type, downsample_factor=downsample_factor),
+            cnmf_extra=CNMFParamsExtra(seed_params=SeedParams.default(metadata), crossplane_merge_thr=0.7),
             eval_extra=EvalParamsExtra(snr_type=snr_type)
         )
 
@@ -619,8 +655,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
 
     # Updating, safely
     def change_params_and_get_stage_to_invalidate(
-            self, changes: Mapping[str, dict[str, Any]], metadata: dict[str, Any]
-            ) -> tuple['SessionAnalysisParams', Optional[AnalysisStage]]:
+            self, changes: Mapping[str, dict[str, Any]], metadata: dict[str, Any]) -> tuple[Self, Optional[AnalysisStage]]:
         """
         Make a copy with new parameters, and also return which analysis stage should be invalidated
         to ensure we are using these new parameters in future operations (if any).
@@ -671,7 +706,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             if invalid_stage is None and not self.do_params_match(new_params, metadata=metadata, stage=stage, ignore_prereq_stages=True):
                 invalid_stage = stage
 
-        # update self.<cnmf_group> to refer to self._cnmf.<cnmf_group>
+        # update new_params.<cnmf_group> to refer to new_params._cnmf.<cnmf_group>
         # this could be done automatically with a property maybe, but I think for now this is cleaner
         # to also allow the class to be instantiated by pydantic from a combined nested dict.
         new_params._update_refs_to_cnmf_params()
@@ -683,7 +718,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
 
     
     def change_from_cnmf_h5_and_get_stage_to_invalidate(
-        self, path_hdf5: Union[Path, str], metadata: dict[str, Any]) -> tuple['SessionAnalysisParams', Optional[AnalysisStage]]:
+        self, path_hdf5: Union[Path, str], metadata: dict[str, Any]) -> tuple[Self, Optional[AnalysisStage]]:
         """
         Make a copy that is updated to match those saved along with a CNMF run in the HDF5 results file
         (used if full params were not saved in an accompanying JSON flie)
@@ -719,7 +754,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         return run_params
 
 
-    def copy_with_mesmerize_run_differences(self) -> 'SessionAnalysisParams':
+    def copy_with_mesmerize_run_differences(self) -> Self:
         """
         Return a copy with changes to reflect the parameters used during a mesmerize-core run,
         before finish_cnmf_processing is called.
@@ -782,7 +817,7 @@ quality_params = {
 }
 
 
-def make_cnmf_params(metadata: dict, dims: int, tif_file: Optional[str] = None,
+def make_cnmf_params(metadata: dict, ndim: int, tif_file: Optional[str] = None,
                      snr_type: Literal['normal', 'gamma'] = 'gamma', downsample_factor: Optional[int] = None) -> params.CNMFParams:
     p = 1     # order of the autoregressive system (set p=2 if there is visible rise time in data)
     dxy, scale = get_dxy_and_scale(metadata)    
@@ -803,15 +838,16 @@ def make_cnmf_params(metadata: dict, dims: int, tif_file: Optional[str] = None,
         # motion correction parameters
         'motion': {
             # start a new patch for pw-rigid motion correction every x pixels
-            'strides': (48, 48, metadata['num_planes'])[:dims],
-            'overlaps': (24, 24, 0)[:dims],     # overlap between patches (width of patch = strides+overlaps)
-            'max_shifts': (round(15 * scale), round(15 * scale), 0)[:dims],   # maximum allowed rigid shifts (in pixels)
+            'strides': (48, 48, metadata['num_planes'])[:ndim],
+            'overlaps': (24, 24, 0)[:ndim],     # overlap between patches (width of patch = strides+overlaps)
+            'max_shifts': (round(15 * scale), round(15 * scale), 0)[:ndim],   # maximum allowed rigid shifts (in pixels)
             'max_deviation_rigid': round(10 * scale),  # maximum shifts deviation allowed for patch with respect to rigid shifts
             'pw_rigid': True,                   # flag for performing non-rigid motion correction
-            'is3D': dims == 3,
-            'indices': (slice(None),) * dims,
+            'is3D': ndim == 3,
+            'indices': (slice(None),) * ndim,
             'border_nan': 'copy',
-            'shifts_interpolate': True
+            'shifts_interpolate': True,
+            'nonneg_movie': False  # should already be nonnegative coming from scanbox - avoid offsetting output
         },
         
         'preprocess': {
@@ -885,11 +921,7 @@ def round_to_odd(x: Union[float, np.ndarray]):
 def load_params_from_cnmf_h5(path_hdf5: Union[Path, str]) -> params.CNMFParams:
     """Load just params from CNMF HDF5 file"""
     path_bytes = os.fsencode(path_hdf5)
-    try:
-        valid_hdf5 = h5py.h5f.is_hdf5(path_bytes)
-    except FileNotFoundError:
-        valid_hdf5 = False
-    if not valid_hdf5:
+    if not h5py.h5f.is_hdf5(path_bytes):
         raise ValueError(f'Cannot load params from {path_hdf5} - not a valid HDF5 file')
 
     with h5py.File(path_hdf5, 'r') as h5file:
@@ -902,14 +934,25 @@ def load_params_from_cnmf_h5(path_hdf5: Union[Path, str]) -> params.CNMFParams:
 
 def load_params_from_batch_item(item: pd.Series) -> Union[SessionAnalysisParams, params.CNMFParams]:
     """
-    Load params used for this batch item, either from the full params JSON file (if saved)
-    or from the params saved with the CNMF run.
+    Load params used for this batch item, either from the full params JSON file (if saved),
+    the params saved with the CNMF run, or if the run was unsuccessful, the params column of the batch table.
     """
     item = cast(types.MescoreSeries, item)
-    cnmf_path = str(item.cnmf.get_output_path())
+    # get output path without relying on the run having completed
+    batch_path = item.paths.get_batch_path()
+    output_dir = batch_path.parent / item.uuid
+    cnmf_path = output_dir / f'{item.uuid}.hdf5'
     params_path = paths.params_file_for_result(cnmf_path)
 
     try:
         return SessionAnalysisParams.read_from_file(params_path)
     except FileNotFoundError:
+        logging.debug('Params JSON file not found - falling back to CNMF HDF5 file')
+
+    # next try loading params from HDF5 file
+    try:
         return load_params_from_cnmf_h5(cnmf_path)
+    except FileNotFoundError:
+        logging.debug('CNMF HDF5 file not found - falling back to params saved in batch item')
+    
+    return params.CNMFParams(params_dict=item.params['main'])

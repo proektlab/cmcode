@@ -282,6 +282,28 @@ def make_spatial_seed_from_projection(proj: onp.Array2D[np.floating], seed_param
     return sparse.block_diag(Ain_planes, format='csc')  # type: ignore
 
 
+def make_spatial_seed_from_masks(masks: onp.Array2D[np.integer]) -> sparse.csc_array[np.bool_]:
+    """Convert an image of labels (0 = background, >= 1 = specific ROI) to a binary spatial seed"""
+    masks_flat = masks.ravel(order='F')
+    filled_pixels = np.flatnonzero(masks_flat)
+    comp_nums = masks_flat[filled_pixels] - 1  # now 0 to n_comps-1
+
+    # make coordinate array 
+    coo_data = np.ones(len(filled_pixels), dtype=bool)
+    coords = (filled_pixels, comp_nums)
+    seed = sparse.coo_array((coo_data, coords), (len(masks_flat), int(np.max(masks_flat))))
+    return seed.tocsc()
+
+
+def plot_masks(masks: onp.Array2D[np.integer], background: Optional[onp.Array2D[np.floating]] = None):
+    """Plot an image of ROI labels as a contour map on top of a background image"""
+    fig, ax = plt.subplots()
+    if background is not None:
+        ax.imshow(background)
+    ax.contourf(masks, levels=np.arange(0.5, np.max(masks)+0.5), colors=[f'C{i}' for i in range(10)], alpha=0.4)
+    return fig
+
+
 def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[float], np.ndarray], n_border_points,
                                    z_border: float = 20, min_total_points=0) -> tuple[np.ndarray, np.ndarray]:
     """

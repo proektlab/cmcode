@@ -19,13 +19,13 @@ from caiman.paths import decode_mmap_filename_dict, memmap_frames_filename
 from caiman.source_extraction.cnmf.params import MotionParams
 import cv2
 import holoviews as hv
-from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel
+from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel, make_projection_parallel
 from mesmerize_core.utils import Border
 import numpy as np
 import optype.numpy as onp
+import scipy.ndimage as ndi
 from suite2p.registration.metrics import get_pc_metrics
 import torch
-from torch.cuda import is_available
 
 from cmcode import caiman_analysis as cma, caiman_params as cmp
 from cmcode.util import paths
@@ -53,7 +53,7 @@ class MCResult(paths.CustomPathMappable):
     shifts_els: Optional[list[onp.Array3D]] = None
     dims: Optional[tuple[int, int]] = None
     motion_params: Optional[MotionParams] = None
-    mmap_file_transposed: Optional[str] = None  # deprecated, keep for unpickling
+    mmap_file_transposed: Optional[str] = field(default=None, repr=False)  # deprecated, keep for unpickling
 
     # cached datasets
     _shifts_rig_hv: Optional[hv.Dataset] = field(init=False, default=None)
@@ -271,20 +271,6 @@ def _build_motion_correct_path(filepath: str, is_piecewise=True, with_dt=False) 
     return Path(fname_tot)
 
 
-def _make_hardlink_with_dt(file_path: str) -> str:
-    """
-    Make a hard link to the given file with the current date/time added before the extension.
-    This is used to help do potentially multiple versions of motion correction from a single
-    TIF file, since MotionCorrect doesn't support saving the mmap file with a different name.
-    """
-    start, ext = os.path.splitext(file_path)
-    path_template = start + '_%dt' + ext
-    dir, name_template = os.path.split(path_template)
-    link_path = os.path.join(dir, paths.make_timestamped_filename(name_template))
-    os.link(src=file_path, dst=link_path)
-    return link_path
-
-
 @contextmanager
 def set_output_location(output_path: Union[str, Path]) -> Generator[None, None, None]:
     """
@@ -402,23 +388,22 @@ def load_mcorr_result(mmap_path: str) -> PlaneMcorrResult:
 def motion_correct_file(tif_file: str, motion_params: MotionParams, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
     """Runs motion correction on the given file (does not attempt to load)"""
     # First, make a link to the tif_file with the current date, so that the mmap file will have it too
-    tif_file_link = _make_hardlink_with_dt(tif_file)
+    with paths.linked_timestamped_path(tif_file) as tif_file_link:
+        # Get path to output file we want to be created in the mcorr folder
+        expected_file = _build_motion_correct_path(tif_file_link, is_piecewise=motion_params.pw_rigid)
 
-    # Get path to output file we want to be created in the mcorr folder
-    expected_file = _build_motion_correct_path(tif_file_link, is_piecewise=motion_params.pw_rigid)
-
-    # whether to first fit to subwindow and then apply to whole movie
-    with set_output_location(expected_file):
-        mcorr_obj = MotionCorrect(tif_file_link, **motion_params, dview=dview)
-        # if we have indices, first compute using indices, then apply to the original movie.
-        if any(s != slice(None) for s in motion_params.indices):
-            mcorr_obj.motion_correct(save_movie=False)
-            actual_file = apply_mcorr_to_file(mcorr_obj, tif_file_link)
-            if expected_file != actual_file:
-                logging.debug(f'apply_mcorr_to_file expected to save to {expected_file}, but saved to {actual_file} instead')
-        else:
-            mcorr_obj.motion_correct(save_movie=True)
-            actual_file = expected_file
+        # whether to first fit to subwindow and then apply to whole movie
+        with set_output_location(expected_file):
+            mcorr_obj = MotionCorrect(tif_file_link, **motion_params, dview=dview)
+            # if we have indices, first compute using indices, then apply to the original movie.
+            if any(s != slice(None) for s in motion_params.indices):
+                mcorr_obj.motion_correct(save_movie=False)
+                actual_file = apply_mcorr_to_file(mcorr_obj, tif_file_link)
+                if expected_file != actual_file:
+                    logging.debug(f'apply_mcorr_to_file expected to save to {expected_file}, but saved to {actual_file} instead')
+            else:
+                mcorr_obj.motion_correct(save_movie=True)
+                actual_file = expected_file
 
     # extract shifts
     shifts_rig = np.array(mcorr_obj.shifts_rig).T  # transpose to dims x frames
@@ -449,9 +434,8 @@ def motion_correct_file(tif_file: str, motion_params: MotionParams, dview: Optio
 
 def apply_mcorr_to_file(mcorr_obj: MotionCorrect, input_file: str) -> Path:
     """Apply shifts from a MotionCorrect object to the given input file (returns output filename)"""
-    # First, make a link to the tif_file with the current date, so that the mmap file will have it too
-    file_link = _make_hardlink_with_dt(input_file)
-    basename = _build_motion_correct_basename(file_link, is_piecewise=mcorr_obj.pw_rigid)
+    tif_path_with_timestamp = paths.add_timestamp_to_path(input_file)
+    basename = _build_motion_correct_basename(tif_path_with_timestamp, is_piecewise=mcorr_obj.pw_rigid)
 
     saved_file = mcorr_obj.apply_shifts_movie(
         input_file, save_memmap=True, save_base_name=basename, remove_min=False)
@@ -487,12 +471,22 @@ def get_transposed_mmap_name(orig_mmap_names: list[str], trans_params: cmp.Trans
         extra_param_strings.append(f'blur{trans_params.blur_kernel_size}')
 
     if trans_params.highpass_cutoff != 0:
-        extra_param_strings.append(f'highpass{trans_params.highpass_cutoff:g}')      
+        extra_param_strings.append(f'highpass{trans_params.highpass_cutoff:g}')
+     
         if trans_params.highpass_order != 4:  # only relevant if we are doing highpass filter
             extra_param_strings.append(f'order{trans_params.highpass_order}')
     
     if trans_params.add_to_mov != 0:
         extra_param_strings.append(f'add{trans_params.add_to_mov:g}')
+
+    if trans_params.remove_bg_mean:
+        extra_param_strings.append('bgremoved')
+
+        if trans_params.bg_filter_size != 20:  # only relevant if background-remove step is on
+            extra_param_strings.append(f'filtersize{trans_params.bg_filter_size}')
+        
+        if trans_params.bg_mean_scale != 1.:
+            extra_param_strings.append(f'scale{trans_params.bg_mean_scale:g}')
 
     if len(extra_param_strings) > 0:
         # insert strings for non-default params into filename
@@ -551,6 +545,24 @@ def blurred_movies(input_mmap_files: list[str], ksize=1) -> Generator[list[str],
             os.remove(path)         
 
 
+def get_background_estimate(
+    plane_mmap_path: str, border: BorderSpec, filter_size: int, return_center_only=True,
+    dview: Optional[Cluster] = None) -> onp.Array2D[np.floating]:
+    """Make estimate of local background level based on min-filtering the mean projection"""
+    # get mean projection
+    plane_mean = make_projection_parallel(plane_mmap_path, 'mean', dview=dview)
+    slices = border.slices(plane_mean.shape)
+    center = plane_mean[slices]
+    center_filtered = ndi.minimum_filter(center, filter_size)
+    center_filtered = ndi.gaussian_filter(center_filtered, filter_size // 2)
+    if return_center_only:
+        return center_filtered
+    else:
+        filtered = np.zeros_like(plane_mean)
+        filtered[slices] = center_filtered
+        return filtered
+
+
 def transpose_flatten_mc_mmap(
         mc_result: MCResult, trans_params: cmp.TranspositionParams, fr: float,
         dview: Optional[Cluster] = None) -> str:
@@ -593,11 +605,19 @@ def transpose_flatten_mc_mmap(
 
         for k_plane, input_path in enumerate(mmap_files):
             byte_offset = pixels_per_plane * k_plane * bytes_per_pixel * T
+            
             # use plane-specific border if possible
             if mc_result.border_asym is not None:
-                border = cast(Border, asdict(mc_result.border_asym[k_plane]))
+                border_spec = mc_result.border_asym[k_plane]
             else:
-                border = mc_result.border_to_0
+                border_spec = BorderSpec.equal(mc_result.border_to_0)
+
+            if trans_params.remove_bg_mean:
+                filter_size = trans_params.bg_filter_size
+                bg_mean_center = get_background_estimate(input_path, border_spec, filter_size, dview=dview)
+                add_to_movie = add_to_movie - trans_params.bg_mean_scale * bg_mean_center
+
+            border = cast(Border, asdict(border_spec))
 
             save_c_order_mmap_parallel(
                 movie_path=input_path,

@@ -1,19 +1,17 @@
 """
 Functions for doing grid searches of parameters using mesmerize-core
 """
-from copy import deepcopy
 from itertools import product
 import os
 from pathlib import Path
 from typing import Any, Optional, Iterable, Union, Mapping, Sequence, cast
 
-import pandas as pd
 import matplotlib.pyplot as plt
 
 from mesmerize_core.caiman_extensions.common import Waitable
 
 from cmcode import caiman_analysis as cma, caiman_params as cmp, cmcustom
-from cmcode.util import types, paths
+from cmcode.util import types
 
 
 ParamGrid = Mapping[tuple[str, str], Iterable]

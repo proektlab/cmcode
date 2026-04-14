@@ -42,10 +42,9 @@ from mesmerize_core import MCorrExtensions, CaimanSeriesExtensions
 from mesmerize_viz._cnmf import CNMFVizContainer, CNMFDataFrameVizExtension, EvalController
 
 import cmcode
-from cmcode import caiman_analysis as cma, alignment
+from cmcode import caiman_analysis as cma, alignment, mcorr
 from cmcode.cnmf_ext import CNMFExt, MetricInfo, clear_cnmf_cache
 from cmcode.cmcustom import my_get_contours, my_plot_contours, compute_matching_performance
-from cmcode.mcorr import MCResult
 from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_xy,
                                     map_footprints, maxproj_per_cell, footprint_interpolator_per_cell)
 from cmcode.util.image import remap_image, make_merge, BorderSpec, preprocess_proj_for_seed
@@ -825,7 +824,7 @@ class patch_shift_mag_and_angle(Operation):
             )
 
 
-def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: MCResult,
+def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: 'mcorr.MCResult',
                    show_quiver_plot=False):
     # make upper figure with histograms of mcorr shifts
     shifts_rig_ds = mc_result.shifts_rig_hv
@@ -1820,3 +1819,35 @@ def make_plots_taller(plots: VBox, new_max_height = 3000):
     for child in plots.children:
         if isinstance(child, JupyterOutputContext):
             child.frame.canvas.layout.max_height = max_height
+
+
+def plot_background_components(f: np.ndarray, b: np.ndarray, dims: tuple[int, int]):
+    n_comps = len(f)
+
+    with mplstyle.context('dark_background'):  # type: ignore
+        fig = plt.figure(figsize=(20, 4.5 * n_comps))
+        gs = fig.add_gridspec(n_comps, 2)
+        first_im_ax = None
+        first_t_ax = None
+
+        for i, (comp_s, comp_t) in enumerate(zip(b.T, f)):  # type: ignore
+            im_ax = fig.add_subplot(gs[i, 0], sharex=first_im_ax, sharey=first_im_ax)
+            if first_im_ax is None:
+                first_im_ax = im_ax
+            im_ax.imshow(
+                comp_s.reshape(dims, order='F'), cmap='gray',
+                vmin=np.percentile(comp_s, 10), vmax=np.percentile(comp_s, 99.5))
+            im_ax.set_title(f'Component {i+1}')
+            im_ax.set_frame_on(False)
+
+            t_ax = fig.add_subplot(gs[i, 1], sharex=first_t_ax)
+            if first_t_ax is None:
+                first_t_ax = t_ax
+            t_ax.plot(comp_t, lw=1)
+            t_ax.set_xticks([])
+            t_ax.set_xlabel('Time')
+            t_ax.set_frame_on(False)
+
+        fig.suptitle('Background components')
+        fig.tight_layout()
+    return fig

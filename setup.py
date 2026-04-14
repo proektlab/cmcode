@@ -3,6 +3,7 @@ from setuptools import setup, find_packages
 install_requires = [
     "asyncssh",
     "caiman>=1.10.0",
+    "cellpose",
     "dask",
     "fastplotlib~=0.1.0.a17",
     "h5py",
@@ -15,7 +16,9 @@ install_requires = [
     "opencv-python",
     "optype[numpy]",
     "pydantic",
-    "suite2p"
+    "suite2p",
+    "torch",
+    "typing_extensions"
 ]
 
 
