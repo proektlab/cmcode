@@ -1,5 +1,6 @@
 """Utilities for saving/loading data such as dealing with changes to conventions, etc."""
 from copy import copy
+from dataclasses import replace
 from glob import glob
 import logging
 import os
@@ -39,12 +40,13 @@ def _populate_missing_fields(loaded_info: dict[str, Any]):
         loaded_info['mc_result'] = None
 
     if 'mmap_file_transposed' not in loaded_info:
-        if (mc_result := loaded_info['mc_result']) is not None:
-            # bypass __getattribute__ which will throw an AttributeError
-            loaded_info['mmap_file_transposed'] = object.__getattribute__(mc_result, 'mmap_file_transposed')
-        else:
-            loaded_info['mmap_file_transposed'] = None
-    
+        loaded_info['mmap_file_transposed'] = None
+
+    if (mc_result := loaded_info['mc_result']) is not None and mc_result.mmap_file_transposed is not None:
+        if loaded_info['mmap_file_transposed'] is None:
+            loaded_info['mmap_file_transposed'] =  mc_result.mmap_file_transposed
+        loaded_info['mc_result'] = replace(mc_result, mmap_file_transposed=None)
+
     if 'rec_type' not in loaded_info:
         if 'data_dir' in loaded_info and loaded_info['data_dir']:
             loaded_info['rec_type'] = os.path.split(os.path.split(loaded_info['data_dir'])[0])[1]
@@ -53,15 +55,25 @@ def _populate_missing_fields(loaded_info: dict[str, Any]):
 
 
 def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
-    # find or create SessionAnalysisParams object, then populate with fields
-    if 'params' in loaded_info:
-        params: cmp.SessionAnalysisParams = loaded_info.pop('params')
+    """
+    Find or create SessionAnalysisParams object, then populate with fields
+    ideally, load from JSON file; this is the canonical represenation
+    """
+
+    # pop these out to start with to ensure they are deleted from loaded_info
+    params: Optional[cmp.SessionAnalysisParams] = loaded_info.pop('params', None)
+    cnmf_params: Optional[CNMFParams] = loaded_info.pop('cnmf_params', None)
+    sess_filename: str = loaded_info.pop('sess_filename')
+
+    json_filename = os.path.splitext(sess_filename)[0] + '.json'
+
+    if os.path.exists(json_filename):
+        sessdata.params = cmp.SessionAnalysisParams.read_from_file(json_filename)
+
+    elif params is not None:
         sessdata.params = params
 
-    elif 'cnmf_params' in loaded_info:
-        # re-create params object from dict for backward compatibility
-        cnmf_params: CNMFParams = loaded_info.pop('cnmf_params')
-        
+    elif cnmf_params is not None:       
         # update other parameters from loaded fields as needed
         conv_changes = {}
         for conv_field in ['odd_row_offset', 'downsample_factor', 'crop']:
@@ -137,13 +149,13 @@ def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
             cnmf_extra=cnmf_extra, eval_extra=eval_extra
         )
     else:
-        raise ValueError('Cannot construct SessionAnalysis without either params or cnmf_params field')
+        raise ValueError('Cannot construct SessionAnalysis without params JSON file or either params or cnmf_params field')
 
 
 def _set_fields(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
 
     # obsolete fields that we don't care about anymore
-    fields_to_discard = ['structural_sbx_files', 'structural_offset', 'structural_tif_file', 'tag_base', 'tif_file',
+    fields_to_discard = ['structural_sbx_files', 'structural_offset', 'structural_tif_file', 'tag_base', 'tif_file', 'corr_planes',
                          'cnmf_fit1', 'cnmf_fit1_filename', 'cnmf_fit2', 'image_dir', 'gridsearch_batch_path']
     
     for key, val in loaded_info.items():
@@ -199,11 +211,15 @@ def _fix_tif_field_on_load(sessdata: 'cma.SessionAnalysis'):
 def _fix_mc_field_on_load(sessdata: 'cma.SessionAnalysis'):
     """fix motion correction results if necessary (so els holoview can be retrieved)"""
     if sessdata.mc_result is not None:
+        updates = {}
         if sessdata.mc_result.dims is None:
-            sessdata.mc_result.dims = sessdata.plane_size
+            updates['dims'] = sessdata.plane_size
         if sessdata.mc_result.motion_params is None:
             # need motion params to reconstruct MotionCorrect object
-            sessdata.mc_result.motion_params = copy(sessdata.params._cnmf.motion)
+            updates['motion_params'] = copy(sessdata.params.motion)
+        
+        if updates:
+            sessdata.mc_result = replace(sessdata.mc_result, **updates)
 
 
 def _fix_cnmf_fields_on_load(sessdata: 'cma.SessionAnalysis'):

@@ -950,7 +950,7 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
 def align_templates_multiple(
         templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[BorderSpec, int]]] = None,
         use_opt_flow=False, align_options: Optional[dict] = None, n_planes=1,
-        yx_position_guesses: Union[Sequence, np.ndarray, None] = None) -> list[tuple[np.ndarray, np.ndarray]]:
+        yx_position_guesses: Union[onp.ToFloatStrict2D, None] = None) -> list[tuple[np.ndarray, np.ndarray]]:
     """
     Align a series of templates in an iterative fashion (1 to 2, 2 to 3, ..., n-1 to n).
     Returns a list of n-1 tuples (x_remap, y_remap) which can be passed on to register_ROIs_multiple.
@@ -963,19 +963,21 @@ def align_templates_multiple(
         borders = [0] * n_templates
     
     if yx_position_guesses is None:
-        yx_position_guesses = np.zeros((n_templates, 2))
+        yx_pos = np.zeros((n_templates, 2))
     else:
-        yx_position_guesses = np.array(yx_position_guesses)
-        if yx_position_guesses.shape[0] != n_templates:
+        yx_pos: onp.Array2D[np.floating] = np.asarray(yx_position_guesses)
+        if not onp.is_array_2d(yx_pos):
+            raise TypeError('yx_position_guesses must be n_templates x 2')
+        if yx_pos.shape[0] != n_templates:
             raise ValueError('Height of position guesses matrix does not match number of templates')
-        if yx_position_guesses.shape[1] != 2:
+        if yx_pos.shape[1] != 2:
             raise ValueError('Width of position guesses matrix should be 2 (y, x)')
     
     # align each pair of sessions
     xy_remaps: list[tuple[np.ndarray, np.ndarray]] = []
 
     # always warp the first session, so it should be 'template2'
-    for (template2, border2, pos2), (template1, border1, pos1) in pairwise(zip(templates, borders, yx_position_guesses)):
+    for (template2, border2, pos2), (template1, border1, pos1) in pairwise(zip(templates, borders, yx_pos)):
         border = BorderSpec.max(border1, border2)
         # the guess is how to shift template 2, so we want to subtract its current position and add the position of template 1
         template2_shift_guess = (pos1[0] - pos2[0], pos1[1] - pos2[1])
@@ -1204,7 +1206,7 @@ def align_templates_multisession(
     # make template for each session
     templates: list[np.ndarray] = []
     n_planes = None
-    borders: list[int] = []
+    borders: list[BorderSpec] = []
 
     for sess_id, tag in zip(sess_ids, tags):
         # load existing analysis object
@@ -1216,7 +1218,7 @@ def align_templates_multisession(
         
         if info.mc_result is None:
             raise RuntimeError(f'Motion correction not done in session {sess_id}{tag if tag else ""}')
-        borders.append(info.mc_result.border_to_0)
+        borders.append(BorderSpec.max(*info.mc_result.border_asym))
         templates.append(info.get_projection_for_seed(**template_params)[0])
     assert n_planes is not None, 'No sessions processed'
 
@@ -1584,7 +1586,7 @@ def register_ROIs_multisession(
     As = []
     accepted_inds = []
     n_planes = None
-    borders: list[int] = []
+    borders: list[BorderSpec] = []
     dims = None
     included_rois: list[np.ndarray] = []
     rec_dates: list[date] = []
@@ -1620,7 +1622,7 @@ def register_ROIs_multisession(
         if info.mc_result is None:
             raise RuntimeError(f'Motion correction not run for session {sess_id}{tag if tag else ""}')
         
-        borders.append(info.mc_result.border_to_0)
+        borders.append(BorderSpec.max(*info.mc_result.border_asym))
 
         # get contours to match from CNMF results
         A = info.cnmf_fit.estimates.A
@@ -1918,7 +1920,7 @@ def get_zmax_templates_and_borders_multisession(
         if sessinfo.mc_result is None:
             raise RuntimeError('Motion correction not run?')
         
-        plane_borders: list[BorderSpec] = sessinfo.mc_result.border_asym
+        plane_borders = sessinfo.mc_result.border_asym
         border = BorderSpec.max(*plane_borders)
 
         if include_dead_pixel_border:

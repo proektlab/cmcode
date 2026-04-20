@@ -15,7 +15,7 @@ import pandas as pd
 from scipy import ndimage, interpolate
 from scipy.ndimage import median_filter
 
-from mesmerize_core.utils import Border2D
+from mesmerize_core.utils import Border
 
 from cmcode.util.scaled import ScaledDataFrame, ScaledSeries, ScaledPixels
 
@@ -78,39 +78,67 @@ class BorderSpec:
 
     def __setstate__(self, state: dict[str, Any]):
         for side in ['left', 'right', 'top', 'bottom']:
-            if side + '_subpix' not in state:
-                state[side + '_subpix'] = float(state[side])
+            if side in state:
+                if side + '_subpix' not in state:
+                    state[side + '_subpix'] = float(state[side])
+                del state[side]
         self.__dict__.update(state)
 
     
-    def ceil(self) -> Border2D:
+    def ceil(self) -> Border:
         """Convert to dict with each side converted to next highest int"""
-        return Border2D(left=self.left, right=self.right, top=self.top, bottom=self.bottom)
+        return Border(left=self.left, right=self.right, top=self.top, bottom=self.bottom)
 
-    
-    def _arithmetic_op(self, op: str, other: Union[CanFloat, Self]) -> Self:
+    def ceil_scalar(self) -> int:
+        """Get scalar maximum border"""
+        return max(self.left, self.right, self.top, self.bottom)
+
+
+    def _arithmetic_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> Self:
         """Apply arithmetic operation to all sides"""
         sides = ['left', 'right', 'top', 'bottom']
         op_method = getattr(float, op)
         if isinstance(other, CanFloat):
             res = type(self)(**{side: op_method(getattr(self, side + '_subpix'), float(other)) for side in sides})
-        else:
+        elif isinstance(other, BorderSpec):
             res = type(self)(**{side: op_method(
                 getattr(self, side + '_subpix'), getattr(other, side + '_subpix')
                 ) for side in sides})
+        else:
+            return NotImplemented
         return type(self).max(res, type(self).equal(0))
 
-    def _comparison_op(self, op: str, other: Union[CanFloat, Self]) -> bool:
+    def increased(self, other: Union[CanFloat, 'BorderSpec'], shape: Optional[tuple[int, int]] = None) -> Self:
+        """Increase borders, limiting result to maximal borders if shape is given"""
+        res = self._arithmetic_op('__add__', other)
+        if shape is not None:
+            res = type(self).min(res, type(self).maximal(shape=shape))
+        return res
+    
+    def decreased(self, other: Union[CanFloat, 'BorderSpec']) -> Self:
+        """Decrease borders"""
+        return self._arithmetic_op('__sub__', other)
+
+    __mul__ = partialmethod(_arithmetic_op, '__mul__')
+    __truediv__ = partialmethod(_arithmetic_op, '__truediv__')
+
+    def _comparison_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> bool:
         """Delegate comparisons to int comparisons of all sides"""
         sides = ['left_subpix', 'right_subpix', 'top_subpix', 'bottom_subpix']
         op_method = getattr(float, op)
-        if isinstance(other, (int, CanFloat)):
+        if isinstance(other, CanFloat):
             return all(op_method(getattr(self, side), other) for side in sides)
-        else:
+        elif isinstance(other, BorderSpec):
             return all(op_method(getattr(self, side), getattr(other, side)) for side in sides)
+        else:
+            return NotImplemented
 
-    for op in ['__eq__', '__ne__', '__lt__', '__le__', '__gt__', '__ge__']:
-        vars()[op] = partialmethod(_comparison_op, op)
+    __eq__ = partialmethod(_comparison_op, '__eq__')  # type: ignore
+    __ne__ = partialmethod(_comparison_op, '__ne__')  # type: ignore
+    __lt__ = partialmethod(_comparison_op, '__lt__')
+    __le__ = partialmethod(_comparison_op, '__le__')
+    __gt__ = partialmethod(_comparison_op, '__gt__')
+    __ge__ = partialmethod(_comparison_op, '__ge__')
 
     @classmethod
     def equal(cls, border: CanFloat) -> Self:
@@ -161,17 +189,6 @@ class BorderSpec:
         """Whether there are any pixels left in the center, given shape"""
         center_shape = self.center_shape(shape)
         return center_shape[0] > 0 and center_shape[1] > 0
-    
-    def increased(self, other: Union[CanFloat, Self], shape: Optional[tuple[int, int]] = None) -> Self:
-        """Increase borders, limiting result to maximal borders if shape is given"""
-        res = self._arithmetic_op('__add__', other)
-        if shape is not None:
-            res = type(self).min(self, type(self).maximal(shape=shape))
-        return res
-    
-    def decreased(self, other: Union[CanFloat, Self]) -> Self:
-        """Decrease borders"""
-        return self._arithmetic_op('__sub__', other)
     
     def enclosing_square(self, shape: tuple[int, int]) -> Self:
         """

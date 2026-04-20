@@ -1,7 +1,7 @@
 from collections.abc import Container, Iterator, Collection, Sequence, Mapping
 from copy import deepcopy
 from datetime import date
-from enum import IntEnum
+from enum import IntEnum, auto
 from functools import cache
 import h5py
 from itertools import pairwise
@@ -15,7 +15,7 @@ import warnings
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
 from caiman.utils.utils import recursively_load_dict_contents_from_group
-from mesmerize_core.utils import Border2D
+from mesmerize_core.utils import Border
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
@@ -23,7 +23,7 @@ from pydantic.dataclasses import dataclass
 from pydantic.json_schema import SkipJsonSchema, PydanticJsonSchemaWarning
 from typing_extensions import Self
 
-from cmcode.util import types, paths
+from cmcode.util import types, paths, image
 
 
 # pydantic helpers
@@ -33,6 +33,13 @@ def list_from_ndarray(obj: Any) -> Any:
     return obj
 
 ReadNDArray = BeforeValidator(list_from_ndarray)
+
+def border_from_spec(obj: Any) -> Any:
+    if isinstance(obj, image.BorderSpec):
+        return obj.ceil()
+    return obj
+
+BorderDict = Annotated[Border, BeforeValidator(border_from_spec)]
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -91,8 +98,11 @@ class StageParams:
 
         # update the dict while recursing into other StageParams instances
         for key, val in replacements.items():
-            if not hasattr(self, key):
-                raise KeyError(f'Cannot replace unknown key {key}')
+            if key not in self.input_params():
+                if key in self.params():
+                    raise KeyError(f'Key {key} is computed from other parameters and cannot be set directly')
+                else:
+                    raise KeyError(f'Cannot replace unknown key {key}')
 
             my_val = getattr(self, key)
             if isinstance(my_val, StageParams) and isinstance(val, Mapping):
@@ -115,7 +125,7 @@ class StageParams:
 @dataclass(kw_only=True, frozen=True)
 class ConversionParams(StageParams):
     """Settings for convert_to_tif"""
-    crop: Border2D = Field(default_factory=lambda: {'left': 0, 'right': 0, 'top': 0, 'bottom': 0})  # borders to crop out of image
+    crop: BorderDict = Field(default_factory=lambda: {'left': 0, 'right': 0, 'top': 0, 'bottom': 0})  # borders to crop out of image
     downsample_factor: Optional[int] = None
     keep_3d: bool = False
 
@@ -173,9 +183,33 @@ class ConversionParams(StageParams):
 
 
 @dataclass(kw_only=True, frozen=True)
+class Suite2pRegistrationParams(StageParams):
+    """
+    Params for registration using Suite2p
+    See https://suite2p.readthedocs.io/en/latest/parameters/#registration for definitions
+    (Note some defaults here differ from Suite2p defaults)
+    """
+    nimg_init: int = 400
+    maxregshift: float = 0.1
+    do_bidiphase: bool = False  # by default handled in conversion step
+    bidiphase: float = 0.       # by default handled in conversion step
+    batch_size: int = 100
+    nonrigid: bool = True
+    maxregshiftNR: int = 6  # increased for high motion
+    block_size: tuple[int, int] = (128, 128)
+    smooth_sigma_time: float = 0.
+    smooth_sigma: float = 1.15
+    spatial_taper: float = 3.45
+    th_badframes: float = 1.
+    norm_frames: bool = True
+    snr_thresh: float = 1.2
+    two_step_registration: bool = True   # turned on for low SNR
+
+
+@dataclass(kw_only=True, frozen=True)
 class McorrParamsExtra(StageParams):
     """Extra params for the motion correction step"""
-    # reference to SessionAnalysisParams to compute indices_exclude_fringe
+    # reference to other motion params to compute indices_exclude_fringe
     _mcorr_params: 'SkipJsonSchema[Optional[McorrParamStruct]]' = Field(
         default=None, init=False, exclude=True, repr=False
     )
@@ -185,6 +219,8 @@ class McorrParamsExtra(StageParams):
     _indices_exclude_fringe: Optional[bool] = Field(default=None, alias='indices_exclude_fringe')
     # flag that is set when indices are adjusted and unset when params affecting them are changed
     _indices_are_adjusted: bool = False
+
+    use_suite2p: bool = False
 
     @computed_field
     @property
@@ -272,7 +308,7 @@ class SeedParams(StageParams):
     type: str = 'none' # e.g. "mean", "skew"; "none" means don't use a seed at all
     norm_medw: Optional[int] = None
     blur_size: int = 1  # 1 = blurring in projection disabled
-    borders: Optional[list[Border2D]] = None  # None = auto-fill from mcorr
+    borders: Optional[list[BorderDict]] = None  # None = auto-fill from mcorr
 
     # defaults from my_extract_binary_masks_from_structural_channel
     gSig: Annotated[Union[None, int, Sequence[int]], ReadNDArray] = 5  # neuron pixel size (None = same as CNMF gSig)
@@ -368,13 +404,13 @@ class AnalysisStage(IntEnum):
     In practice, the current stage is determined by which fields of
     CNMFAnalysis are set (and they can be unset to invalidate past a given stage).
     """
-    START = 0       # raw data file identification
-    CONVERT = 1     # file format conversion
-    MCORR = 2       # motion correction
-    TRANSPOSE = 3   # concat/transpose to C order/possibly filter
-    CNMF = 4        # CNMF or CNMFE
-    EVAL = 5        # component quality evaluation
-    FINAL = 6
+    START = 0            # raw data file identification
+    CONVERT = auto()     # file format conversion
+    MCORR = auto()       # motion correction
+    TRANSPOSE = auto()   # concat/transpose to C order/possibly filter
+    CNMF = auto()        # CNMF or CNMFE
+    EVAL = auto()        # component quality evaluation
+    FINAL = auto()
 
     @property
     def name(self) -> str:
@@ -391,7 +427,7 @@ class AnalysisStage(IntEnum):
 
 # recursive models for serializing/deserializing parameters for each stage
 
-class ParamStruct(BaseModel):
+class ParamStruct(BaseModel, revalidate_instances='always'):
     @classmethod
     def read_from_file(cls, path: Union[str, Path]) -> Self:
         with open(path, mode='r') as file:
@@ -514,11 +550,12 @@ UpToConvertParamStruct = ConvertParamStruct
 class McorrParamStruct(ParamStruct, validate_assignment=True):
     # validate assignment so the validator below runs whenever mcorr_extra is reassigned
     motion: params.MotionParams
+    suite2p_register: Suite2pRegistrationParams = Field(default_factory=Suite2pRegistrationParams)
     mcorr_extra: McorrParamsExtra
 
     @model_validator(mode='after')
     def _set_ref(self):
-        """Set reference to full params struct"""
+        """Set reference to other motion params"""
         object.__setattr__(self.mcorr_extra, '_mcorr_params', self)
         return self
 
@@ -584,6 +621,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
     def from_cnmf_params(cls,
         cnmf: params.CNMFParams,
         conversion: ConversionParams = ConversionParams(),
+        suite2p_register: Suite2pRegistrationParams = Suite2pRegistrationParams(),
         mcorr_extra: McorrParamsExtra = McorrParamsExtra(),
         transposition: TranspositionParams = TranspositionParams(),
         cnmf_extra: CNMFParamsExtra = CNMFParamsExtra(),
@@ -593,6 +631,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         obj = cls(
             conversion=conversion,
             motion=cnmf.motion,
+            suite2p_register=suite2p_register,
             mcorr_extra=mcorr_extra,
             transposition=transposition,
             data=cnmf.data,
@@ -627,6 +666,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
 
         return cls.from_cnmf_params(
             conversion=ConversionParams(downsample_factor=downsample_factor),
+            mcorr_extra=McorrParamsExtra(use_suite2p=True),
             transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True),
             cnmf=make_cnmf_params(
                 metadata, ndim=ndim, tif_file=tif_file, snr_type=snr_type, downsample_factor=downsample_factor),
@@ -676,7 +716,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             for key in stage_only_params[stage].model_fields.keys() & changes.keys():
                 change_subparams = changes.pop(key)
                 if not isinstance(change_subparams, dict):
-                        raise TypeError('Changes should always be dicts to avoid replacing non-specified params')
+                    raise TypeError('Changes should always be dicts to avoid replacing non-specified params')
 
                 curr_subparams: Union[params.GroupParams, StageParams] = getattr(new_params, key)
                 if isinstance(curr_subparams, params.GroupParams):

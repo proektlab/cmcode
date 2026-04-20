@@ -2,7 +2,7 @@ import asyncio
 from collections import Counter
 from collections.abc import Container, Iterable, Sequence, Mapping
 from copy import copy
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from datetime import date, datetime
 from functools import lru_cache, partial
 import json
@@ -522,8 +522,9 @@ class SessionAnalysis:
                 self.sess_filename = os.path.join(self.data_dir, filename)
 
             logging.info(f'Saving session analysis to {self.sess_filename}')
-            fields_to_skip = ['sess_filename', 'cluster_args', 'cnmf_fit1', 'cnmf_fit2',
-                            'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit', 'tag_base']
+            fields_to_skip = [
+                'sess_filename', 'cluster_args', 'cnmf_fit1', 'cnmf_fit2',
+                'cnmf_fit1_filename', 'cnmf_fit2_filename', '_cnmf_fit', '_cnmf_changed_flag', 'tag_base']
             fields_to_save = {name: val for (name, val) in vars(self).items() if name not in fields_to_skip}
 
             # relativize paths
@@ -664,34 +665,36 @@ class SessionAnalysis:
         if self.plane_tifs is None:
             raise RuntimeError('Must convert to TIF before doing motion correction')
 
-        plane_results: list[mcorr.PlaneMcorrResult] = []
+        # update indices if necessary
+        if self.params.mcorr_extra.indices_exclude_fringe and not self.params.mcorr_extra._indices_are_adjusted:
+            new_indices = mcorr.compute_adjusted_indices(self.params)
+            param_updates: dict[str, dict[str, Any]] = {'mcorr_extra': {'_indices_are_adjusted': True}}
+            if new_indices is not None:
+                logging.info(f'Changing indices to {new_indices} to avoid dead pixels')
+                param_updates['motion'] = {'indices': new_indices}
+            
+            self.update_params(param_updates)
+
+        plane_mmaps: list[str] = []
+        plane_results: list[Optional[mcorr.PlaneMcorrResult]] = []  # will be filled with only new results
         is_piecewise = self.params.motion.pw_rigid
 
         for k_plane, tif_path in enumerate(self.plane_tifs):
             plane_prefix = f'Plane {k_plane}: ' if len(self.plane_tifs) > 1 else ''
-
-            # update indices if necessary
-            if self.params.mcorr_extra.indices_exclude_fringe and not self.params.mcorr_extra._indices_are_adjusted:
-                new_indices = mcorr.compute_adjusted_indices(self.params)
-                param_updates: dict[str, dict[str, Any]] = {'mcorr_extra': {'_indices_are_adjusted': True}}
-                if new_indices is not None:
-                    logging.info(f'Changing indices to {new_indices} to avoid dead pixels')
-                    param_updates['motion'] = {'indices': new_indices}
-                
-                self.update_params(param_updates)
 
             if load is not False:  # try to load existing results
                 candidate_files = mcorr.get_candidate_mcorr_result_files(tif_path, is_piecewise)
                 found_result = None
                 for path in candidate_files:
                     if self.result_file_matches_params(path, AnalysisStage.MCORR):
-                        found_result = mcorr.load_mcorr_result(path)
+                        found_result = path
                         if load is None:  # only log if we were unsure whether to load
                             logging.info(plane_prefix + 'using existing motion correction results from ' + path)
                         break
                 
                 if found_result is not None:
-                    plane_results.append(found_result)
+                    plane_mmaps.append(found_result)
+                    plane_results.append(None)
                     continue
                 else:
                     no_match_msg = plane_prefix + 'cannot find matching motion correction results.'
@@ -703,27 +706,16 @@ class SessionAnalysis:
             # we are doing mcorr for this plane
             logging.info(plane_prefix + 'doing motion correction.')
 
-            plane_result = mcorr.motion_correct_file(tif_path, motion_params=self.params.motion, dview=cluster.dview)
+            plane_result = mcorr.motion_correct_file(tif_path, self.params, dview=cluster.dview)
+            plane_mmaps.append(plane_result.mmap_path)
             plane_results.append(plane_result)
-            self.write_params_for_result_file(plane_result['mmap_path'], AnalysisStage.MCORR)
+            self.write_params_for_result_file(plane_result.mmap_path, AnalysisStage.MCORR)
         
         # build MCResult from list of PlaneMcorrResults
-        shifts_els: Optional[list[np.ndarray]] = None
-        if self.params.motion.pw_rigid:
-            shifts_els = []
-            for res in plane_results:
-                assert res['shifts_els'] is not None, 'Should have piecewise shifts in results'
-                shifts_els.append(res['shifts_els'])
-
+        suite2p_reg_params = self.params.suite2p_register if self.params.mcorr_extra.use_suite2p else None
         self.mc_result = mcorr.MCResult(
-            mmap_files=[res['mmap_path'] for res in plane_results],
-            border_to_0=max(res['border_to_0'] for res in plane_results),
-            border_asym=[res['border_asym'] for res in plane_results],
-            shifts_rig=[res['shifts_rig'] for res in plane_results],
-            shifts_els=shifts_els,
-            dims=self.plane_size,
-            motion_params=self.params.motion
-        )
+            mmap_files=tuple(plane_mmaps), _loaded_results=plane_results, dims=self.plane_size,
+            motion_params=self.params.motion, suite2p_reg_params=suite2p_reg_params)
 
         if save:
             self.save(save_cnmf=False)
@@ -743,50 +735,89 @@ class SessionAnalysis:
         # do motion correction if necessary
         if self.mc_result is None or load is False:
             self.do_mcorr_only(load=load, save=save)
-            assert self.mc_result is not None
 
         self.concat_and_transpose(load=load, save=save)
 
     
-    def apply_motion_correction(self, mc_result: 'mcorr.MCResult', do_transpose=False, force=False):
+    def apply_motion_correction(
+        self, mc_result: 'mcorr.MCResult', load: Optional[bool] = None, save=True,
+        use_suite2p=True):
         """
-        TODO: update, figure out how this works with new params system (if at all)
         Apply motion correction result (typically from another channel of the same movie) to the current tiffs.
-        By default concatenates the results, but does not transpose to C order, since the output
-        will typically not be used for CNMF.
+        Updates motion correction parameters to match the given result.
+        If use_suite2p is True (the default), uses suite2p to apply shifts regardless of whether it was
+            used to do the correction. Otherwise, uses suite2p only if the shifts come from suite2p.
         """
-        raise NotImplementedError('Not implemented for new params system')
-        # # sanity checks
-        # if self.plane_tifs is None:
-        #     raise RuntimeError('Must convert to TIF first')
+        if self.plane_tifs is None:
+            raise RuntimeError('Must convert to TIF before doing motion correction')
 
-        # if len(mc_result.mmap_files) != len(self.plane_tifs):
-        #     raise RuntimeError('Number of planes does not match given motion correction results')
-        
-        # if mc_result.dims is None or mc_result.motion_params is None:
-        #     raise RuntimeError('Must set dims and motion_params on MCResult before proceeding')
-        
-        # if mc_result.is_piecewise and tuple(mc_result.dims) != tuple(self.plane_size):
-        #     raise RuntimeError('Cannot apply piecewise results to movie of different size')
-        
-        # # check if already done
-        # if not force and self.mc_result is not None and self.mc_result.has_same_shifts_as(mc_result):
-        #     logging.info('Our current mcorr shifts match the passed ones - not re-applying.')
-        #     return
+        if len(mc_result.mmap_files) != len(self.plane_tifs):
+            raise RuntimeError('Number of planes does not match given motion correction results')
 
-        # # should be safe to do a shallow copy, not really any situation where any of the fields would be mutated
-        # this_result = copy(mc_result)
+        if mc_result.motion_params is None or mc_result.dims is None:
+            raise RuntimeError('Must use an MCResult object with motion parameters and dims')
 
-        # # make MotionCorrect objects and apply the passed shifts
-        # mcorr_objs = mc_result.recreate_mcorr_objects()
-        # this_result.mmap_files = [mcorr.apply_mcorr_to_file(mcorr_obj, tif_file)
-        #                           for mcorr_obj, tif_file in zip(mcorr_objs, self.plane_tifs)]
-        # self.mmap_file_transposed = mcorr.transpose_flatten_mc_mmap(
-        #     this_result.mmap_files, this_result.border_to_0, sample_rate=self.sample_rate,
-        #     highpass_cutoff=self.highpass_cutoff, do_transpose=do_transpose, force=True
-        # )
-        # self.mc_result = this_result
-        # self.save(save_cnmf=False)
+        if mc_result.is_piecewise and tuple(mc_result.dims) != tuple(self.plane_size):
+            raise RuntimeError('Cannot apply piecewise results to movie of different size')
+        
+        # update params to match what was passed
+        param_changes = {
+            'motion': mc_result.motion_params.copy(),
+            'mcorr_extra': {'use_suite2p': mc_result.suite2p_reg_params is not None}
+        }
+        if mc_result.suite2p_reg_params is not None:
+            param_changes['register_suite2p'] = asdict(mc_result.suite2p_reg_params)
+
+        self.update_params(param_changes)
+
+        # try loading existing results
+        if load is not False:
+            try:
+                self.do_motion_correction(load=True, save=False)
+            except NoMatchingResultError:
+                if load is None:
+                    pass  # proceed with applying shifts
+                else:
+                    raise
+            else:
+                # check whether the shifts match
+                assert self.mc_result is not None
+                if self.mc_result.has_same_shifts_as(mc_result):
+                    logging.info('Successfully loaded matching shifts')
+                    if save:
+                        self.save(save_cnmf=False)
+                    return
+                else:
+                    nonmatching_msg = 'Found shifts with matching params, but the shifts are different.'
+                    if load is None:
+                        logging.info(nonmatching_msg + ' Re-applying.')
+                    else:
+                        raise NoMatchingResultError(nonmatching_msg)
+
+        # if we're here, load is not True and we're applying the shifts
+        use_s2p = use_suite2p or mc_result.used_suite2p
+        res_files: list[str] = []
+
+        for k_plane, tif_path in enumerate(self.plane_tifs):
+            if len(self.plane_tifs) > 1:
+                logging.info(f'Applying shifts to plane {k_plane}...')
+            else:
+                logging.info('Applying shifts...')
+
+            if use_s2p:
+                plane_result = mc_result.get_plane_result(k_plane)
+                res_file = mcorr.apply_mcorr_to_file_suite2p(
+                    tif_path, plane_result, mc_result.motion_params, mc_result.suite2p_reg_params)
+            else:
+                mcorr_obj = mc_result.get_mcorr_object(k_plane)
+                res_file = mcorr.apply_mcorr_to_file_caiman(tif_path, mcorr_obj)
+            
+            self.write_params_for_result_file(res_file, AnalysisStage.MCORR)
+            res_files.append(str(res_file))
+
+        self.mc_result = replace(mc_result, mmap_files=tuple(res_files))
+        if save:
+            self.save(save_cnmf=False)
 
 
     def get_original_and_corrected_movies(self, ds_ratio=5, xy_ds_ratio=1) -> tuple[np.ndarray, np.ndarray]:
@@ -873,14 +904,14 @@ class SessionAnalysis:
                 tagstr = '/' + self.tag if self.tag else ''
                 fig.suptitle(f'Mouse {self.mouse_id}, session {self.sess_id}{tagstr}, {type_label}')
 
-            for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
-                plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected, from_transposed=False)
+                for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
+                    plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected, from_transposed=False)
 
-                for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
-                    ax = cast(Axes, ax)
-                    imshow_scaled(ax, plane_proj)
-                    ax.set_title(f'Plane {k_plane} ({corrected_label})')
-            figs.append(fig)
+                    for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
+                        ax = cast(Axes, ax)
+                        imshow_scaled(ax, plane_proj)
+                        ax.set_title(f'Plane {k_plane} ({corrected_label})')
+                figs.append(fig)
         return figs[0], figs[1]
 
 
@@ -2466,6 +2497,7 @@ def load(filename: str, quiet=True, lazy=True, **field_overrides) -> SessionAnal
             logging.info(f'Loading session analysis from {filename}')
         loaded_fields: dict[str, Any] = pickle.load(info_file)
     loaded_fields.update(field_overrides)
+    loaded_fields['sess_filename'] = filename  # used to help with loading params
 
     sessdata = SessionAnalysis(loaded_info=loaded_fields)
 

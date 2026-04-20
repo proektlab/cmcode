@@ -192,7 +192,7 @@ class EquivalentPathsByPlatform(EquivalentPaths):
 PathMappable = Union[None, str, PurePath, np.bytes_, 'CustomPathMappable', list['PathMappable']]
 P = ParamSpec('P')
 class PathMapper(Generic[P], Protocol):
-    """Function that can normalize a path or list of paths"""
+    """Function that can normalize a path or Sequence of paths"""
     @overload
     def __call__(self, obj: None, *args: P.args, **kwargs: P.kwargs) -> None: ...
 
