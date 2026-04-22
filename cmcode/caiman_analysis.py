@@ -378,8 +378,10 @@ class SessionAnalysis:
             return AnalysisStage.MCORR
         if self.cnmf_fit is None:
             return AnalysisStage.TRANSPOSE
-        if self.cnmf_fit.estimates.idx_components_eval is None:
+        if self.cnmf_fit.estimates.F_dff_denoised is None:
             return AnalysisStage.CNMF
+        if self.cnmf_fit.estimates.idx_components_eval is None:
+            return AnalysisStage.DFF
         return AnalysisStage.EVAL
     
 
@@ -418,7 +420,12 @@ class SessionAnalysis:
             self.cnmf_fit_filename = None
             self._cnmf_fit = None
 
-        elif stage <= AnalysisStage.EVAL and self.cnmf_fit is not None:
+        if stage <= AnalysisStage.DFF and self.cnmf_fit is not None:
+            self.cnmf_fit.estimates.F_dff = None  # type: ignore
+            self.cnmf_fit.estimates.F_dff_denoised = None
+
+        # don't actually have to invalidate eval results if just invalidating DFF
+        if (stage < AnalysisStage.DFF or stage == AnalysisStage.EVAL) and self.cnmf_fit is not None:
             self.cnmf_fit.estimates.idx_components_eval = None
             self.cnmf_fit.estimates.idx_components_bad_eval = None
             self._cnmf_changed_flag = True
@@ -437,6 +444,8 @@ class SessionAnalysis:
                 self.concat_and_transpose(load=load, save=save)
             case AnalysisStage.CNMF:
                 self.do_cnmf(load=load, save=save)
+            case AnalysisStage.DFF:
+                self.make_df_over_f(recalc=(load is False), save=save)
             case AnalysisStage.EVAL:
                 self.do_cnmf_evaluation(recalc=(load is False))
             case AnalysisStage.FINAL:
@@ -447,7 +456,10 @@ class SessionAnalysis:
         curr_stage = self.last_valid_stage
         for stage_num in range(curr_stage + 1, stage + 1):
             next_stage = AnalysisStage(stage_num)
-            self.process_stage(next_stage, load=load, save=save)
+            self.process_stage(next_stage, load=load, save=False)
+        
+        if save:
+            self.save(save_cnmf=stage >= AnalysisStage.CNMF)
 
     def run_to_end(self, save=True):
         self.process_up_to_stage(AnalysisStage.FINAL, save=save)
@@ -1484,9 +1496,9 @@ class SessionAnalysis:
     """Same as do_cnmf_gridsearch, but runs on a remote host (and waits for completion)"""
     
 
-    def make_df_over_f(self, recalc: bool = False, denoised: Optional[bool] = None):
+    def make_df_over_f(self, recalc=False, save=True):
         """
-        Calculates delta F over F for all ROIs using our default settings and
+        Calculates delta F over F for all ROIs using settings in params.dff and
         saves to estimates.F_dff and estimates.F_dff_denoised. Set denoised to True or False
         to only calculate one or the other
         """
@@ -1494,19 +1506,20 @@ class SessionAnalysis:
             raise RuntimeError('CNMF fit not found')
         est = self.cnmf_fit.estimates   
     
-        if denoised is None or not denoised:
-            if recalc or est.F_dff is None:
-                logging.info('Calculating df/f')
-                est.F_dff = calc_df_over_f(est, use_residuals=True)
-            else:
-                logging.info('Found df/f - not recalculating')
-        
-        if denoised is None or denoised:
-            if recalc or est.F_dff_denoised is None:
-                logging.info('Calculating denoised df/f')
-                est.F_dff_denoised = calc_df_over_f(est, use_residuals=False)
-            else:
-                logging.info('Found denoised df/f - not recalculating')
+        if recalc or est.F_dff is None:
+            logging.info('Calculating df/f')
+            est.F_dff = calc_df_over_f(est, use_residuals=True, **asdict(self.params.dff))
+        else:
+            logging.info('Found df/f - not recalculating')
+    
+        if recalc or est.F_dff_denoised is None:
+            logging.info('Calculating denoised df/f')
+            est.F_dff_denoised = calc_df_over_f(est, use_residuals=False, **asdict(self.params.dff))
+        else:
+            logging.info('Found denoised df/f - not recalculating')
+
+        if save:
+            self.save(save_cnmf=True, save_analysis=False)  # nothing should have changed in SessionAnalysis
 
 
     #------------------------- ROI EVALUATION -----------------------------#
@@ -2154,7 +2167,7 @@ class SessionAnalysis:
         return caiman_viz.plot_background_components(est.f, est.b, dims=est.dims)
 
 
-    def show_cnmf_results(self, image_data_options: Optional[list[str]] = None, denoised_temporal=True):
+    def show_cnmf_results(self, image_data_options: Optional[list[str]] = None, add_residuals=False, add_background=False):
         """
         Make CNMF visualization of completed runs with controls to adjust automatic evaluation & manual accepted/rejected cells,
         linked to this object so that saving updates & saves the parameters if appropriate.
@@ -2175,9 +2188,7 @@ class SessionAnalysis:
         else:
             start_i = list(completed_runs.uuid).index(start_uuid)
 
-        temporal_kwargs = {}
-        if not denoised_temporal:
-            temporal_kwargs['add_residuals'] = True
+        temporal_kwargs = {'add_background': add_background, 'add_residuals': add_residuals}
 
         viz: caiman_viz.CNMFVizWideContainer = completed_runs.cnmf.viz_wide(
             image_data_options=image_data_options, image_widget_kwargs={'cmap': 'gray'}, n_planes=self.metadata['num_planes'],
@@ -2653,10 +2664,9 @@ def identify_marked_rois(cnmf_obj: 'cnmf_ext.CNMFExt', cnmf_filename: Optional[s
 
 
 def calc_df_over_f(est: cnmf_ext.EstimatesExt, use_residuals=True, roi_subset: Optional[Sequence[int]] = None,
-                   detrend_window=500) -> np.ndarray:
+                   baseline_pctile=8., auto_pctile=False, baseline_window: Optional[int] = 500) -> np.ndarray:
     """
-    Calculates dF/F using CaImAn background components to define baseline, which is the default in
-    CaImAn. TODO see whether it makes more sense to use something closer to the raw data for baseline.
+    Calculates dF/F using CaImAn background components to define baseline, which is the default in CaImAn.
     The default here is now to use residuals, i.e. not just rescale the "denoised" traces (C) from CaImAn.
     However, both could potentially be useful - including noise is more trustworthy for initial evaluation/
     data inspection, whereas the denoised dF/F could be better to feed into a downstream analysis.
@@ -2677,10 +2687,9 @@ def calc_df_over_f(est: cnmf_ext.EstimatesExt, use_residuals=True, roi_subset: O
         C = est.C
         YrA = est.YrA
 
-    if use_residuals:
-        dff = detrend_df_f(A, est.b, C, est.f, YrA, flag_auto=False, frames_window=detrend_window)
-    else:
-        dff = detrend_df_f(A, est.b, C, est.f, None, flag_auto=False, frames_window=detrend_window)
+    dff = detrend_df_f(
+        A, est.b, C, est.f, YrA if use_residuals else None, flag_auto=auto_pctile,
+        quantileMin=baseline_pctile, frames_window=baseline_window)  # type: ignore
     assert isinstance(dff, np.ndarray), 'detrend_df_f returned something unexpected'
     return dff
 

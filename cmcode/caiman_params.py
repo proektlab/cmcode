@@ -392,6 +392,19 @@ class CNMFParamsExtra(StageParams):
 
 
 @dataclass(kw_only=True, frozen=True)
+class DffParams(StageParams):
+    """Parameters for dF/F computation"""
+    baseline_pctile: float = 8.  # only used if auto_pctile is False
+    auto_pctile: bool = False
+    baseline_window: Optional[int] = 500  # frames to compute baseline over
+
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
+        if self.auto_pctile and other.auto_pctile:
+            ignore = {'baseline_pctile'}.union(ignore)
+        return super().get_differing_params(other, metadata, ignore)
+
+
+@dataclass(kw_only=True, frozen=True)
 class EvalParamsExtra(StageParams):
     """Extra parameters for CNMF evaluation (do not require redoing CNMF)"""
     snr_type: params.LitStr[Literal['normal', 'gamma']] = 'normal'
@@ -409,6 +422,7 @@ class AnalysisStage(IntEnum):
     MCORR = auto()       # motion correction
     TRANSPOSE = auto()   # concat/transpose to C order/possibly filter
     CNMF = auto()        # CNMF or CNMFE
+    DFF = auto()         # compute dF/F
     EVAL = auto()        # component quality evaluation
     FINAL = auto()
 
@@ -420,6 +434,7 @@ class AnalysisStage(IntEnum):
             'motion correction',
             'transposition/plane concatenation',
             'CNMF',
+            'dF/F computation',
             'component evaluation',
             'final',
             ][self]
@@ -583,11 +598,17 @@ class CNMFParamStruct(ParamStruct):
 class UpToCNMFParamStruct(UpToTransposeParamStruct, CNMFParamStruct):
     pass
 
+class DffParamStruct(ParamStruct):
+    dff: DffParams = Field(default_factory=DffParams)
+
+class UpToDffParamStruct(UpToCNMFParamStruct, DffParamStruct):
+    pass
+
 class EvalParamStruct(ParamStruct):
     quality: params.QualityParams
     eval_extra: EvalParamsExtra
 
-class UpToEvalParamStruct(UpToCNMFParamStruct, EvalParamStruct):
+class UpToEvalParamStruct(UpToDffParamStruct, EvalParamStruct):
     pass
 
 
@@ -625,6 +646,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         mcorr_extra: McorrParamsExtra = McorrParamsExtra(),
         transposition: TranspositionParams = TranspositionParams(),
         cnmf_extra: CNMFParamsExtra = CNMFParamsExtra(),
+        dff: DffParams = DffParams(),
         eval_extra: EvalParamsExtra = EvalParamsExtra()
         ):
 
@@ -644,6 +666,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             online=cnmf.online,
             ring_CNN=cnmf.ring_CNN,
             cnmf_extra=cnmf_extra,
+            dff=dff,
             quality=cnmf.quality,
             eval_extra=eval_extra
         )
@@ -812,6 +835,7 @@ stage_only_params: dict[AnalysisStage, Type[ParamStruct]] = {
     AnalysisStage.MCORR: McorrParamStruct,
     AnalysisStage.TRANSPOSE: TransposeParamStruct,
     AnalysisStage.CNMF: CNMFParamStruct,
+    AnalysisStage.DFF: DffParamStruct,
     AnalysisStage.EVAL: EvalParamStruct,
     AnalysisStage.FINAL: ParamStruct
 }
@@ -823,6 +847,7 @@ stage_cumulative_params: dict[AnalysisStage, Type[ParamStruct]] = {
     AnalysisStage.MCORR: UpToMcorrParamStruct,
     AnalysisStage.TRANSPOSE: UpToTransposeParamStruct,
     AnalysisStage.CNMF: UpToCNMFParamStruct,
+    AnalysisStage.DFF: UpToDffParamStruct,
     AnalysisStage.EVAL: UpToEvalParamStruct,
     AnalysisStage.FINAL: SessionAnalysisParams
 }

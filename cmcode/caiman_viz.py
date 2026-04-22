@@ -674,17 +674,24 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
 
     def make_dff_plot(self) -> hv.DynamicMap:
-        def dff_plot(cell_id: int, **_other_params) -> hv.Curve:
+        def dff_plot(cell_id: int, **_other_params):
             est = self._cnmf_obj_ext.estimates
+            dff_str = "\u0394F/F"
+            dff_plots = []
+
             if est.F_dff is not None:
                 dff = est.F_dff[cell_id]
+                dff_plots.append(hv.Curve(
+                    (range(len(dff)), dff), kdims='frame', vdims=dff_str, label='raw').opts(color='#666'))
+                if est.F_dff_denoised is not None:
+                    dff_dn = est.F_dff_denoised[cell_id]
+                    dff_plots.append(hv.Curve(
+                        (range(len(dff_dn)), dff_dn), kdims='frame', vdims=dff_str, label='denoised').opts(color='#0F0'))
             else:
-                # calc dF/F on the fly for just the current component
-                dff = cma.calc_df_over_f(est, use_residuals=True, roi_subset=[cell_id])[0]
-            assert isinstance(dff, np.ndarray)
-            return hv.Curve((range(len(dff)), dff), kdims='frame', vdims="\u0394F/F").opts(width=900)  # type: ignore
-        return hv.DynamicMap(dff_plot, streams=[self._metric_stream]
-                             ).opts(framewise=True) # type: ignore
+                dff_plots.append(hv.Text(0.5, 0.5, dff_str + " is not available").opts(width=900))
+            return hv.Overlay(dff_plots).opts(width=900)
+
+        return hv.DynamicMap(dff_plot, streams=[self._metric_stream]).opts(framewise=True) # type: ignore
 
     def set_component_index(self, index):
         super().set_component_index(index)
