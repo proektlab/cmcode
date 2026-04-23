@@ -7,6 +7,7 @@ from dataclasses import dataclass, field, asdict, replace
 from functools import cached_property
 import logging
 import math
+from multiprocessing.pool import Pool
 import os
 from pathlib import Path
 import re
@@ -24,14 +25,15 @@ import holoviews as hv
 from mesmerize_core.algorithms._utils import Cluster, save_c_order_mmap_parallel, make_projection_parallel
 import numpy as np
 import optype.numpy as onp
+import scipy.interpolate as interp
 import scipy.ndimage as ndi
 import suite2p
 from suite2p.registration import register as s2p_register, nonrigid, get_pc_metrics
 import torch
 
 from cmcode import caiman_analysis as cma, caiman_params as cmp
-from cmcode.util import paths
-from cmcode.util.image import BorderSpec
+from cmcode.util import paths, footprints
+from cmcode.util.image import BorderSpec, preprocess_proj_for_seed
 from cmcode.util.types import NoMatchingResultError, Array4D
 
 
@@ -790,9 +792,12 @@ def get_transposed_mmap_name(orig_mmap_names: Sequence[str], trans_params: cmp.T
 
         if trans_params.bg_filter_size != 20:  # only relevant if background-remove step is on
             extra_param_strings.append(f'filtersize{trans_params.bg_filter_size}')
+
+    if trans_params.remove_bg_component:
+        extra_param_strings.append('bgcompremoved')
         
-        if trans_params.bg_mean_scale != 1.:
-            extra_param_strings.append(f'scale{trans_params.bg_mean_scale:g}')
+    if (trans_params.remove_bg_mean or trans_params.remove_bg_component) and trans_params.bg_scale != 1.:
+        extra_param_strings.append(f'scale{trans_params.bg_scale:g}')
 
     if len(extra_param_strings) > 0:
         # insert strings for non-default params into filename
@@ -851,12 +856,11 @@ def blurred_movies(input_mmap_files: Sequence[str], ksize=1) -> Generator[Sequen
             os.remove(path)         
 
 
-def get_background_estimate(
-    plane_mmap_path: str, border: BorderSpec, filter_size: int, return_center_only=True,
+def estimate_bg_mean(
+    plane_mean: onp.Array2D[np.floating], border: BorderSpec, filter_size: int, return_center_only=True,
     dview: Optional[Cluster] = None) -> onp.Array2D[np.floating]:
     """Make estimate of local background level based on min-filtering the mean projection"""
     # get mean projection
-    plane_mean = make_projection_parallel(plane_mmap_path, 'mean', dview=dview)
     slices = border.slices(plane_mean.shape)
     center = plane_mean[slices]
     center_filtered = ndi.minimum_filter(center, filter_size)
@@ -867,6 +871,73 @@ def get_background_estimate(
         filtered = np.zeros_like(plane_mean)
         filtered[slices] = center_filtered
         return filtered
+
+
+def _bg_component_helper(
+    args: tuple[str, slice, onp.Array1D[np.bool_]]) -> tuple[onp.Array1D[np.float32], onp.Array1D[np.float32]]:
+    """Compute mean f and b on slice, for pixels in given mask"""
+    mmap_path, time_slice, pixel_mask = args
+    Y, _, _ = cm.load_memmap(mmap_path, 'r')
+    chunk = Y[pixel_mask, time_slice]
+    f = np.mean(chunk, axis=0)
+    b = chunk @ f
+    return b, f
+
+
+def estimate_bg_component(
+    plane_mmap_path: str, border: BorderSpec, corrected_mean_proj: onp.Array2D[np.floating],
+    cellpose_params: cmp.CellposeParams, chunk_size=1000, dview: Optional[Cluster] = None,
+    ) -> tuple[onp.Array2D[np.floating], onp.Array1D[np.floating]]:
+    """Make estimate of mean background spatial and temporal components"""
+    dims, T = get_file_size(plane_mmap_path)
+    assert isinstance(T, int), 'Should be scalar for scalar input'
+    assert len(dims) == 2, 'Plane is 2-dimensional'
+
+    # first identify non-cell pixels using cellpose, then find mean activation across movie
+    bg_seed_params = cmp.SeedParams(use_cellpose=True, cellpose_params=cellpose_params)
+    seed = footprints.make_spatial_seed(corrected_mean_proj, bg_seed_params)
+    not_cell_pixels = (seed.sum(axis=1) == 0) & border.flatmask(dims)  # outside cells, within borders
+    cell_pixels = ~not_cell_pixels & border.flatmask(dims)  # inside cells, within borders
+
+    coords = np.mgrid[0:dims[0], 0:dims[1]]
+    Y_flat = coords[0].ravel(order='F')
+    X_flat = coords[1].ravel(order='F')
+    not_cell_coords = np.stack([Y_flat[not_cell_pixels], X_flat[not_cell_pixels]], axis=1)
+    cell_coords = np.stack([Y_flat[cell_pixels], X_flat[cell_pixels]], axis=1)
+    
+    # estimate component in the same way as caiman - first get temporal mean, then full spatial component
+    args = [
+        (plane_mmap_path, slice(start, min(start + chunk_size, T)), not_cell_pixels)
+        for start in range(0, T, chunk_size)
+    ]
+    if dview is None:
+        map_fn = map
+    elif isinstance(dview, Pool):
+        map_fn = dview.map
+    else:
+        map_fn = dview.map_sync
+    
+    bf_each_chunk = map_fn(_bg_component_helper, args)
+    f = np.concatenate([res[1] for res in bf_each_chunk])
+    b_not_cell = np.sum([res[0] for res in bf_each_chunk], axis=0)
+    b_not_cell /= np.linalg.norm(f) ** 2  # normalize so that if a row i of Y == f, b[i] = 1
+
+
+    # interpolate to fill in holes where cells are - first linear, then nearest
+    interp_lin = interp.LinearNDInterpolator(not_cell_coords, b_not_cell)
+    b_cell = interp_lin(cell_coords)
+    is_outside_hull = np.isnan(b_cell)
+    if np.any(is_outside_hull):
+        # fill in pixels outside convex hull with nearest interpolator
+        outside_hull_coords = cell_coords[is_outside_hull, :]
+        interp_nearest = interp.NearestNDInterpolator(not_cell_coords, b_not_cell)
+        b_cell[is_outside_hull] = interp_nearest(outside_hull_coords)
+    
+    b = np.zeros(dims, dtype=np.float32)
+    b[not_cell_coords[:, 0], not_cell_coords[:, 1]] = b_not_cell
+    b[cell_coords[:, 0], cell_coords[:, 1]] = b_cell
+
+    return b, f
 
 
 def transpose_flatten_mc_mmap(
@@ -913,11 +984,22 @@ def transpose_flatten_mc_mmap(
             byte_offset = pixels_per_plane * k_plane * bytes_per_pixel * T
 
             add_to_movie = trans_params.add_to_mov
-            if trans_params.remove_bg_mean:
-                # implement remove_bg_mean by setting add_to_movie to a 2D array (can be size of whole plane or just center)
+            add_to_movie_temporal = None
+            if trans_params.remove_bg_mean or trans_params.remove_bg_component:
+                plane_mean = make_projection_parallel(input_path, 'mean', dview=dview)
                 filter_size = trans_params.bg_filter_size
-                bg_mean_center = get_background_estimate(input_path, border, filter_size, dview=dview)
-                add_to_movie = add_to_movie - trans_params.bg_mean_scale * bg_mean_center
+                bg_mean = estimate_bg_mean(plane_mean, border, filter_size, dview=dview, return_center_only=False)
+
+                if trans_params.remove_bg_mean:
+                    # implement remove_bg_mean by setting add_to_movie to a 2D array (can be size of whole plane or just center)
+                    add_to_movie = add_to_movie - trans_params.bg_scale * bg_mean
+
+                if trans_params.remove_bg_component:
+                    # technically not mutually exclusive with remove_bg_mean, but probably it should be
+                    corrected_mean_proj = plane_mean - bg_mean
+                    bg_mean_spatial, add_to_movie_temporal = estimate_bg_component(
+                        input_path, border, corrected_mean_proj, trans_params.bg_cellpose_params, dview=dview)
+                    add_to_movie = add_to_movie - trans_params.bg_scale * bg_mean_spatial
 
             save_c_order_mmap_parallel(
                 movie_path=input_path,
@@ -925,6 +1007,7 @@ def transpose_flatten_mc_mmap(
                 dview=dview,
                 fr=fr,
                 add_to_movie=add_to_movie,
+                add_to_movie_temporal=add_to_movie_temporal,
                 border_pixels=border.ceil(),
                 highpass_cutoff=highpass_cutoff,
                 highpass_order=highpass_order,

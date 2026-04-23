@@ -45,7 +45,7 @@ BorderDict = Annotated[Border, BeforeValidator(border_from_spec)]
 @dataclass(kw_only=True, frozen=True)
 class StageParams:
     """Params for a particular analysis stage (abstract base class)"""
-    __pydantic_config__ = ConfigDict(extra='forbid', serialize_by_alias=True)
+    __pydantic_config__ = ConfigDict(extra='forbid', serialize_by_alias=True, validate_by_name=True)
 
     @classmethod
     @cache
@@ -249,31 +249,8 @@ class McorrParamsExtra(StageParams):
 
 
 @dataclass(kw_only=True, frozen=True)
-class TranspositionParams(StageParams):
-    """Settings for transpose/concat planes"""
-    highpass_cutoff: float = 0.
-    highpass_order: int = 4
-    add_to_mov: float = 0.
-    blur_kernel_size: int = 1  # same as blur_size in SeedParams
-    remove_bg_mean: bool = False  # remove min- and gaussian-filtered mean projection (background estimate)
-    bg_filter_size: int = Field(default=20, gt=1)  # size of square min filter (gaussian sigma is half this)
-    bg_mean_scale: float = 1.  # scalar to multiply by background mean before subtracting
-
-    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
-        irrelevant_fields = set(ignore)
-
-        if self.highpass_cutoff == 0 and other.highpass_cutoff == 0:
-            irrelevant_fields.add('highpass_order')
-        
-        if not self.remove_bg_mean and not other.remove_bg_mean:
-            irrelevant_fields |= {'bg_filter_size', 'bg_mean_scale'}
-
-        yield from super().get_differing_params(other, metadata, ignore=irrelevant_fields)
-
-
-@dataclass(kw_only=True, frozen=True)
 class CellposeParams(StageParams):
-    """Params for using cellpose for seed"""
+    """Params for using cellpose for seed or background identification"""
     # params to constructor
     pretrained_model: str = 'cpsam'
     diam_mean: Optional[float] = None
@@ -300,6 +277,35 @@ class CellposeParams(StageParams):
 
     def get_eval_params(self) -> dict[str, Any]:
         return {n: getattr(self, n) for n in self.params() if n not in self._constr_params}
+
+
+@dataclass(kw_only=True, frozen=True)
+class TranspositionParams(StageParams):
+    """Settings for transpose/concat planes"""
+    highpass_cutoff: float = 0.
+    highpass_order: int = 4
+    add_to_mov: float = 0.
+    blur_kernel_size: int = 1  # same as blur_size in SeedParams
+
+    remove_bg_mean: bool = False  # remove min- and gaussian-filtered mean projection (background estimate)
+    bg_filter_size: int = Field(default=20, gt=1)  # size of square min filter (gaussian sigma is half this)
+
+    remove_bg_component: bool = False  # remove spatiotemporal mean component outside of neurons (determined by cellpose)
+    bg_cellpose_params: CellposeParams = CellposeParams(flow_threshold=0)
+
+    bg_scale: Annotated[float, Field(validation_alias='bg_mean_scale')] = 1.  # scalar to multiply by background before subtracting
+    
+
+    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
+        irrelevant_fields = set(ignore)
+
+        if self.highpass_cutoff == 0 and other.highpass_cutoff == 0:
+            irrelevant_fields.add('highpass_order')
+        
+        if not self.remove_bg_mean and not other.remove_bg_mean:
+            irrelevant_fields |= {'bg_filter_size', 'bg_scale'}
+
+        yield from super().get_differing_params(other, metadata, ignore=irrelevant_fields)
 
 
 @dataclass(kw_only=True, frozen=True)
