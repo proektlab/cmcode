@@ -240,9 +240,9 @@ class BorderSpec:
         return (max(shape[0] - self.top_subpix - self.bottom_subpix, 0),
                 max(shape[1] - self.left_subpix - self.right_subpix, 0))
 
-    def flatmask(self, shape: tuple[int, ...], order: onp.OrderKACF = 'F') -> np.ndarray:
+    def flatmask(self, shape: tuple[int, ...], order: onp.OrderKACF = 'F') -> onp.Array1D[np.bool_]:
         """Make a boolean vector for masking a flattened array within these borders."""
-        mask = np.zeros(shape, dtype=bool)
+        mask = np.zeros(shape, dtype=np.bool_)
         mask[self.slices(shape)] = True
         return mask.ravel(order=order)
 

@@ -682,16 +682,18 @@ class CNMFVizWideContainer(CNMFVizContainer):
             if est.F_dff is not None:
                 dff = est.F_dff[cell_id]
                 dff_plots.append(hv.Curve(
-                    (range(len(dff)), dff), kdims='frame', vdims=dff_str, label='raw').opts(color='#666'))
+                    (range(len(dff)), dff), kdims='frame', vdims=dff_str, label='raw')
+                    .opts(color='#666', framewise=True))
                 if est.F_dff_denoised is not None:
                     dff_dn = est.F_dff_denoised[cell_id]
                     dff_plots.append(hv.Curve(
-                        (range(len(dff_dn)), dff_dn), kdims='frame', vdims=dff_str, label='denoised').opts(color='#0F0'))
+                        (range(len(dff_dn)), dff_dn), kdims='frame', vdims=dff_str, label='denoised')
+                        .opts(color='#0F0', framewise=True))
             else:
                 dff_plots.append(hv.Text(0.5, 0.5, dff_str + " is not available").opts(width=900))
             return hv.Overlay(dff_plots).opts(width=900)
 
-        return hv.DynamicMap(dff_plot, streams=[self._metric_stream]).opts(framewise=True) # type: ignore
+        return hv.DynamicMap(dff_plot, streams=[self._metric_stream])#.opts(framewise=True) # type: ignore
 
     def set_component_index(self, index):
         super().set_component_index(index)

@@ -283,8 +283,8 @@ class CellposeParams(StageParams):
     invert: bool = False
     rescale: Optional[float] = None
     diameter: Union[None, float, list[float]] = None
-    flow_threshold: float = 0.8  # modified from cellpose default
-    cellprob_threshold: float = -3.  # modified from cellpose default
+    flow_threshold: Optional[float] = 0.8  # modified from cellpose default
+    cellprob_threshold: Optional[float] = -3.  # modified from cellpose default
     min_size: Optional[int] = 15
     max_size_fraction: Optional[float] = 0.4
     niter: Optional[int] = None
@@ -359,7 +359,7 @@ class SeedParams(StageParams):
             norm_medw=None if use_cellpose else 25,
             gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
             use_cellpose=use_cellpose,
-            cellpose_params=CellposeParams()
+            cellpose_params=CellposeParams(flow_threshold=None)
             )
 
     def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:

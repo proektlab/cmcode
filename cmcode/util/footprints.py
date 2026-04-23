@@ -6,6 +6,7 @@ import math
 from typing import Any, Literal, Union, Sequence, Callable, Optional, Mapping, overload
 from warnings import warn
 
+import cellpose.models
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
@@ -13,10 +14,11 @@ import optype.numpy as onp
 from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import gaussian_filter
 from scipy import sparse
+import torch
 
 from caiman.source_extraction.cnmf.merging import get_ROIs_to_merge
 
-from cmcode import caiman_analysis as cma, cmcustom
+from cmcode import caiman_analysis as cma, cmcustom, caiman_params as cmp
 from cmcode.cmcustom import my_get_contours
 from cmcode.util.image import make_merge, BorderSpec
 from cmcode.util.naming import make_sess_name
@@ -253,7 +255,7 @@ def map_footprints(A: MaybeSparse, xy_remap: RemapOrNull) -> sparse.csc_matrix[n
     return sparse.csc_matrix(sparse.coo_matrix((coo_data, (rows, cols)), shape=A2.shape))
 
 
-def make_spatial_seed_from_projection(proj: onp.Array2D[np.floating], seed_params_extra: dict[str, Any]) -> sparse.csc_array[np.bool_]:
+def make_spatial_seed_caiman(proj: onp.Array2D[np.floating], seed_params_extra: dict[str, Any]) -> sparse.csc_array[np.bool_]:
     """Extract binary spatial seed from projection image and parameters"""
     borders: list[BorderSpec] = seed_params_extra.pop('borders')
     concat_planes = len(borders)
@@ -293,6 +295,36 @@ def make_spatial_seed_from_masks(masks: onp.Array2D[np.integer]) -> sparse.csc_a
     coords = (filled_pixels, comp_nums)
     seed = sparse.coo_array((coo_data, coords), (len(masks_flat), int(np.max(masks_flat))))
     return seed.tocsc()
+
+
+def make_spatial_seed(
+    proj: onp.Array2D[np.floating], seed_params: cmp.SeedParams, 
+    seed_params_extra: Optional[dict[str, Any]] = None, default_gSig=5) -> sparse.csc_array[np.bool_]:
+    """Make seed given projection and seed params"""
+    if seed_params.use_cellpose:
+        cellparams = seed_params.cellpose_params
+
+        use_gpu = torch.cuda.is_available()
+        if not use_gpu:
+            logging.warning('GPU not available for torch (when running cellpose)')
+
+        model = cellpose.models.CellposeModel(gpu=use_gpu, **cellparams.get_constructor_params())
+        masks, _, _ = model.eval(proj, **cellparams.get_eval_params())
+        seed = make_spatial_seed_from_masks(masks)
+
+    else:  # use my_extract_binary_masks_from_structural_channel
+        if seed_params_extra is None:
+            raise RuntimeError('Cannot compute seed using caiman without seed_params_extra')
+
+        for extract_param in ('gSig', 'blur_type', 'blur_gSig_multiple', 'min_area_size', 'min_hole_size', 'expand_method', 'selem'):
+            seed_params_extra[extract_param] = getattr(seed_params, extract_param)
+
+        # fill in default value of gSig
+        if seed_params_extra['gSig'] is None:
+            seed_params_extra['gSig'] = default_gSig
+
+        seed = make_spatial_seed_caiman(proj, seed_params_extra)
+    return seed
 
 
 def plot_masks(masks: onp.Array2D[np.integer], background: Optional[onp.Array2D[np.floating]] = None):

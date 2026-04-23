@@ -769,6 +769,8 @@ def get_transposed_mmap_name(orig_mmap_names: Sequence[str], trans_params: cmp.T
     
     # collect param strings to add to the filename to disambiguate
     # note this is just for convenience; actual decision for whether it can be used is from the params file
+    # TODO maybe just date the files, like the mcorr results, rather than putting parameters in the filename?
+    # but then it would be less clear which transposed file(s) comes from which original plane files, if that matters
     extra_param_strings = []
 
     if trans_params.blur_kernel_size != 1:

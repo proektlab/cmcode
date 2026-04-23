@@ -16,7 +16,6 @@ import shutil
 from subprocess import CalledProcessError
 from typing import Optional, Union, Any, cast, Literal, overload, TYPE_CHECKING
 
-import cellpose.models
 import cv2
 from hdf5storage import savemat
 import matplotlib.pyplot as plt
@@ -28,7 +27,6 @@ import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
 from scipy import sparse
-import torch
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
@@ -1351,28 +1349,7 @@ class SessionAnalysis:
                 type=seed_params.type, blur_size=seed_params.blur_size, norm_medw=seed_params.norm_medw, borders=borders)
             np.save(output_dir / 'projection_for_seed.npy', proj)
 
-            if seed_params.use_cellpose:
-                cellparams = seed_params.cellpose_params
-                logging.info('Making spatial seed using cellpose')
-
-                use_gpu = torch.cuda.is_available()
-                if not use_gpu:
-                    logging.warning('GPU not available for torch (when running cellpose)')
-
-                model = cellpose.models.CellposeModel(gpu=use_gpu, **cellparams.get_constructor_params())
-                masks, _, _ = model.eval(proj, **cellparams.get_eval_params())
-                Ain = footprints.make_spatial_seed_from_masks(masks)
-
-            else:  # use my_extract_binary_masks_from_structural_channel
-                for extract_param in ('gSig', 'blur_type', 'blur_gSig_multiple', 'min_area_size', 'min_hole_size', 'expand_method', 'selem'):
-                    seed_params_extra[extract_param] = getattr(seed_params, extract_param)
-
-                # fill in default value of gSig
-                if seed_params_extra['gSig'] is None:
-                    seed_params_extra['gSig'] = params_obj.init.gSig[0]
-
-                Ain = footprints.make_spatial_seed_from_projection(proj, seed_params_extra)
-
+            Ain = footprints.make_spatial_seed(proj, seed_params, seed_params_extra, default_gSig=params_obj.init.gSig[0])
             np.save(output_dir / f'{Ain_name}.npy', np.array(Ain))  # saves as object array
 
         if 'dview' not in run_args and backend in ['local', 'local_async']:
