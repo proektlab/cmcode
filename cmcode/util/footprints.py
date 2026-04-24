@@ -9,6 +9,7 @@ from warnings import warn
 import cellpose.models
 import cv2
 import matplotlib.pyplot as plt
+import matplotlib.style as mplstyle
 import numpy as np
 import optype.numpy as onp
 from scipy.interpolate import make_smoothing_spline
@@ -16,6 +17,7 @@ from scipy.ndimage import gaussian_filter
 from scipy import sparse
 import torch
 
+from caiman.base import rois
 from caiman.source_extraction.cnmf.merging import get_ROIs_to_merge
 
 from cmcode import caiman_analysis as cma, cmcustom, caiman_params as cmp
@@ -334,6 +336,37 @@ def plot_masks(masks: onp.Array2D[np.integer], background: Optional[onp.Array2D[
         ax.imshow(background)
     ax.contourf(masks, levels=np.arange(0.5, np.max(masks)+0.5), colors=[f'C{i}' for i in range(10)], alpha=0.4)
     return fig
+
+
+def extract_roi_thumbnails(
+    A: MaybeSparse[np.floating], roi_ids: Sequence[int], proj: onp.Array2D[np.floating], box_size=25,
+    edge_fill_value=0.) -> onp.Array3D[np.floating]:
+    """Make a stack of thumbnail images from the given projection around the given ROIs"""
+    dims = proj.shape
+    coms: onp.Array2D[np.floating] = rois.com(A[:, roi_ids], *dims)
+    thumbnails = np.full((len(roi_ids), box_size, box_size), edge_fill_value, dtype=proj.dtype)
+
+    for com, dest in zip(coms, thumbnails):
+        com_y = float(com[0])
+        com_x = float(com[1])
+
+        # get data for image, filling with zeros if necessary
+        top = round(com_y - box_size / 2)
+        bottom = top + box_size
+        left = round(com_x - box_size / 2)
+        right = left + box_size
+        nclip_top = max(0, -top)
+        nclip_bottom = max(0, bottom - dims[0])
+        nclip_left = max(0, -left)
+        nclip_right = max(0, right - dims[1])
+        data = proj[top+nclip_top:bottom-nclip_bottom, left+nclip_left:right-nclip_right]
+        dest[nclip_top:box_size-nclip_bottom, nclip_left:box_size-nclip_right] = data
+
+    return thumbnails
+
+def extract_roi_thumbnail(
+    A: MaybeSparse[np.floating], roi_id: int, proj: onp.Array2D[np.floating], box_size=25) -> onp.Array2D[np.floating]:
+    return extract_roi_thumbnails(A, [roi_id], proj, box_size=box_size)[0]
 
 
 def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[float], np.ndarray], n_border_points,
@@ -685,7 +718,7 @@ def plot_ROIs_to_merge_crossplane(sessinfo: 'cma.SessionAnalysis', planes_to_mer
     assert sessinfo.cnmf_fit is not None
     dff = sessinfo.cnmf_fit.estimates.F_dff_denoised
     if dff is None:
-        sessinfo.make_df_over_f(denoised=True)
+        sessinfo.make_df_over_f()
         dff = sessinfo.cnmf_fit.estimates.F_dff_denoised
     assert dff is not None
     assert (A_orig := sessinfo.cnmf_fit.estimates.A) is not None
@@ -696,7 +729,7 @@ def plot_ROIs_to_merge_crossplane(sessinfo: 'cma.SessionAnalysis', planes_to_mer
     A0_merged = A0_merged[:, in_planes_inds]
     A1_merged = A1_merged[:, in_planes_inds]
 
-    with plt.style.context('dark_background'):
+    with mplstyle.context('dark_background'):  # type: ignore
         fig = plt.figure(figsize=(15, 8))
         n_rows = math.ceil(A0_merged.shape[1] / n_cols)
         axs = fig.subplot_mosaic([['image', [[f'dff{kc*n_rows + kr}' for kc in range(n_cols)] for kr in range(n_rows)]]])

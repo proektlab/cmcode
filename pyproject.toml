@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cmcode"
+version = "0.1.0"
+description = "Caiman 2P analysis code for Proekt Lab"
+requires-python = ">=3.10"
+authors = [
+    {name = "Ethan Blackwood", email = "ethanbblackwood@gmail.com"}
+]
+dependencies = [
+    "asyncssh",
+    "caiman>=1.10.0",
+    "cellpose",
+    "dask",
+    "fastplotlib~=0.1.0.a17",
+    "h5py",
+    "hdf5storage",
+    "ipympl",
+    "mesmerize-core",
+    "mesmerize-viz",
+    "mslex",
+    "nest-asyncio",
+    "opencv-python",
+    "optype[numpy]",
+    "pydantic",
+    "scipy-stubs",
+    "suite2p",
+    "torch",
+    "typing_extensions"
+]
+
+[project.scripts]
+caimanlab = "cmcode.remote.caimanlab:main"
+
+[tool.setuptools]
+packages = ["cmcode"]
+
+
+[tool.pyright]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportPrivateImportUsage = false

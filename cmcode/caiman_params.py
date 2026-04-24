@@ -924,7 +924,7 @@ def make_cnmf_params(metadata: dict, ndim: int, tif_file: Optional[str] = None,
             'gSig': round_to_odd(np.array([9, 9]) * scale),     # expected half-width of neurons in pixels (Gaussian kernel standard deviation)
             'method_init': 'greedy_roi',  # initialization method (if analyzing dendritic data see demo_dendritic.ipynb)
             'ssub': 1,                    # spatial subsampling during initialization 
-            'tsub': 1,                    # temporal subsampling during intialization
+            'tsub': 10,                    # temporal subsampling during intialization
         },
 
         'spatial': {

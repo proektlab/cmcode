@@ -2160,10 +2160,11 @@ class SessionAnalysis:
             image_data_options = ['corr', 'mean_equalized']
 
         start_uuid = self.get_selected_uuid()
-        if start_uuid is None or start_uuid not in completed_runs.uuid:
+        shown_uuids = list(completed_runs.uuid)
+        if start_uuid is None or start_uuid not in shown_uuids:
             start_i = -1
         else:
-            start_i = list(completed_runs.uuid).index(start_uuid)
+            start_i = shown_uuids.index(start_uuid)
 
         temporal_kwargs = {'add_background': add_background, 'add_residuals': add_residuals}
 
@@ -2386,8 +2387,9 @@ class SessionAnalysis:
         return tuple(dims)
 
 
-    def save_roi_thumbnails(self, roi_ids: Optional[Sequence[int]] = None, proj_type: Union[str, dict] = 'mean',
-                            box_size=25, vmin_pct=1., vmax_pct=99.96, cmap='gray', force=False) -> list[str]:
+    def save_roi_thumbnails(
+        self, roi_ids: Optional[Sequence[int]] = None, proj_type: Union[str, Mapping[str, Any], onp.Array2D[np.floating]] = 'mean',
+        box_size=25, vmin_pct=1., vmax_pct=99.96, cmap='gray', force=False) -> list[str]:
         """
         Save square thumbnails of projections around each requested ROI (or all by default).
         Save location is "thumbnails" subdir of the export folder. Returns a list of saved paths.
@@ -2418,47 +2420,37 @@ class SessionAnalysis:
         fns = [f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_{uuid}_roi{roi_id}_{box_size}x{box_size}.png'
                for roi_id in roi_ids]
         save_paths = [os.path.join(thumbnail_dir, fn) for fn in fns]
-
-        # get centers of mass
-        dims = cast(tuple[int, int], est.dims)
-        A = sparse.csc_array(est.A)
-        coms: onp.Array2D[np.floating] = rois.com(A[:, roi_ids], *dims)  # type: ignore
+        if not force:
+            do_ids, do_paths = [], []
+            for roi_id, path in zip(roi_ids, save_paths):
+                if os.path.exists(path):
+                    logging.info(f'Skipping {roi_id} since it is already saved')
+                else:
+                    do_ids.append(roi_id)
+                    do_paths.append(path)
+            roi_ids = do_ids
+            save_paths = do_paths
 
         # get projection
         if isinstance(proj_type, str):
             proj = self.get_projection(proj_type)
-        else:
+        elif isinstance(proj_type, Mapping):
             proj, _ = self.get_projection_for_seed(**proj_type)
+        else:
+            assert isinstance(proj_type, np.ndarray), 'proj_type must be a string, dict, or the projection itself'
+            proj = proj_type
         
+        A = sparse.csc_array(est.A)
+        thumbnails = footprints.extract_roi_thumbnails(A, roi_ids, proj, box_size=box_size, edge_fill_value=np.nan)
+
         fig, ax = plt.subplots()
-        thumbnail = np.empty((box_size, box_size), dtype=proj.dtype)
-
-        for roi_id, path, com in zip(roi_ids, save_paths, tqdm(coms, desc='Saving thumbnails...', unit='ROI')):
-            if not force and os.path.exists(path):
-                logging.info(f'Skipping {roi_id} since it is already saved')
-                continue
-
-            com_y = float(com[0])
-            com_x = float(com[1])
-
-            # get data for image, filling with zeros if necessary
-            top = round(com_y - box_size / 2)
-            bottom = top + box_size
-            left = round(com_x - box_size / 2)
-            right = left + box_size
-            nclip_top = max(0, -top)
-            nclip_bottom = max(0, bottom - dims[0])
-            nclip_left = max(0, -left)
-            nclip_right = max(0, right - dims[1])
-            thumbnail[:] = 0
-            data = proj[top+nclip_top:bottom-nclip_bottom, left+nclip_left:right-nclip_right]
-            thumbnail[nclip_top:box_size-nclip_bottom, nclip_left:box_size-nclip_right] = data
-
+        for roi_id, path, img in zip(roi_ids, save_paths, tqdm(thumbnails, desc='Saving thumbnails...', unit='ROI')):
             # plot, taking colormap etc. into account
-            vmin = float(np.percentile(data[~np.isnan(data)], vmin_pct))
-            vmax = float(np.percentile(data[~np.isnan(data)], vmax_pct))
+            vmin = float(np.percentile(img[~np.isnan(img)], vmin_pct))
+            vmax = float(np.percentile(img[~np.isnan(img)], vmax_pct))
+            img[np.isnan(img)] = 0
             ax.clear()
-            ax.imshow(thumbnail, interpolation='none', vmin=vmin, vmax=vmax, cmap=cmap)
+            ax.imshow(img, interpolation='none', vmin=vmin, vmax=vmax, cmap=cmap)
             ax.set_axis_off()
 
             # save as PNG
