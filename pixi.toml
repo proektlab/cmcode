@@ -1,0 +1,19 @@
+# Info for pixi-build
+[package]
+version = "0.1.0"  # see: https://github.com/prefix-dev/pixi/issues/2946
+
+[package.build.backend]
+name = "pixi-build-python"
+version = "0.4.*"
+
+[package.build.config]
+ignore-pypi-mapping = false
+
+[package.host-dependencies]
+uv = "*"  # added for faster installation
+
+[package.run-dependencies]
+caiman = { git = "ssh://git@github.com/proektlab/CaImAn", branch = "new-dev" }
+mesmerize-core = { git = "ssh://git@github.com/proektlab/mesmerize-core", branch = "new-dev" }
+fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", tag = "v0.1.0.a17" }
+mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
