@@ -10,7 +10,10 @@ ignore-pypi-mapping = false
 uv = "*"  # added for faster installation
 
 [package.run-dependencies]
-caiman = { git = "ssh://git@github.com/proektlab/CaImAn", branch = "new-dev" }
-mesmerize-core = { git = "ssh://git@github.com/proektlab/mesmerize-core", branch = "new-dev" }
 fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2" }
 mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
+
+
+[workspace]
+preview = ["pixi-build"]
+channels = ["conda-forge"]
