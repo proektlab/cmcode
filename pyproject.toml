@@ -35,8 +35,8 @@ dependencies = [
 [project.scripts]
 caimanlab = "cmcode.remote.caimanlab:main"
 
-[tool.setuptools]
-packages = ["cmcode"]
+[tool.setuptools.packages.find]
+exclude = ["assets*"]
 
 
 [tool.pyright]
