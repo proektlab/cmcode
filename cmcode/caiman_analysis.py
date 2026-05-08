@@ -676,18 +676,18 @@ class SessionAnalysis:
             raise RuntimeError('Must convert to TIF before doing motion correction')
 
         # update indices if necessary
-        if self.params.mcorr_extra.indices_exclude_fringe and not self.params.mcorr_extra._indices_are_adjusted:
-            new_indices = mcorr.compute_adjusted_indices(self.params)
-            param_updates: dict[str, dict[str, Any]] = {'mcorr_extra': {'_indices_are_adjusted': True}}
+        params = self.params
+        motion_params = params.motion
+        if params.mcorr_extra.indices_exclude_fringe:
+            new_indices = mcorr.compute_adjusted_indices(params)
             if new_indices is not None:
                 logging.info(f'Changing indices to {new_indices} to avoid dead pixels')
-                param_updates['motion'] = {'indices': new_indices}
-            
-            self.update_params(param_updates)
+                motion_params = params.motion.replace(indices=new_indices)
+                params = params.model_copy(update={'motion': motion_params})  # to be used for running, not written to params file
 
         plane_mmaps: list[str] = []
         plane_results: list[Optional[mcorr.PlaneMcorrResult]] = []  # will be filled with only new results
-        is_piecewise = self.params.motion.pw_rigid
+        is_piecewise = motion_params.pw_rigid
 
         for k_plane, tif_path in enumerate(self.plane_tifs):
             plane_prefix = f'Plane {k_plane}: ' if len(self.plane_tifs) > 1 else ''
@@ -716,16 +716,16 @@ class SessionAnalysis:
             # we are doing mcorr for this plane
             logging.info(plane_prefix + 'doing motion correction.')
 
-            plane_result = mcorr.motion_correct_file(tif_path, self.params, dview=cluster.dview)
+            plane_result = mcorr.motion_correct_file(tif_path, params, dview=cluster.dview)
             plane_mmaps.append(plane_result.mmap_path)
             plane_results.append(plane_result)
             self.write_params_for_result_file(plane_result.mmap_path, AnalysisStage.MCORR)
         
         # build MCResult from list of PlaneMcorrResults
-        suite2p_reg_params = self.params.suite2p_register if self.params.mcorr_extra.use_suite2p else None
+        suite2p_reg_params = params.suite2p_register if params.mcorr_extra.use_suite2p else None
         self.mc_result = mcorr.MCResult(
             mmap_files=tuple(plane_mmaps), _loaded_results=plane_results, dims=self.plane_size,
-            motion_params=self.params.motion, suite2p_reg_params=suite2p_reg_params)
+            motion_params=motion_params, suite2p_reg_params=suite2p_reg_params)
 
         if save:
             self.save(save_cnmf=False)

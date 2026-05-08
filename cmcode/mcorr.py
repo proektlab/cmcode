@@ -628,8 +628,8 @@ def motion_correct_file_suite2p(tif_file: str, reg_params: cmp.Suite2pRegistrati
     # now apply to full movie if necessary
     if any(inds != slice(None) for inds in indices):
         logging.info('Applying shifts to full movie using Suite2p')
-        path = apply_mcorr_to_file_suite2p(tif_file, result, motion_params, reg_params)
-        assert str(path) == result.mmap_path, 'Should save to same path'
+        apply_mcorr_to_file_suite2p(
+            tif_file, result, motion_params, reg_params, output_path=output_path)
 
     # save shifts
     info_file = output_path.parent / (output_path.stem + '.npz')
@@ -651,11 +651,12 @@ def apply_mcorr_to_file_caiman(input_file: str, mcorr_obj: MotionCorrect) -> Pat
 
 def apply_mcorr_to_file_suite2p(
     input_file: str, result: PlaneMcorrResult, motion_params: MotionParams,
-    reg_params: Optional[cmp.Suite2pRegistrationParams]) -> Path:
+    reg_params: Optional[cmp.Suite2pRegistrationParams], output_path: Union[str, Path, None] = None) -> Path:
     """
     Use suite2p to apply shifts from the given plane to the given input movie,
     assuming it is the same size as the original movie (before cropping), and
-    save at the appropriate mcorr output path (returns this path)
+    save at the appropriate mcorr output path (returns this path).
+    If output_path is given, this overrides automatically creating a path with the current date/time.
     This also works on shifts computed using CaImAn. See also apply_mcorr_to_file_caiman.
     """
     # open the input file
@@ -665,10 +666,13 @@ def apply_mcorr_to_file_suite2p(
         raise ValueError('Input movie should be 2-dimensional')
     ny, nx = dims
 
-    # open the output file
-    is_piecewise = reg_params.nonrigid if reg_params is not None else motion_params.pw_rigid
-    with paths.linked_timestamped_path(input_file) as input_file_plus_dt:
-        output_path = _build_motion_correct_path(input_file_plus_dt, is_piecewise=is_piecewise)
+    # make the output path if necessary
+    if output_path is None:
+        is_piecewise = reg_params.nonrigid if reg_params is not None else motion_params.pw_rigid
+        with paths.linked_timestamped_path(input_file) as input_file_plus_dt:
+            output_path = _build_motion_correct_path(input_file_plus_dt, is_piecewise=is_piecewise)
+    else:
+        output_path = Path(output_path)
     
     # make mmap to hold output data
     output_mmap, _, _ = cm.load_memmap(str(output_path), mode='w+')  # pixels x time
@@ -689,12 +693,12 @@ def apply_mcorr_to_file_suite2p(
             blocks = get_suite2p_blocks_from_centers(patch_centers)
 
         # convert shifts_els to offsets (deviations from rigid)
-        yoff1 = result.shifts_els[0] - result.shifts_rig[0][:, :, np.newaxis]
-        xoff1 = result.shifts_els[0] - result.shifts_rig[0][:, :, np.newaxis]
+        yoff1: onp.Array2D[np.floating] = result.shifts_els[0] - result.shifts_rig[0][:, np.newaxis]
+        xoff1: onp.Array2D[np.floating] = result.shifts_els[1] - result.shifts_rig[1][:, np.newaxis]
     
     s2p_register.shift_frames_and_write(
         f_raw, f_reg, yoff=result.shifts_rig[0], xoff=result.shifts_rig[1],
-        yoff1=yoff1, xoff1=xoff1, blocks=blocks)
+        yoff1=yoff1.astype(np.float32), xoff1=xoff1.astype(np.float32), blocks=blocks)
 
     return output_path
 

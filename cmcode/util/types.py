@@ -1,4 +1,4 @@
-from typing import Optional, Union, TYPE_CHECKING, TypeVar, Type, Callable
+from typing import Optional, Union, TYPE_CHECKING, TypeVar
 
 import numpy as np
 import optype.numpy as onp

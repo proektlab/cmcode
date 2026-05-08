@@ -217,8 +217,10 @@ class McorrParamsExtra(StageParams):
     # whether to automatically adjust indices to take odd_row_ndead, odd_row_offset and crop into account
     # default = only for rigid motion correction.
     _indices_exclude_fringe: Optional[bool] = Field(default=None, alias='indices_exclude_fringe')
-    # flag that is set when indices are adjusted and unset when params affecting them are changed
-    _indices_are_adjusted: bool = False
+
+    # not using this anymore, instead never updating the indices field in the "real" params
+    # but rather creating a copy with adjusted indices when running motion correction
+    _indices_are_adjusted: bool = Field(default=False, deprecated=True, exclude=True)
 
     use_suite2p: bool = False
 
@@ -233,19 +235,6 @@ class McorrParamsExtra(StageParams):
             raise RuntimeError('Cannot compute indices_exclude_fringe without reference to mcorr params')
         
         return not self._mcorr_params.motion.pw_rigid
-
-
-    def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:
-        # only care about indices_exclude_fringe if indices are out of date, meaning that
-        # matching motion.indices can't be trusted.
-        if 'indices_exclude_fringe' not in ignore:
-            if self.indices_exclude_fringe and not other.indices_exclude_fringe and not self._indices_are_adjusted:
-                yield 'indices_exclude_fringe'
-
-            elif other.indices_exclude_fringe and not self.indices_exclude_fringe and not other._indices_are_adjusted:
-                yield 'indices_exclude_fringe'
-
-        yield from super().get_differing_params(other, metadata, ignore={'indices_exclude_fringe', '_indices_are_adjusted'})
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -749,18 +738,6 @@ class SessionAnalysisParams(UpToEvalParamStruct):
                     # set new_params attribute to an updated copy
                     new_subparams = curr_subparams.replace(**change_subparams)
                     setattr(new_params, key, new_subparams)
-
-                    # special case: unset _indices_are_adjusted flag if necessary
-                    if isinstance(curr_subparams, ConversionParams):
-                        assert isinstance(new_subparams, ConversionParams)
-                        for differing_param in curr_subparams.get_differing_params(new_subparams, metadata=metadata):
-                            if differing_param in ['crop', 'odd_row_offset', 'odd_row_ndead']:
-                                # add to mcorr_extra changes to apply in future loop iteration
-                                if 'mcorr_extra' not in changes:
-                                    changes['mcorr_extra'] = {'_indices_are_adjusted': False}
-                                else:  # note we make a new dict since the value is not guaranteed to be mutable
-                                    changes['mcorr_extra'] = {**changes['mcorr_extra'], '_indices_are_adjusted': False}
-                                break
 
             if stage_cnmf_updates:
                 new_params._cnmf.change_params(stage_cnmf_updates)

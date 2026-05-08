@@ -5,7 +5,6 @@ from typing import Iterable, Optional, Union
 from cmcode.remote import host_info
 from cmcode.remote.host_info import NetworkInfo
 from cmcode.util import paths
-from cmcode.util.paths import EquivalentPaths
 
 
 @dataclass
@@ -21,7 +20,7 @@ class ComputingEnvironment:
     """
     caiman_data_dir: Optional[Union[str, Path]] = None # path to caiman_data, must be set before root_data_dir
     network_hosts: NetworkInfo = NetworkInfo()         # hosts available to do work
-    root_mappings: Iterable[EquivalentPaths] = ()      # equivalent root paths
+    root_mappings: Iterable[paths.EquivalentPaths] = ()      # equivalent root paths
     root_data_dir: Optional[Union[str, Path]] = None   # path with 'processed' and 'raw' folders (required to do anything)
     ipyprofile_dir: Optional[Union[str, Path]] = None  # shared folder for ipyparallel
 

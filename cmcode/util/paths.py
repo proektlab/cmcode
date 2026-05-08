@@ -139,7 +139,7 @@ class EquivalentPaths:
                 return root_path, relpath
         return None
     
-    def try_map_path_to_host(self, path: Union[str, PurePath], host: Optional[HostInfo]) -> Optional[PurePath]:
+    def try_map_path_to_host(self, path: Union[str, PurePath], host: Optional[HostInfo] = None) -> Optional[PurePath]:
         """
         See whether the given path is an absolute path relative to one of these equivalent paths,
         and if so, map it to the canonical path for the given host.
