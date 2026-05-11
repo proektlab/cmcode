@@ -19,6 +19,7 @@ dependencies:
 - pytorch
 - setuptools < 82.0.0  # for mesmerize-viz (pkg_resources dependency in pygfx version)
 - scipy-stubs
+- tabulate
 - typing_extensions
 - pip:
   - mesmerize-viz

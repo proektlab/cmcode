@@ -30,8 +30,6 @@ from scipy import sparse
 
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
-from caiman.base import rois
-from caiman.source_extraction.cnmf.estimates import Estimates
 from caiman.source_extraction.cnmf.params import CNMFParams
 from caiman.source_extraction.cnmf.utilities import detrend_df_f
 from caiman.utils import sbx_utils
@@ -44,7 +42,7 @@ from cmcode import in_jupyter, alignment, cmcustom, gridsearch_analysis, mcorr, 
 from cmcode.caiman_params import SessionAnalysisParams, AnalysisStage
 from cmcode.remote import remoteops
 from cmcode.gridsearch_analysis import ParamGrid
-from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling
+from cmcode.mcorr import MCResult, PiecewiseMCInfo  # to allow unpickling  # noqa: F401
 from cmcode.util import footprints, paths, naming
 from cmcode.util.cluster import Cluster
 from cmcode.util.compat import reconstruct_sessdata_obj
@@ -1191,7 +1189,7 @@ class SessionAnalysis:
                         borders = self.get_borders(motion_corrected=True)
                         plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
                 else:
-                    logging.warning(f'projection_for_seed not saved; recomputing with current seed params')
+                    logging.warning('projection_for_seed not saved; recomputing with current seed params')
             
             if plane_projs is None:
                 # fall back to recomputing based on seed_params

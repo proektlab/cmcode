@@ -28,6 +28,7 @@ dependencies = [
     "pydantic",
     "scipy-stubs",
     "suite2p",
+    "tabulate",
     "torch",
     "typing_extensions"
 ]

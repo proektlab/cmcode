@@ -4,13 +4,14 @@ Holds information about hosts that can be used for cluster processing
 See private/example_local_environment.py for an example. 
 """
 from copy import copy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from functools import cache
 import os
 import psutil
 import shlex
 from socket import gethostname
 import sys
+from tabulate import tabulate
 from types import ModuleType
 from typing import Optional, Protocol, Union, runtime_checkable
 
@@ -236,6 +237,20 @@ class NetworkInfo:
         if part_info is None:
             raise UnknownPartitionError(host, partition)
         return part_info
+
+    def __str__(self):
+        host_dicts = [
+            {
+                fld: ', '.join(getattr(host, fld).keys()) if fld == 'partitions' else getattr(host, fld)
+                for fld in [f.name for f in fields(host)]
+            }
+            for host in self. hosts.values()
+        ]
+        return 'NetworkInfo with hosts:\n' + tabulate(host_dicts, headers='keys')
+
+    def __repr__(self):
+        return 'NetworkInfo(' + ', '.join([repr(host) for host in self.hosts.values()]) + ')'
+    
 
 def get_cpu_limits(network: NetworkInfo, hostname: str, partition: Optional[str] = None) -> tuple[int, int]:
     """For given host and SLURM partition if given, return the total CPUs and max usable per job"""
