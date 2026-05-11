@@ -36,10 +36,8 @@ dependencies = [
 caimanlab = "cmcode.remote.caimanlab:main"
 
 [tool.setuptools.packages.find]
-exclude = ["assets*"]
+include = ["cmcode*"]
 
 
 [tool.pyright]
 pythonVersion = "3.12"
-typeCheckingMode = "basic"
-reportPrivateImportUsage = false
