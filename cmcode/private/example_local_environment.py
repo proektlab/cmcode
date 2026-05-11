@@ -107,7 +107,7 @@ network_hosts.add_host(
     self_name='happy',
     ssh_name='happy.proektlab',
     is_pc=False,
-    envname='caiman',
+    env_name='caiman',
     n_cores=32
 )
 
@@ -116,7 +116,7 @@ network_hosts.add_host(
     self_name='Dopey',
     ssh_name='dopey.proektlab',
     is_pc=True,
-    envname='caiman-test',
+    env_name='caiman-test',
     n_cores=32
 )
 
@@ -125,7 +125,9 @@ network_hosts.add_host(
     self_name='sleepy.proektlab.local',
     ssh_name='sleepy.proektlab',
     is_pc=False,
-    envname='caiman',
+    env_name='caiman',
+    env_dir='/home/ethan/code/caiman_code',
+    env_is_pixi=True,  # activates pixi environment from /home/ethan/code/caiman_code/pixi.toml
     n_cores=56
 )
 
@@ -137,7 +139,8 @@ network_hosts.add_host(
     ssh_name='node01.abc',
     is_pc=False,
     n_cores=32,
-    envname='caiman'
+    env_name=None,
+    env_dir='/home/ethan/miniforge3/envs/caiman'  # prefix for conda
 )
 
 # Can add specific SLURM partitions to run jobs on

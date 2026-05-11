@@ -63,9 +63,18 @@ async def launch_command_on_host(command: str, host_spec: Union[str, WorkerConte
     If existing_connection is given, the connection will be used and not closed after the function completes.
     """
     host_spec, host = resolve_host(host_spec, no_slurm=no_slurm)
-    host_env = host.envname
-    if host_env is not None:
-        command = f'conda run -n {host_env} --live-stream ' + command
+
+    # apply conda or pixi environment
+    if host.env_is_pixi:
+        env_clause = f'-e {host.env_name}' if host.env_name is not None else ''
+        manifest_clause = f'-m {host.env_dir}/pixi.toml' if host.env_dir is not None else ''
+        command = f'pixi run {manifest_clause} {env_clause} {command}'
+    elif host.env_name is not None:
+        if host.env_dir is not None:
+            raise RuntimeError('Cannot specify both env_name and env_dir for conda environment')
+        command = f'conda run -n {host.env_name} --live-stream {command}'
+    elif host.env_dir is not None:
+        command = f'conda run -p {host.env_dir} --live-stream {command}'
 
     if not host.is_pc:
         if nohup and wait_for_str is not None:
