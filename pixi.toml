@@ -9,15 +9,22 @@ ignore-pypi-mapping = false
 [package.host-dependencies]
 uv = "*"  # added for faster installation
 
+[package.run-dependencies]
+# add in git dependencies manually since pypi-mapping ignores them
+fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2"}
+mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
+# add in [notebook] dependencies of fastplotlib manually since conda-build doesn't handle them
+jupyterlab = "*"
+jupyter-rfb = ">=0.4.1"
+ipywidgets = ">=8.0.0,<9"
+sidecar = "*"
 
 [workspace]
 preview = ["pixi-build"]
 channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 
-[pypi-dependencies]
-fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2", extras = ["notebook"] }
-mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
-
 [dependencies]
+caiman = { path = "../CaImAn" }
+mesmerize-core = { path = "../mesmerize-core" }
 cmcode = { path = "." }
