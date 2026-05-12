@@ -9,11 +9,15 @@ ignore-pypi-mapping = false
 [package.host-dependencies]
 uv = "*"  # added for faster installation
 
-[package.run-dependencies]
-fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2" }
-mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
-
 
 [workspace]
 preview = ["pixi-build"]
 channels = ["conda-forge"]
+platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
+
+[pypi-dependencies]
+fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2", extras = ["notebook"] }
+mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
+
+[dependencies]
+cmcode = { path = "." }
