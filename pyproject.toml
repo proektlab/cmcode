@@ -12,7 +12,7 @@ authors = [
 ]
 dependencies = [
     "asyncssh",
-    "caiman>=1.10.0",
+    "caiman[jupyter]>=1.10.0",
     "cellpose",
     "dask",
     "fastplotlib[notebook] @ git+ssh://git@github.com/ethanbb/fastplotlib.git@a16-numpy2",
