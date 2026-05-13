@@ -27,7 +27,7 @@ dependencies = [
     "optype[numpy]",
     "pydantic",
     "scipy-stubs",
-    "suite2p",
+    "suite2p @ git+ssh://git@github.com/proektlab/suite2p.git@proekt-dev",
     "tabulate",
     "torch",
     "typing_extensions"

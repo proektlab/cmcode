@@ -143,7 +143,7 @@ async def launch_new_server(host_spec: WorkerContext, host_info: HostInfo, noteb
     return server, proc_task
 
 
-async def launch(host_spec: Union[str, WorkerContext], force_new: bool = False, launch_timeout: int = 60,
+async def launch(host_spec: Union[str, WorkerContext], force_new: bool = False, launch_timeout: int = 300,
                  idle_timeout: Optional[int] = None, no_slurm: bool = True, slurm_args: Optional[str] = None,
                  show_output: bool = False, root_path: Optional[str] = None):
     """

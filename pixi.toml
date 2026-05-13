@@ -12,7 +12,9 @@ uv = "*"  # added for faster installation
 [package.run-dependencies]
 # add in git dependencies manually since pypi-mapping ignores them
 fastplotlib = { git = "ssh://git@github.com/ethanbb/fastplotlib", branch = "a16-numpy2"}
+# fastplotlib = { path = '../other_tools/fastplotlib' }  # use if setuptools version restriction doesn't propagate; should be fixed in https://github.com/prefix-dev/pixi/issues/6073
 mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch = "master" }
+optype-numpy = "*"  # optype with numpy extra is available as a different conda package
 # add in [notebook] dependencies of fastplotlib manually since conda-build doesn't handle them
 jupyterlab = "*"
 jupyter-rfb = ">=0.4.1"
@@ -23,8 +25,7 @@ jupyter = "*"
 jupyter_bokeh = "*"
 pyqtgraph = "*"
 tk = "*"
-# add in [numpy] dependencies of optype
-numpy-typing-compat = ">=20250818.1.25,<20251207"
+
 
 [workspace]
 preview = ["pixi-build"]
@@ -35,3 +36,6 @@ platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 caiman = { path = "../CaImAn" }
 mesmerize-core = { path = "../mesmerize-core" }
 cmcode = { path = "." }
+
+[pypi-dependencies]
+suite2p = { git = "ssh://git@github.com/proektlab/suite2p", branch = "proekt-dev" }
