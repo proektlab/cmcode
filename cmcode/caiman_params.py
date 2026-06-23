@@ -220,7 +220,7 @@ class McorrParamsExtra(StageParams):
 
     # not using this anymore, instead never updating the indices field in the "real" params
     # but rather creating a copy with adjusted indices when running motion correction
-    _indices_are_adjusted: bool = Field(default=False, deprecated=True, exclude=True)
+    _indices_are_adjusted: bool = Field(default=False, deprecated=True, exclude=True, repr=False)
 
     use_suite2p: bool = False
 

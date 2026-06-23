@@ -818,6 +818,37 @@ def mcorr_compare_widget(movie_orig: np.ndarray, movie_mcorr: np.ndarray):
     return mcorr_iw.show()
 
 
+def make_shifts_plot(mc_result: 'mcorr.MCResult'):
+    """Make plot that shows shifts in X and Y over time"""
+    # strategy: first make a holomap, then separate dimensions and planes
+    shifts_rig_data = mc_result.shifts_rig_hv
+    shifts_els_data = mc_result.shifts_els_hv
+    shift_holomap = shifts_rig_data.to(hv.Curve, 'frame', 'shift').opts(alpha=0.7)
+
+    if shifts_els_data is not None:
+        # add min and max piecewise shifts to rigid shift dataset
+        min_shifts = cast(hv.Dataset, shifts_els_data.aggregate(['frame', 'dim', 'plane'], function=np.min))
+        max_shifts = cast(hv.Dataset, shifts_els_data.aggregate(['frame', 'dim', 'plane'], function=np.max))
+        shifts_w_range = shifts_rig_data.add_dimension(
+            'minshift', 0, min_shifts.data['shift'], vdim=True).add_dimension(
+            'maxshift', 0, max_shifts.data['shift'], vdim=True)
+        shifts_w_range = shifts_w_range.transform(
+            upper=hv.dim('maxshift') - hv.dim('shift'),
+            lower=hv.dim('shift') - hv.dim('minshift')
+        )
+        range_holomap = shifts_w_range.to(hv.Spread, kdims='frame', vdims=['shift', 'lower', 'upper']).opts(
+            fill_alpha=0.45, line_alpha=0, tools=preferred_bokeh_tools
+        )
+        shift_holomap = shift_holomap * range_holomap
+
+    shift_holomap.get_dimension('dim').label = ''  # remove title from legend
+    shift_plots = shift_holomap.opts(height=300, responsive=True).overlay('dim').layout('plane').opts(
+        opts.NdOverlay(legend_cols=2),
+        opts.NdLayout(sizing_mode='stretch_width'))
+    
+    return shift_plots
+
+
 class patch_shift_mag_and_angle(Operation):
     vdim = hv.param.String(default='shift', doc='vdim containing shifts to operate on')
 
@@ -833,59 +864,33 @@ class patch_shift_mag_and_angle(Operation):
             'shift_angle', 0, angle, vdim=True).clone(
             vdims=['shift_mag', 'shift_angle']
             )
+    
+
+def make_els_shift_quiver_plot(mc_result: 'mcorr.MCResult') -> jbk.widgets.BokehModel:
+    """Make plot that shows nonrigid shifts as arrows, with a slider for time"""
+    if (shifts_els_data := mc_result.shifts_els_hv) is None:
+        raise RuntimeError('Must have nonrigid shifts to make quiver plot')
+
+    shifts_els_mag_and_angle = cast(hv.Dataset, patch_shift_mag_and_angle(shifts_els_data))  # type: ignore
+    def quiver(frame: int):
+        this_mag_and_angle = cast(hv.Dataset, shifts_els_mag_and_angle.select(frame=frame))
+        holomap_over_planes = this_mag_and_angle.reindex().to(
+            hv.VectorField, kdims=['xpatch', 'ypatch'], vdims=['shift_angle', 'shift_mag'],
+            group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True, tools=preferred_bokeh_tools)
+        return holomap_over_planes.layout('plane').opts(sizing_mode='stretch_width')
+
+    return hv.DynamicMap(quiver, kdims=['frame']).redim.values(frame=shifts_els_mag_and_angle.data['frame'])
 
 
-def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: 'mcorr.MCResult',
-                   show_quiver_plot=False):
+def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: 'mcorr.MCResult', show_quiver_plot=False):
     # make upper figure with histograms of mcorr shifts
-    shifts_rig_ds = mc_result.shifts_rig_hv
-    shifts_els_ds = mc_result.shifts_els_hv
-    shift_holomap = shifts_rig_ds.to(hv.Curve, 'frame', 'shift').opts(alpha=0.7)
+    shift_plots = make_shifts_plot(mc_result)
+    plot_rows = [pn.ipywidget(pn.Row(pn.pane.HoloViews(shift_plots), width_policy='max', max_width=2500))]
+    if show_quiver_plot and mc_result.shifts_els is not None:
+        quiver_plots = make_els_shift_quiver_plot(mc_result)
+        plot_rows.append(pn.ipywidget(pn.Row(
+            pn.pane.HoloViews(quiver_plots, widget_location='bottom'), width_policy='max', max_width=2500)))
     
-    if shifts_els_ds is not None:
-        # add min and max piecewise shifts to rigid shift dataset
-        min_shifts = cast(hv.Dataset, shifts_els_ds.aggregate(['frame', 'dim', 'plane'], function=np.min))
-        max_shifts = cast(hv.Dataset, shifts_els_ds.aggregate(['frame', 'dim', 'plane'], function=np.max))
-        shifts_w_range = shifts_rig_ds.add_dimension(
-            'minshift', 0, min_shifts.data['shift'], vdim=True).add_dimension(
-            'maxshift', 0, max_shifts.data['shift'], vdim=True)
-        shifts_w_range = shifts_w_range.transform(
-            upper=hv.dim('maxshift') - hv.dim('shift'),
-            lower=hv.dim('shift') - hv.dim('minshift')
-        )
-        range_holomap = shifts_w_range.to(hv.Spread, kdims='frame', vdims=['shift', 'lower', 'upper']).opts(
-            fill_alpha=0.45, line_alpha=0, tools=preferred_bokeh_tools
-        )
-        shift_holomap = shift_holomap * range_holomap
-
-        # make quiver plots of the shifts for each patch
-        if show_quiver_plot:
-            shifts_els_mag_and_angle = cast(hv.Dataset, patch_shift_mag_and_angle(shifts_els_ds))  # type: ignore
-            def quiver(plane: int, frame: int):
-                this_mag_and_angle = cast(hv.Dataset, shifts_els_mag_and_angle.select(plane=plane, frame=frame))
-                return this_mag_and_angle.reindex().to(
-                    hv.VectorField, kdims=['xpatch', 'ypatch'], vdims=['shift_angle', 'shift_mag'],
-                    group='Piecewise shifts').opts(invert_yaxis=True, data_aspect=1, responsive=True, tools=preferred_bokeh_tools)
-
-            kdims = ['plane', 'frame']
-            quiver_dmap = hv.DynamicMap(quiver, kdims=kdims).redim.values(
-                **{kdim: shifts_els_mag_and_angle.data[kdim] for kdim in kdims}
-            )
-            quiver_plots = quiver_dmap.layout('plane').opts(sizing_mode='stretch_width')  # type: ignore
-        else:
-            quiver_plots = None
-    else:
-        quiver_plots = None
-    
-    shift_holomap.get_dimension('dim').label = ''  # remove title from legend
-    shift_plots = shift_holomap.opts(height=300, responsive=True).overlay('dim').layout('plane').opts(
-        opts.NdOverlay(legend_cols=2),
-        opts.NdLayout(sizing_mode='stretch_width'))
-
-    plot_rows: list = [pn.ipywidget(pn.Row(pn.pane.HoloViews(shift_plots), width_policy='max', max_width=2500))]
-    if quiver_plots is not None:
-        plot_rows.append(pn.ipywidget(pn.Row(pn.pane.HoloViews(quiver_plots, widget_location='bottom'),
-                                             width_policy='max', max_width=2500)))
     plot_rows.append(mcorr_compare_widget(movie_orig, movie_mcorr))
     widget = VBox(plot_rows)
     return widget

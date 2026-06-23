@@ -1,8 +1,9 @@
 # Plotting/image helpers
+from collections.abc import Mapping, Sequence, Callable
 from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
-from typing import Union, Sequence, Optional, Callable, Any
+from typing import Union, Optional, Any
 from typing_extensions import Self
 
 import cv2
@@ -368,6 +369,29 @@ def make_merge(im1: np.ndarray, im2: np.ndarray,
     rgb1 = colorize(im1, color1, clip_percentile=clip_percentile)
     rgb2 = colorize(im2, color2, clip_percentile=clip_percentile)
     return np.clip(rgb1 + rgb2, 0, 1)
+
+
+def merge_to_rgb(
+    color_to_im_mapping: Mapping[Union[Sequence[float], str], np.ndarray],
+    clip_percentile: Union[float, tuple[float, float]] = (40, 99.7)) -> np.ndarray:
+    """
+    Colorize images according to their keys in color_to_im_mapping and merge into an RGB image.
+    Example: merge_to_rgb({'r': <image>, (0., 1., 1.): <image>}) 
+        ('c' is also understood for cyan)
+    All images must have the same dimensions.
+    """    
+    rgb = None
+    for color, im in color_to_im_mapping.items():
+        channel = colorize(im, color, clip_percentile=clip_percentile)
+        if rgb is None:
+            rgb = channel
+        else:
+            rgb = np.clip(rgb + channel, 0, 1)
+    
+    if rgb is None:
+        raise ValueError('Must provide at least one image to merge')
+    
+    return rgb
 
 
 def shift_image(image: onp.ToFloat2D, x_shift: float, y_shift: float) -> np.ndarray:

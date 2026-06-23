@@ -5,6 +5,7 @@ version = "0.4.*"
 
 [package.build.config]
 ignore-pypi-mapping = false
+extra-args = ["-Ceditable_mode=compat"]
 
 [package.host-dependencies]
 uv = "*"  # added for faster installation
@@ -25,11 +26,12 @@ jupyter = "*"
 jupyter_bokeh = "*"
 pyqtgraph = "*"
 tk = "*"
-
+# for https://github.com/holoviz/holoviews/issues/6882
+bokeh = ">=3.10.0.dev3"
 
 [workspace]
 preview = ["pixi-build"]
-channels = ["conda-forge"]
+channels = ["bokeh/label/dev", "conda-forge"]
 platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 
 [dependencies]

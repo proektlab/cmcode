@@ -264,13 +264,13 @@ class MCResult(paths.CustomPathMappable):
         assert ndims == 2, 'Only 2D shifts supported'
 
         # unravel shifts into X/Y grid
-        shifts_all_els = shifts_all_els.reshape(shifts_all_els.shape[:3] + (npatch_y, npatch_x), order='C')
+        shifts_all_els_grid = shifts_all_els.reshape(shifts_all_els.shape[:3] + (npatch_y, npatch_x), order='C')
 
         data_dims = {
             'plane': range(nplanes),
             'dim': ['y', 'x'],
             'frame': range(nframes),
-            'shift': shifts_all_els,
+            'shift': shifts_all_els_grid,
             'ypatch': patch_centers['y'],
             'xpatch': patch_centers['x']
         }

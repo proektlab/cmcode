@@ -1084,6 +1084,7 @@ def load_or_compute_remaps_for_sessions(
     Helper to load nonrigid mappings between sessions for the given sessions or compute them if they
     are not saved. If computing mappings, rigid_offsets will be used for the initial guesses if it is not None.
     See register_ROIs_multisession_3D for the other parameters.
+    See load_remaps_allpairs for the format of the returned mappings array.
 
     use_saved_mappings is a ternary flag:
         - If False, skips trying to load and just computes the mappings
