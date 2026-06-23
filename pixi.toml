@@ -18,7 +18,7 @@ mesmerize-viz = { git = "ssh://git@github.com/proektlab/mesmerize-viz", branch =
 optype-numpy = "*"  # optype with numpy extra is available as a different conda package
 # add in [notebook] dependencies of fastplotlib manually since conda-build doesn't handle them
 jupyterlab = "*"
-jupyter-rfb = ">=0.4.1"
+jupyter-rfb = ">=0.4.1,<1"
 ipywidgets = ">=8.0.0,<9"
 sidecar = "*"
 # add in [jupyter] dependencies of caiman
