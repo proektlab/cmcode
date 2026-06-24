@@ -26,12 +26,11 @@ jupyter = "*"
 jupyter_bokeh = "*"
 pyqtgraph = "*"
 tk = "*"
-# for https://github.com/holoviz/holoviews/issues/6882
-bokeh = ">=3.10.0.dev3"
+
 
 [workspace]
 preview = ["pixi-build"]
-channels = ["bokeh/label/dev", "conda-forge"]
+channels = ["conda-forge"]
 platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
 
 [dependencies]

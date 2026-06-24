@@ -18,6 +18,7 @@ from fastplotlib.layouts._frame._jupyter_output import JupyterOutputContext
 import holoviews as hv
 from holoviews import opts
 from holoviews.operation import Operation
+from holoviews.operation.datashader import rasterize
 from holoviews.streams import Stream, param
 from IPython.display import display
 from ipywidgets import (HBox, VBox, IntSlider, Label, Layout, Button, Image as ImageWidget, 
@@ -819,34 +820,63 @@ def mcorr_compare_widget(movie_orig: np.ndarray, movie_mcorr: np.ndarray):
 
 
 def make_shifts_plot(mc_result: 'mcorr.MCResult'):
-    """Make plot that shows shifts in X and Y over time"""
-    # strategy: first make a holomap, then separate dimensions and planes
-    shifts_rig_data = mc_result.shifts_rig_hv
+    """Make plot that shows shifts in X and Y over time, using rasterize to avoid plotting too much data at once"""
+    # make a separate rasterized curve and spread for each dimension & plane
+    shifts_data = mc_result.shifts_rig_hv
     shifts_els_data = mc_result.shifts_els_hv
-    shift_holomap = shifts_rig_data.to(hv.Curve, 'frame', 'shift').opts(alpha=0.7)
 
     if shifts_els_data is not None:
         # add min and max piecewise shifts to rigid shift dataset
         min_shifts = cast(hv.Dataset, shifts_els_data.aggregate(['frame', 'dim', 'plane'], function=np.min))
         max_shifts = cast(hv.Dataset, shifts_els_data.aggregate(['frame', 'dim', 'plane'], function=np.max))
-        shifts_w_range = shifts_rig_data.add_dimension(
+        shifts_data = shifts_data.add_dimension(
             'minshift', 0, min_shifts.data['shift'], vdim=True).add_dimension(
             'maxshift', 0, max_shifts.data['shift'], vdim=True)
-        shifts_w_range = shifts_w_range.transform(
+        shifts_data = shifts_data.transform(
             upper=hv.dim('maxshift') - hv.dim('shift'),
             lower=hv.dim('shift') - hv.dim('minshift')
         )
-        range_holomap = shifts_w_range.to(hv.Spread, kdims='frame', vdims=['shift', 'lower', 'upper']).opts(
-            fill_alpha=0.45, line_alpha=0, tools=preferred_bokeh_tools
-        )
-        shift_holomap = shift_holomap * range_holomap
 
-    shift_holomap.get_dimension('dim').label = ''  # remove title from legend
-    shift_plots = shift_holomap.opts(height=300, responsive=True).overlay('dim').layout('plane').opts(
-        opts.NdOverlay(legend_cols=2),
-        opts.NdLayout(sizing_mode='stretch_width'))
-    
-    return shift_plots
+    panels = []
+    dims = shifts_data.dimension_values('dim', expanded=False)
+    planes = shifts_data.dimension_values('plane', expanded=False)
+    for dim in dims:
+        for plane in planes:
+            this_shifts = shifts_data.select(dim=dim, plane=plane).reindex(kdims=['frame']) # type: ignore
+            vdims = this_shifts.dimensions('value')
+
+            # compute ylims in advance
+            shift_range: tuple[np.floating, np.floating] = this_shifts.range('shift')  # type: ignore
+            ymin = shift_range[0]
+            ymax = shift_range[1]
+
+            for minmax_vdim in ['minshift', 'maxshift']:
+                if minmax_vdim in vdims:
+                    minmax_shift_range = this_shifts.range(minmax_vdim)
+                    ymin = min(ymin, minmax_shift_range[0])  # type: ignore
+                    ymax = max(ymax, minmax_shift_range[1])  # type: ignore
+            
+            ylim_range = ymax - ymin
+            extra = max(ylim_range * 0.1, 0.5)
+            ylims = (ymin - extra, ymax + extra)
+
+            shift_plot = rasterize(
+                element=this_shifts.to(hv.Curve, 'frame', 'shift').opts(ylim=ylims), line_width=3, pixel_ratio=3
+                ).opts(alpha=0.7)  # type: ignore
+
+            if 'lower' in vdims and 'upper' in vdims:
+                # overlay with spread showing min and max shift
+                range_area = rasterize(
+                    element=this_shifts.to(hv.Spread, 'frame', ['shift', 'lower', 'upper']).opts(ylim=ylims)
+                ).opts(alpha=0.45)  # type: ignore
+
+                shift_plot = shift_plot * range_area
+            
+            shift_plot = shift_plot.relabel(f'Plane {plane}, {dim} shift').opts(
+                ylim=ylims, height=200, responsive=True, apply_hard_bounds=True)
+            panels.append(shift_plot)
+
+    return hv.Layout(panels).cols(len(planes)).opts(sizing_mode='stretch_width', shared_axes=False)
 
 
 class patch_shift_mag_and_angle(Operation):
