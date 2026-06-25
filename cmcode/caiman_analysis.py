@@ -1319,7 +1319,7 @@ class SessionAnalysis:
             item_name=batch.paths.get_batch_path().stem,
             input_movie_path=self.mmap_file_transposed,
             params={
-                'main': params_obj.to_dict(),
+                'main': params_obj.to_dict_roundtrip(),
                 'refit': seed_params.type == 'none',
                 'Ain_path': f'{Ain_name}.npy' if Ain_name is not None else None
             }
