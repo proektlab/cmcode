@@ -18,7 +18,7 @@ dependencies = [
     "datashader",
     "fastplotlib[notebook] @ git+https://github.com/ethanbb/fastplotlib.git@a16-numpy2",
     "h5py",
-    "hdf5storage",
+    # "hdf5storage",  # required but commenting out for now until https://github.com/prefix-dev/pixi/issues/6452 is fixed
     "holoviews",
     "ipympl",
     "mesmerize-core",

@@ -45,7 +45,7 @@ def setup_logging(log_level: Union[int, str], force: bool = True):
 setup_logging('INFO')
 
 def in_jupyter() -> bool:
-    return getattr(builtins, "__IPYTHON__", False) != False
+    return getattr(builtins, "__IPYTHON__", False) is not False
 
 if in_jupyter():
     # allow asyncio.run() to work in notebooks

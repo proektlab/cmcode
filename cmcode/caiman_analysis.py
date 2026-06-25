@@ -1793,7 +1793,7 @@ class SessionAnalysis:
             # if the planes are uniform, we save the spacing; otherwise just set it to None
             spacings_z = np.diff(um_vals_z)
             if np.all(spacings_z == spacings_z[0]):
-                spacings['plane'] = spacings_z[0]
+                spacings['plane'] = float(spacings_z[0])
             else:
                 spacings['plane'] = None
 
@@ -2147,6 +2147,11 @@ class SessionAnalysis:
         Make CNMF visualization of completed runs with controls to adjust automatic evaluation & manual accepted/rejected cells,
         linked to this object so that saving updates & saves the parameters if appropriate.
         """
+        viz = self._get_cnmf_visualization(image_data_options=image_data_options, add_residuals=add_residuals, add_background=add_background)
+        return viz.show()
+
+    def _get_cnmf_visualization(
+        self, image_data_options: Optional[list[str]] = None, add_residuals=False, add_background=False) -> caiman_viz.CNMFVizWideContainer:
         batch = self.get_gridsearch_results()
         is_completed = [out is not None and out['success'] for out in batch.outputs]
         if not any(is_completed):
@@ -2171,7 +2176,7 @@ class SessionAnalysis:
             start_index=completed_runs.iloc[start_i].name, temporal_kwargs=temporal_kwargs)
 
         viz.on_save(partial(self._update_params_from_viz, viz))
-        return viz.show()
+        return viz
 
 
     def _update_params_from_viz(self, viz: 'caiman_viz.CNMFVizWideContainer', _save_button):

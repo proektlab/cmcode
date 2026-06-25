@@ -424,7 +424,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
         self._top_widget = self._top_widget.children[0]
 
         # histograms
-        self._metric_stream = MetricStream()
+        self._metric_stream = MetricStream(curr_row=self.current_row)
         self._eval_controller.add_handler(lambda data: self._metric_stream.event(**data))
         self._eval_controller._call_handlers(None)  # make sure stream is up to date before making histograms
         self._metric_histogram_objs, self._metric_histograms = self.metric_histograms(n_bins=hist_nbins)
@@ -705,7 +705,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
                 # so then we don't set_component_index because then infinite recursion
                 return
             index = index.pick_info["selected_index"]
-        self._metric_stream.event(cell_id=index)
+        self._metric_stream.event(cell_id=int(index))
 
 
 @pd.api.extensions.register_dataframe_accessor("cnmf")

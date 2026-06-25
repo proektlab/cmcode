@@ -6,6 +6,7 @@ version = "0.*"
 [package.build.config]
 ignore-pypi-mapping = false
 extra-args = ["-Ceditable_mode=compat"]
+# pypi-conda-map = { hdf5storage = false }
 
 [package.host-dependencies]
 uv = "*"  # added for faster installation
@@ -39,3 +40,4 @@ cmcode = { path = "." }
 
 [pypi-dependencies]
 suite2p = { git = "https://github.com/proektlab/suite2p", branch = "proekt-dev" }
+hdf5storage = ">=0.2.0"  # version on conda-forge is out of date
