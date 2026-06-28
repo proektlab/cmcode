@@ -2151,7 +2151,7 @@ class SessionAnalysis:
         return viz.show()
 
     def _get_cnmf_visualization(
-        self, image_data_options: Optional[list[str]] = None, add_residuals=False, add_background=False) -> caiman_viz.CNMFVizWideContainer:
+        self, image_data_options: Optional[list[str]] = None, add_residuals=False, add_background=False) -> 'caiman_viz.CNMFVizWideContainer':
         batch = self.get_gridsearch_results()
         is_completed = [out is not None and out['success'] for out in batch.outputs]
         if not any(is_completed):
