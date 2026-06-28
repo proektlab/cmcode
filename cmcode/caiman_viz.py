@@ -16,7 +16,6 @@ from bokeh.themes import built_in_themes
 import fastplotlib as fpl
 from fastplotlib.layouts._frame._jupyter_output import JupyterOutputContext
 import holoviews as hv
-from holoviews import opts
 from holoviews.operation import Operation
 from holoviews.operation.datashader import rasterize
 from holoviews.streams import Stream, param
@@ -54,7 +53,7 @@ from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files
 from cmcode.util.types import MaybeSparse, Array4D
 from cmcode.util.scaled import ScaledDataFrame
 
-pn.extension()
+pn.extension(theme='dark')
 hv.extension('bokeh')  # type: ignore
 
 BokehPalette = Callable[[int], Sequence[str]]
@@ -433,10 +432,19 @@ class CNMFVizWideContainer(CNMFVizContainer):
         # trigger callback on CNN checkbox - I think this was not done originally by mistake
         self._eval_controller.use_cnn_checkbox.observe(self._eval_controller._call_handlers, 'value')
 
+        # add "auto_manual" to contour colors dropdown and make default
+        self._dropdown_contour_colors.options = ('auto_manual',) + self._dropdown_contour_colors.options
+        self._dropdown_contour_colors.value = 'auto_manual'
+
         # render plots in a way that allows me to set the theme
         self._plots_doc = Document(theme=built_in_themes['dark_minimal'])
         self._eval_plots = column([hv.render(self._dff_plot), hv.render(self._metric_histograms)])
         self._plots_doc.add_root(self._eval_plots)
+
+        # # try this next if dff plot isn't updating - might break theme, though
+        # dff_pane = pn.pane.HoloViews(self._dff_plot, theme=built_in_themes['dark_minimal'])
+        # hists_pane = pn.pane.HoloViews(self._metric_histograms, theme=built_in_themes['dark_minimal'])
+        # self._eval_plots = pn.Column(dff_pane, hists_pane).get_root(doc=self._plots_doc)
 
         
     @property
@@ -454,7 +462,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
             # put heatmap and temporal plots in a row at the top
             temporals = HBox([self._plot_heatmap.show(), self._plot_temporal.show()])
             self._widget = VBox([self._top_widget, temporals,
-                                 HBox([self._image_widget.widget, jbk.BokehModel(self._eval_plots)]),
+                                 HBox([self._image_widget.widget, jbk.BokehModel(self._eval_plots, combine_events=True)]),
                                  self._middle_widget, self._tab_contours_eval])
             if sidecar:
                 self._sidecar = Sidecar()
@@ -621,6 +629,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
     
     def set_component_colors(self, metric: Union[str, np.ndarray], cmap: Optional[str] = None):
+
         def remove_nonfinite(classifier) -> np.ndarray:
             cls_array = np.array(classifier)
             arr_finite = cls_array[np.isfinite(cls_array)]
@@ -629,7 +638,26 @@ class CNMFVizWideContainer(CNMFVizContainer):
             cls_array[np.isneginf(cls_array)] = min(arr_finite)
             return cls_array
 
-        if metric == 'marked':
+        if metric == 'auto_manual':
+            # color bright blue/red if manually accepted/rejected
+            # Using "Paired" colormap: 0 = auto accept, 4 = auto reject, 1 = manual accept, 5 = manual reject
+            est = self._cnmf_obj_ext.estimates
+            n_contours = len(self._image_widget.gridplot[0, 0]["contours"])  # type: ignore
+            classifier = np.zeros(n_contours, dtype=int)
+            classifier[est.idx_components_bad_eval] = 4
+            classifier[est.accepted_list] = 1
+            classifier[est.rejected_list] = 5
+
+            for subplot in self._image_widget.gridplot:
+                contour_plot = cast(fpl.LineCollection, subplot['contours'])
+                # first initialize using a quantitative cmap
+                # this ensures that setting cmap_values will work
+                contour_plot.cmap = "gray"
+                contour_plot.cmap_values = classifier
+                contour_plot.cmap = 'Paired'
+                self._set_component_visibility(contour_plot, self._cnmf_obj_ext)
+
+        elif metric == 'marked':
             assert self._cnmf_obj_ext.estimates.idx_components_marked is not None, \
                 'Marked components should be identifed if "marked" is available'
             marked_inds = self._cnmf_obj_ext.estimates.idx_components_marked

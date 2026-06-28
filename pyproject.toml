@@ -12,13 +12,14 @@ authors = [
 ]
 dependencies = [
     "asyncssh",
+    "bokeh<3.9",  # 3.8 may impact performance, need to test more though
     "caiman[jupyter]>=1.10.0",
     "cellpose",
     "dask",
     "datashader",
     "fastplotlib[notebook] @ git+https://github.com/ethanbb/fastplotlib.git@a16-numpy2",
     "h5py",
-    # "hdf5storage",  # required but commenting out for now until https://github.com/prefix-dev/pixi/issues/6452 is fixed
+    "hdf5storage>=0.2.0",
     "holoviews",
     "ipympl",
     "mesmerize-core",

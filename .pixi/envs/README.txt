@@ -1,2 +1,2 @@
-Environments are installed in a custom detached-environments directory: C:\Users\ethan\AppData\Local\rattler\cache\envs\caiman_2p_analysis_dev-17934126332052712660\envs.
-Symlinks are not supported on this platform so environments will not be reachable from the default ('.pixi/envs') directory.
+Environments are stored in a custom detached-environments directory: F:\pixi_cache\envs\caiman_2p_analysis_dev-17934126332052712660\envs.
+Symlinks are not supported on this platform so they will not be reachable from the default ('.pixi/envs') directory.

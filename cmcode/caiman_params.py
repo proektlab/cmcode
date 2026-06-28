@@ -242,6 +242,8 @@ class TranspositionParams(StageParams):
     """Settings for transpose/concat planes"""
     highpass_cutoff: float = 0.
     highpass_order: int = 4
+    highpass_padtype: params.LitStr[Literal['odd', 'even', 'constant']] = 'odd'
+    highpass_padlen: Optional[int] = None
     add_to_mov: float = 0.
     blur_kernel_size: int = 1  # same as blur_size in SeedParams
     remove_bg_mean: bool = False  # remove min- and gaussian-filtered mean projection (background estimate)
@@ -679,7 +681,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         return cls.from_cnmf_params(
             conversion=ConversionParams(downsample_factor=downsample_factor),
             mcorr_extra=McorrParamsExtra(use_suite2p=True),
-            transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True),
+            transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True, highpass_padtype='even', highpass_padlen=2000),
             cnmf=make_cnmf_params(
                 metadata, ndim=ndim, tif_file=tif_file, snr_type=snr_type, downsample_factor=downsample_factor),
             cnmf_extra=CNMFParamsExtra(seed_params=SeedParams.default(metadata), crossplane_merge_thr=0.7),

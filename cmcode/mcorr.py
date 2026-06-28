@@ -889,9 +889,6 @@ def transpose_flatten_mc_mmap(
         - High-pass filtering, enabled by setting highpass_cutoff (in Hz) > 0.
     """
     mmap_files = mc_result.mmap_files
-    highpass_cutoff = trans_params.highpass_cutoff
-    highpass_order = trans_params.highpass_order
-
     expected_file = get_transposed_mmap_name(mmap_files, trans_params)
     logging.info(f'Saving transposed memmap to {os.path.basename(expected_file)}')
 
@@ -930,8 +927,10 @@ def transpose_flatten_mc_mmap(
                 fr=fr,
                 add_to_movie=add_to_movie,
                 border_pixels=border.ceil(),
-                highpass_cutoff=highpass_cutoff,
-                highpass_order=highpass_order,
+                highpass_cutoff=trans_params.highpass_cutoff,
+                highpass_order=trans_params.highpass_order,
+                highpass_padtype=trans_params.highpass_padtype,
+                highpass_padlen=trans_params.highpass_padlen,
                 existing_output_path=expected_file,
                 existing_output_offset=byte_offset
             )
