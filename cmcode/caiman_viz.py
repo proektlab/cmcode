@@ -8,7 +8,8 @@ from typing import Optional, Union, cast, Callable, Literal, Any, Sequence
 from bokeh.document import Document
 from bokeh.io import curdoc
 from bokeh.layouts import column, row
-from bokeh.models import Slider, CategoricalSlider, LinearColorMapper, CategoricalColorMapper
+from bokeh.models import (Model, Plot, Column, Row, Slider, CategoricalSlider,
+                          LinearColorMapper, CategoricalColorMapper)
 import bokeh.palettes
 from bokeh.plotting import figure
 from bokeh.themes import built_in_themes
@@ -54,7 +55,7 @@ from cmcode.util.types import MaybeSparse, Array4D
 from cmcode.util.scaled import ScaledDataFrame
 
 pn.extension(theme='dark')
-hv.extension('bokeh')  # type: ignore
+hv.extension('bokeh')
 
 BokehPalette = Callable[[int], Sequence[str]]
 preferred_bokeh_tools = ['pan', 'box_zoom', 'reset', 'save']
@@ -338,6 +339,24 @@ def my_set_limits(self: EvalController, cnmf_obj: CNMF):
     self._block_handlers = False
 
 
+def bokeh_apply_dark_background(root_model: Model, bg_color='#15191c'):
+    """
+    Walk all Bokeh models and apply dark background to layouts and plots.
+    Claude thinks this is the way to do it...
+    default color is the background for dark_minimal
+    """
+    for model in root_model.references():
+        # Plot covers HoloViews-generated figures
+        if isinstance(model, Plot):
+            model.background_fill_color = bg_color
+            model.border_fill_color = bg_color
+        elif isinstance(model, (Column, Row)):
+            if hasattr(model, 'background'):
+                model.background = bg_color
+            elif hasattr(model, 'styles'):
+                model.styles = {**model.styles, 'background-color': bg_color}
+
+
 class CNMFVizWideContainer(CNMFVizContainer):
     """
     Drop-in replacement for CNMFVizContainer that works better for wide images
@@ -437,11 +456,12 @@ class CNMFVizWideContainer(CNMFVizContainer):
         self._dropdown_contour_colors.value = 'auto_manual'
 
         # this fixes the issue with dff plot not updating
-        # TODO get the theming to work with this method
         self._plots_doc = Document(theme=built_in_themes['dark_minimal'])
-        dff_pane = pn.pane.HoloViews(self._dff_plot, theme=built_in_themes['dark_minimal'])
-        hists_pane = pn.pane.HoloViews(self._metric_histograms, theme=built_in_themes['dark_minimal'])
+        dff_pane = pn.pane.HoloViews(self._dff_plot)
+        hists_pane = pn.pane.HoloViews(self._metric_histograms)
         self._eval_plots = pn.Column(dff_pane, hists_pane).get_root(doc=self._plots_doc)
+        # force the dark background on each model being rendered
+        bokeh_apply_dark_background(self._eval_plots)
 
         
     @property
@@ -719,7 +739,7 @@ class CNMFVizWideContainer(CNMFVizContainer):
                 dff_plots.append(hv.Text(0.5, 0.5, dff_str + " is not available").opts(width=900))
             return hv.Overlay(dff_plots).opts(width=900)
 
-        return hv.DynamicMap(dff_plot, streams=[self._metric_stream])#.opts(framewise=True) # type: ignore
+        return hv.DynamicMap(dff_plot, streams=[self._metric_stream]) # type: ignore
 
     def set_component_index(self, index):
         super().set_component_index(index)
