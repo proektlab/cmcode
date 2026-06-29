@@ -10,12 +10,12 @@ import logging
 import os
 from pathlib import Path
 from typing import Optional, Literal, Union, Any, Type, Annotated, cast
+from typing_extensions import TypedDict
 import warnings
 
 from caiman.source_extraction.cnmf import params
 from caiman.source_extraction.cnmf.utilities import all_same
 from caiman.utils.utils import recursively_load_dict_contents_from_group
-from mesmerize_core.utils import Border
 import numpy as np
 import pandas as pd
 from pydantic import BaseModel, ConfigDict, TypeAdapter, BeforeValidator, Field, PrivateAttr, computed_field, model_validator
@@ -38,6 +38,13 @@ def border_from_spec(obj: Any) -> Any:
     if isinstance(obj, image.BorderSpec):
         return obj.ceil()
     return obj
+
+class Border(TypedDict):
+    """Same as Border in mesmerize-core, but using typing_extensions to make pydantic happy"""
+    left: int
+    right: int
+    top: int
+    bottom: int
 
 BorderDict = Annotated[Border, BeforeValidator(border_from_spec)]
 
