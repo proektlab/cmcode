@@ -436,15 +436,12 @@ class CNMFVizWideContainer(CNMFVizContainer):
         self._dropdown_contour_colors.options = ('auto_manual',) + self._dropdown_contour_colors.options
         self._dropdown_contour_colors.value = 'auto_manual'
 
-        # render plots in a way that allows me to set the theme
+        # this fixes the issue with dff plot not updating
+        # TODO get the theming to work with this method
         self._plots_doc = Document(theme=built_in_themes['dark_minimal'])
-        self._eval_plots = column([hv.render(self._dff_plot), hv.render(self._metric_histograms)])
-        self._plots_doc.add_root(self._eval_plots)
-
-        # # try this next if dff plot isn't updating - might break theme, though
-        # dff_pane = pn.pane.HoloViews(self._dff_plot, theme=built_in_themes['dark_minimal'])
-        # hists_pane = pn.pane.HoloViews(self._metric_histograms, theme=built_in_themes['dark_minimal'])
-        # self._eval_plots = pn.Column(dff_pane, hists_pane).get_root(doc=self._plots_doc)
+        dff_pane = pn.pane.HoloViews(self._dff_plot, theme=built_in_themes['dark_minimal'])
+        hists_pane = pn.pane.HoloViews(self._metric_histograms, theme=built_in_themes['dark_minimal'])
+        self._eval_plots = pn.Column(dff_pane, hists_pane).get_root(doc=self._plots_doc)
 
         
     @property
