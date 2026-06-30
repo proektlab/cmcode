@@ -2,7 +2,6 @@
 import logging
 from typing import Union
 
-from fastplotlib.layouts._utils import auto_determine_canvas, CANVAS_OPTIONS_AVAILABLE
 import nest_asyncio
 
 from cmcode.util.environment import ComputingEnvironment
@@ -45,10 +44,16 @@ def setup_logging(log_level: Union[int, str], force: bool = True):
 
 setup_logging('INFO')
 
-def in_jupyter() -> bool:
-    # utilize fastplotlib's mechanism to decide which canvas type to use
-    jupyter_canvas = CANVAS_OPTIONS_AVAILABLE['jupyter']
-    return jupyter_canvas and auto_determine_canvas() is jupyter_canvas
+def in_jupyter():
+    """
+    Determine whether the user is executing in a Jupyter Notebook / Lab.
+    Copied from wgpu (don't want to import because it will try to use Qt)
+    """
+    try:
+        ip = get_ipython()  # type: ignore
+        return ip.has_trait("kernel")
+    except NameError:
+        return False
 
 if in_jupyter():
     # allow asyncio.run() to work in notebooks
