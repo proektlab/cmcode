@@ -1,7 +1,8 @@
 """General setup for Ethan's Proekt Lab code"""
-import builtins
 import logging
 from typing import Union
+
+from fastplotlib.layouts._utils import auto_determine_canvas, CANVAS_OPTIONS_AVAILABLE
 import nest_asyncio
 
 from cmcode.util.environment import ComputingEnvironment
@@ -45,7 +46,9 @@ def setup_logging(log_level: Union[int, str], force: bool = True):
 setup_logging('INFO')
 
 def in_jupyter() -> bool:
-    return getattr(builtins, "__IPYTHON__", False) is not False
+    # utilize fastplotlib's mechanism to decide which canvas type to use
+    jupyter_canvas = CANVAS_OPTIONS_AVAILABLE['jupyter']
+    return jupyter_canvas and auto_determine_canvas() is jupyter_canvas
 
 if in_jupyter():
     # allow asyncio.run() to work in notebooks

@@ -12,7 +12,7 @@ authors = [
 ]
 dependencies = [
     "asyncssh",
-    "bokeh<3.9",  # 3.8 may impact performance, need to test more though
+    "bokeh<3.9",  # 3.9 may impact performance, need to test more though
     "caiman[jupyter]>=1.10.0",
     "cellpose",
     "dask",
