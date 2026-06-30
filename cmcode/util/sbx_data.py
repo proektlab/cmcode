@@ -26,7 +26,7 @@ def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]
     all_nframes: list[int] = []
     dims: Optional[tuple[int, int, int]] = None
     for file in sbx_files:
-        _, y, x, z, nframes = sbx_utils.sbx_shape(file)
+        _, x, y, z, nframes = sbx_utils.sbx_shape(file)
         if dims is None:
             dims = (y, x, z)
         elif dims != (y, x, z):

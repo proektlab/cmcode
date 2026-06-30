@@ -560,7 +560,6 @@ class SessionAnalysis:
 
     def preview_raw_data(self, frames_to_average: Union[int, slice] = 50, channel=0, title: Optional[str] = None):
         """Display interface to preview N frames of raw data and adjust bidirectional offset"""
-        # local import because canvas might not be available
         if not in_jupyter():
             raise RuntimeError('preview_raw_data only available in Jupyter')
 

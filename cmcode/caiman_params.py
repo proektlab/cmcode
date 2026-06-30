@@ -869,7 +869,6 @@ quality_params = {
 
 def make_cnmf_params(metadata: dict, ndim: int, tif_file: Optional[str] = None,
                      snr_type: Literal['normal', 'gamma'] = 'gamma', downsample_factor: Optional[int] = None) -> params.CNMFParams:
-    p = 1     # order of the autoregressive system (set p=2 if there is visible rise time in data)
     dxy, scale = get_dxy_and_scale(metadata)    
     
     if downsample_factor is None:
@@ -900,10 +899,6 @@ def make_cnmf_params(metadata: dict, ndim: int, tif_file: Optional[str] = None,
             'nonneg_movie': False  # should already be nonnegative coming from scanbox - avoid offsetting output
         },
         
-        'preprocess': {
-            'p': p
-        },
-        
         'init': {
             'nb': 1,                      # number of global background components (set to 1 or 2) 11/6/24: seems that 1 works fine and is faster
             'K': 10,                      # number of components per patch
@@ -918,7 +913,7 @@ def make_cnmf_params(metadata: dict, ndim: int, tif_file: Optional[str] = None,
         },
         
         'temporal': {
-            'p': p,
+            'p': 1,                 # order of the autoregressive system (set p=2 if there is visible rise time in data)
             'bas_nonneg': True      # enforce nonnegativity constraint on calcium traces (technically on baseline)
         },
         
