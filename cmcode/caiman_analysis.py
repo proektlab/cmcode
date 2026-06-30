@@ -912,7 +912,8 @@ class SessionAnalysis:
                 fig.suptitle(f'Mouse {self.mouse_id}, session {self.sess_id}{tagstr}, {type_label}')
 
                 for b_corrected, axs, corrected_label in zip((False, True), axss, ('original', 'corrected')):
-                    plane_projs = self.get_plane_projections(proj_type, motion_corrected=b_corrected, from_transposed=False)
+                    plane_projs = self.get_plane_projections(
+                        proj_type, motion_corrected=b_corrected, from_transposed=False, exclude_border=False)
 
                     for k_plane, (ax, plane_proj) in enumerate(zip(axs, plane_projs)):
                         ax = cast(Axes, ax)

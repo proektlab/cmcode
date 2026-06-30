@@ -785,6 +785,14 @@ class RawDataPreviewContainer:
         self.offset_data_3d = np.copy(self.mean_data_3d, order='F')  # pre-allocate
         self.curr_offset = 0 if curr_offset is None else curr_offset
 
+        # keep track of which pixels are odd rows
+        if len(subinds_spatial) == 0:  # no subindexing on Y
+            self.is_odd_row = np.arange(self.mean_data_3d.shape[0]) % 2 == 1
+        else:
+            _, _, y, _, _ = sbx_utils.sbx_shape(sbx_files[0])
+            row_numbers = np.arange(y)[subinds_spatial[0]]
+            self.is_odd_row = row_numbers % 2 == 1
+
         # initialize ImageWidget
         self.image_widget = fpl.ImageWidget(data=[self.get_corrected_image()],
                                             names=[title] if title else None,  # type: ignore
@@ -825,13 +833,13 @@ class RawDataPreviewContainer:
         """
         correction = -self.curr_offset
         if correction > 0:
-            self.offset_data_3d[1::2, correction:] = self.mean_data_3d[1::2, :-correction]
-            self.offset_data_3d[1::2, :correction] = 0
+            self.offset_data_3d[self.is_odd_row, correction:] = self.mean_data_3d[self.is_odd_row, :-correction]
+            self.offset_data_3d[self.is_odd_row, :correction] = 0
         elif correction < 0:
-            self.offset_data_3d[1::2, :correction] = self.mean_data_3d[1::2, -correction:]
-            self.offset_data_3d[1::2, correction:] = 0
+            self.offset_data_3d[self.is_odd_row, :correction] = self.mean_data_3d[self.is_odd_row, -correction:]
+            self.offset_data_3d[self.is_odd_row, correction:] = 0
         else:
-            self.offset_data_3d[1::2, :] = self.mean_data_3d[1::2, :]
+            self.offset_data_3d[self.is_odd_row, :] = self.mean_data_3d[self.is_odd_row, :]
         return np.reshape(self.offset_data_3d, (self.offset_data_3d.shape[0], -1), order='F')
 
     def set_offset(self, new_offset: int):
