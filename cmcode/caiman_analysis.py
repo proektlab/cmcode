@@ -592,6 +592,13 @@ class SessionAnalysis:
         # first update with passed-in params
         self.update_params({'conversion': convert_kwargs})
 
+        # warn if odd_row_offset is not set
+        if self.params.conversion.odd_row_offset is None and (
+            self.metadata['scanning_mode'] == 'bidirectional' or self.params.conversion.force_estim_ndead_offset):
+            logging.warning(
+                'odd_row_offset is set to be estimated automatically - this is usually inaccurate. '
+                'Consider setting it explicitly using sessinfo.preview_raw_data().')
+
         # estimate ndead explicitly if needed so we can use it later
         if self.params.conversion.odd_row_ndead is None and (
             self.metadata['scanning_mode'] == 'bidirectional' or self.params.conversion.force_estim_ndead_offset):

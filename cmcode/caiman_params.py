@@ -178,13 +178,10 @@ class ConversionParams(StageParams):
             # no correction to be done, can ignore dead pixel fields
             irrelevant_fields |= {'interp', 'dead_pix_mode'}
 
-        # if either is None, be permissive, assume that the other was correctly estimated
-        if ('odd_row_ndead' not in ignore and self_max_ndead is not None and 
-            other_max_ndead is not None and self_max_ndead != other_max_ndead):
+        if 'odd_row_ndead' not in ignore and self_max_ndead != other_max_ndead:
             yield 'odd_row_ndead'
 
-        if ('odd_row_offset' not in ignore and self_offset is not None and
-            other_offset is not None and self_offset != other_offset):
+        if 'odd_row_offset' not in ignore and self_offset != other_offset:
             yield 'odd_row_offset'
 
         yield from super().get_differing_params(other, metadata, ignore=irrelevant_fields)
@@ -737,7 +734,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             if 'dtype' in changes['conversion'] and (dt := np.dtype(changes['conversion']['dtype'])) != np.int16:
                 raise ValueError(f'Incompatible params: use_suite2p=True and dtype={dt}. Suite2p registration requires conversion to int16.')
             else:
-                changes['conversion'] = 'int16'
+                changes['conversion']['dtype'] = 'int16'
                 logging.info('Added {"conversion": {"dtype": "int16"}} to params for Suite2p registration compatibility')
         
         # if changing from int16, make sure we are not already using suite2p registration
