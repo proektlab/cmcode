@@ -144,6 +144,7 @@ class ConversionParams(StageParams):
     bigtiff: bool = True
     imagej: bool = False
     to32: Optional[bool] = None
+    dtype: Optional[str] = None  # overrides to32
     chunk_size: Optional[int] = 100
     force_estim_ndead_offset: bool = False
     interp: bool = True
@@ -686,7 +687,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             snr_type = 'gamma'
 
         return cls.from_cnmf_params(
-            conversion=ConversionParams(downsample_factor=downsample_factor),
+            conversion=ConversionParams(downsample_factor=downsample_factor, dtype='int16'),  # int16 needed for suite2p_register
             mcorr_extra=McorrParamsExtra(use_suite2p=True),
             transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True, highpass_padtype='even', highpass_padlen=2000),
             cnmf=make_cnmf_params(
@@ -713,7 +714,6 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         return AnalysisStage.FINAL
 
 
-    # Updating, safely
     def change_params_and_get_stage_to_invalidate(
             self, changes: Mapping[str, dict[str, Any]], metadata: dict[str, Any]) -> tuple[Self, Optional[AnalysisStage]]:
         """
@@ -728,6 +728,23 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         new_params = deepcopy(self)
         invalid_stage: Optional[AnalysisStage] = None
         changes = dict(changes)
+
+        # automatic additional changes - if this gets too complex should move to another function or rethink
+        # if turning on suite2p registration, ensure we also use int16
+        if 'mcorr_extra' in changes and changes['mcorr_extra'].get('use_suite2p', False):
+            if 'conversion' not in changes:
+                changes['conversion'] = {}
+            if 'dtype' in changes['conversion'] and (dt := np.dtype(changes['conversion']['dtype'])) != np.int16:
+                raise ValueError(f'Incompatible params: use_suite2p=True and dtype={dt}. Suite2p registration requires conversion to int16.')
+            else:
+                changes['conversion'] = 'int16'
+                logging.info('Added {"conversion": {"dtype": "int16"}} to params for Suite2p registration compatibility')
+        
+        # if changing from int16, make sure we are not already using suite2p registration
+        elif (
+            self.mcorr_extra.use_suite2p and 'conversion' in changes and
+            'dtype' in changes['conversion'] and (dt := np.dtype(changes['conversion']['dtype'])) != np.int16):
+            raise ValueError('Cannot change conversion dtype except to int16 if using Suite2p registration')
 
         while stage < AnalysisStage.FINAL:
             stage = AnalysisStage(stage + 1)

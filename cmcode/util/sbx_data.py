@@ -7,6 +7,7 @@ from typing import Optional, Sequence, Union
 
 from caiman.utils import sbx_utils
 import numpy as np
+from numpy.typing import DTypeLike
 from tqdm import tqdm
 
 from cmcode.util import paths
@@ -53,7 +54,7 @@ def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]
 
 def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], *, channel: Optional[int] = 0,
                        subinds_spatial: Sequence[sbx_utils.DimSubindices] = (), crop_dead=True,
-                       plane: Optional[int] = None, to32: Optional[bool] = None, quiet=False, dview=None,
+                       plane: Optional[int] = None, dtype: Optional[DTypeLike] = None, quiet=False, dview=None,
                        odd_row_offset=0) -> np.ndarray:
     """load frames, slicing across all given files, and take mean projection"""
     subinds_map, total_frames, dims = subinds_per_file(sbx_files, frames)
@@ -80,7 +81,7 @@ def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], *, chann
     for file_ind, subinds_t in file_iterator:
         subindices = (subinds_t,) + tuple(subinds_spatial)
         data = sbx_utils.sbxread(sbx_files[file_ind], subindices=subindices, channel=channel, plane=plane, odd_row_ndead=0,
-                                 odd_row_offset=odd_row_offset, interp=False, dview=dview, quiet=True, to32=to32) # frames x Y x X [x planes]
+                                 odd_row_offset=odd_row_offset, interp=False, dview=dview, quiet=True, dtype=dtype) # frames x Y x X [x planes]
         mean_data_file = np.sum(data, axis=0) / total_frames
         if mean_data is not None:
             mean_data += mean_data_file

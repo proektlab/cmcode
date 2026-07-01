@@ -627,6 +627,11 @@ class SessionAnalysis:
             for other_param in ['crop', 'downsample_factor', 'keep_3d']:
                 del param_dict[other_param]
 
+            # deal with "to32"
+            if param_dict['dtype'] is None and param_dict['to32'] is not None:
+                param_dict['dtype'] = 'float32' if param_dict['to32'] else 'uint16'
+            del param_dict['to32']
+
             sbx_utils.sbx_chain_to_tif(
                 self.sbx_files, fileout=filename, subindices=subindices, plane=plane, dview=cluster.dview, **param_dict)
             self.write_params_for_result_file(filename, AnalysisStage.CONVERT)

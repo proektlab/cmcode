@@ -949,7 +949,7 @@ class patch_shift_mag_and_angle(Operation):
             )
     
 
-def make_els_shift_quiver_plot(mc_result: 'mcorr.MCResult') -> jbk.widgets.BokehModel:
+def make_els_shift_quiver_plot(mc_result: 'mcorr.MCResult'):
     """Make plot that shows nonrigid shifts as arrows, with a slider for time"""
     if (shifts_els_data := mc_result.shifts_els_hv) is None:
         raise RuntimeError('Must have nonrigid shifts to make quiver plot')
@@ -968,14 +968,19 @@ def make_els_shift_quiver_plot(mc_result: 'mcorr.MCResult') -> jbk.widgets.Bokeh
 def check_mcorr_nb(movie_orig: np.ndarray, movie_mcorr: np.ndarray, mc_result: 'mcorr.MCResult', show_quiver_plot=False):
     # make upper figure with histograms of mcorr shifts
     shift_plots = make_shifts_plot(mc_result)
-    plot_rows = [pn.ipywidget(pn.Row(pn.pane.HoloViews(shift_plots), width_policy='max', max_width=2500))]
+    plots: list[pn.pane.Pane] = [pn.pane.HoloViews(shift_plots)]
+
     if show_quiver_plot and mc_result.shifts_els is not None:
         quiver_plots = make_els_shift_quiver_plot(mc_result)
-        plot_rows.append(pn.ipywidget(pn.Row(
-            pn.pane.HoloViews(quiver_plots, widget_location='bottom'), width_policy='max', max_width=2500)))
+        plots.append(pn.pane.HoloViews(quiver_plots, widget_location='bottom'))
     
-    plot_rows.append(mcorr_compare_widget(movie_orig, movie_mcorr))
-    widget = VBox(plot_rows)
+    plots_col = pn.Column(*plots)
+    plots_model = plots_col.get_root(doc=Document(theme=built_in_themes['dark_minimal']))
+    bokeh_apply_dark_background(plots_model)
+
+    widget = VBox([
+        jbk.BokehModel(plots_model, combine_events=True),
+        mcorr_compare_widget(movie_orig, movie_mcorr)])
     return widget
 
 

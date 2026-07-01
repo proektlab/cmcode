@@ -11,7 +11,8 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Optional, Union, ParamSpec, Any, cast
+import tifffile
+from typing import Optional, Union, ParamSpec, Any
 from typing_extensions import Self
 
 import caiman as cm
@@ -502,11 +503,18 @@ def get_candidate_mcorr_result_files(tif_path: str, is_piecewise: bool) -> list[
 
 
 def motion_correct_file(
-    tif_file: str, mcorr_params: cmp.McorrParamStruct, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
-    if mcorr_params.mcorr_extra.use_suite2p:
-        return motion_correct_file_suite2p(tif_file, mcorr_params.suite2p_register, mcorr_params.motion)
+    tif_file: str, params: cmp.SessionAnalysisParams, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
+    if params.mcorr_extra.use_suite2p:
+        # check that we have data in the right format
+        if np.dtype(params.conversion.dtype) != np.int16:
+            raise RuntimeError(
+                'Conversion dtype must be int16 to use Suite2p for mcorr. '
+                'To fix, update params using sessinfo.update_params({"conversion": {"dtype": "int16"}}), '
+                'then re-run convert_to_tif before motion correction.'
+            )
+        return motion_correct_file_suite2p(tif_file, params.suite2p_register, params.motion)
     else:
-        return motion_correct_file_caiman(tif_file, mcorr_params.motion, dview=dview)
+        return motion_correct_file_caiman(tif_file, params.motion, dview=dview)
 
 
 def motion_correct_file_caiman(tif_file: str, motion_params: MotionParams, dview: Optional[Cluster] = None) -> PlaneMcorrResult:
@@ -570,7 +578,10 @@ def motion_correct_file_suite2p(tif_file: str, reg_params: cmp.Suite2pRegistrati
 
     indices = motion_params.indices
 
-    f_raw = cm.load(tif_file)  # loads TIF as memmap
+    # load TIF as memmap
+    with tifffile.TiffFile(tif_file) as f:
+        f_raw = f.asarray(out='memmap')
+
     T, ny, nx = f_raw.shape  # full movie size
     f_raw = f_raw[(slice(None),) + indices]
     _, ny_cropped, nx_cropped = f_raw.shape

@@ -373,4 +373,8 @@ def linked_timestamped_path(path: str) -> Generator[str, None, None]:
     link_path = add_timestamp_to_path(path)
     os.link(src=path, dst=link_path)
     yield link_path
-    os.unlink(link_path)
+
+    try:
+        os.unlink(link_path)
+    except PermissionError:  # for Windows
+        pass

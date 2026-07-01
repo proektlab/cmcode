@@ -155,14 +155,14 @@ def load_zstack(filename: str, plane: Union[int, slice, None] = None, channel=1,
         if average:
             stack_planes = [
                 average_raw_frames([filename], frames=slice(start, end), channel=channel, subinds_spatial=subinds_spatial,
-                                   crop_dead=crop_dead, plane=plane, to32=True, quiet=True, odd_row_offset=odd_row_offset)
+                                   crop_dead=crop_dead, plane=plane, dtype=np.float32, quiet=True, odd_row_offset=odd_row_offset)
                 for start, end in zip(step_starts, step_ends)
             ]
         else:
             stack_planes = [
                 sbx_utils.sbxread(filename, subindices=(slice(start, end),) + subinds_spatial, channel=channel,
                                   plane=plane, odd_row_ndead=0, odd_row_offset=odd_row_offset, interp=False,
-                                  dview=cma.cluster.dview, quiet=True, to32=True)
+                                  dview=cma.cluster.dview, quiet=True, dtype=np.float32)
                 for start, end in zip(step_starts, step_ends)
             ]
         stack = np.stack(stack_planes, axis=-1)
@@ -409,7 +409,7 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
         subinds_y = slice(0, None, 2) if skip_odd else slice(None)
         ref = average_raw_frames(
             [ref_file], frames=slice(None), channel=1, subinds_spatial=(subinds_y, slice(None), slice(0, top_n_planes)),
-            crop_dead=False, to32=True, quiet=True)
+            crop_dead=False, dtype=np.float32, quiet=True)
 
     elif not allow_stack_as_backup:
         raise RuntimeError('Reference file not found')
