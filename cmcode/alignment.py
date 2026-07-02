@@ -795,7 +795,7 @@ def load_offsets_for_sessions(
             raise RuntimeError(f'Could not determine scan day for session {sess_id}')
         rec_dates.append(rec_date)
     
-    daily_offsets_um = make_um_df(offsets_um_df.loc[rec_dates, :], pixel_size=um_per_pixel, index=sess_ids_uniq)
+    daily_offsets_um = make_um_df(offsets_um_df.loc[rec_dates, :].astype(float), pixel_size=um_per_pixel, index=sess_ids_uniq)
     
     if zero_first:
         # ensure it is relative to the first session
