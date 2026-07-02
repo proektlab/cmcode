@@ -5,7 +5,6 @@ from enum import IntEnum, auto
 from functools import cache
 import h5py
 from itertools import pairwise
-import json
 import logging
 import os
 from pathlib import Path
@@ -52,7 +51,7 @@ BorderDict = Annotated[Border, BeforeValidator(border_from_spec)]
 @dataclass(kw_only=True, frozen=True)
 class StageParams:
     """Params for a particular analysis stage (abstract base class)"""
-    __pydantic_config__ = ConfigDict(extra='forbid', serialize_by_alias=True)
+    __pydantic_config__ = ConfigDict(extra='forbid', serialize_by_alias=True, ser_json_inf_nan='constants')
 
     @classmethod
     @cache
@@ -438,28 +437,27 @@ class AnalysisStage(IntEnum):
 
 # recursive models for serializing/deserializing parameters for each stage
 
-class ParamStruct(BaseModel, revalidate_instances='always'):
+class ParamStruct(BaseModel, revalidate_instances='always', ser_json_inf_nan='constants'):
     @classmethod
     def read_from_file(cls, path: Union[str, Path]) -> Self:
         with open(path, mode='r') as file:
             data = file.read()
         return cls.model_validate_json(data)
     
-    def serialize_params(self, stage: Optional[AnalysisStage] = None, pretty=True) -> str:
+    def serialize_params(self, stage: Optional[AnalysisStage] = None, pretty=True) -> bytes:
         """Convert a group of params to JSON, optionally specifying the subset of params to serialize using params_type."""
         if stage is None:
-            encoded = self.model_dump(mode='json', round_trip=True)
+            json_str = self.model_dump_json(round_trip=True, indent=4 if pretty else None)
+            return json_str.encode("utf-8")
         else:
             # use TypeAdapter to serialize only params relevant for the stage
             ta = TypeAdapter(stage_cumulative_params[stage])
-            encoded = ta.dump_python(self, mode='json', round_trip=True)
+            return ta.dump_json(self, round_trip=True, indent=4 if pretty else None)
 
-        # use json library for dumping b/c it allows nans and infs
-        return json.dumps(encoded, indent=4 if pretty else None)
 
     def write_params(self, path: Union[str, Path], stage: Optional[AnalysisStage] = None, pretty=True):
         data = self.serialize_params(stage=stage, pretty=pretty)
-        with open(path, mode='w') as file:
+        with open(path, mode='wb') as file:
             file.write(data)
 
     

@@ -15,7 +15,6 @@ else:
         'computing_environment should be an instance of ComputingEnvironment'
     computing_environment.apply()
 
-
 def setup_logging(log_level: Union[int, str], force: bool = True):
     """
     Enable basic logging to console
@@ -24,6 +23,7 @@ def setup_logging(log_level: Union[int, str], force: bool = True):
     """
     if isinstance(log_level, str):
         log_level = getattr(logging, log_level)
+
     logging.basicConfig(
         format="{asctime} - {levelname} - [{filename} {funcName}() {lineno}] - pid {process} - {message}",
         filename=None, force=force,
@@ -36,11 +36,12 @@ def setup_logging(log_level: Union[int, str], force: bool = True):
         return True
 
     caiman_logger = logging.getLogger('caiman')
+    caiman_logger.setLevel(log_level)
     caiman_logger.addFilter(filter_mc_logs)
     
     # override asyncssh logging level - maybe todo do this more idiomatically
     ssh_logger = logging.getLogger('asyncssh')
-    ssh_logger.setLevel(logging.WARNING)
+    ssh_logger.setLevel(max(log_level, logging.WARNING))
 
 setup_logging('INFO')
 

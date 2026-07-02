@@ -458,7 +458,7 @@ def load_CNMFExt(filename: Union[Path, str], dview=None, quiet=True) -> CNMFExt:
     logger = logging.getLogger('caiman')
     old_level = logger.level
     if quiet:
-        logger.setLevel(logging.WARNING)
+        logger.setLevel(max(old_level, logging.WARNING))
     cnmf_obj_ext = _load_CNMFExt(str(filename))
     if quiet:
         logger.setLevel(old_level)
