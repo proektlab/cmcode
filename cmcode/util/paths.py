@@ -5,7 +5,6 @@ import logging
 import os
 from pathlib import Path, PurePath, PurePosixPath, PureWindowsPath
 import re
-import sys
 from string import Template
 from typing import (Optional, Protocol, Union, Literal, Sequence, Callable, Generic, Generator,
                     Iterable, TypeVar, ParamSpec, Concatenate, runtime_checkable, overload)
@@ -62,10 +61,6 @@ def set_caiman_data_dir(path: Union[str, Path, None]):
     path = path if path is None else Path(path) 
     if path == _caiman_data_dir:
         return
-
-    if 'caiman' in sys.modules:
-        # for now there is an import order issue
-        raise RuntimeError('Cannot set caiman_data_dir; caiman already loaded')
     
     _caiman_data_dir = path
     if path is None:

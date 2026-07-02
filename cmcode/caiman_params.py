@@ -351,7 +351,7 @@ class SeedParams(StageParams):
         _, scale = get_dxy_and_scale(metadata)
         return cls(
             type='mean',
-            norm_medw=None if use_cellpose else 25,
+            norm_medw=25,
             gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
             use_cellpose=use_cellpose,
             cellpose_params=CellposeParams(flow_threshold=None)
