@@ -695,8 +695,8 @@ def get_ROIs_to_merge_crossplane(A: MaybeSparse, C: np.ndarray, n_planes: int, p
         A_merged = sparse.lil_matrix((A_flat.shape[0], len(merged_ROIs)), dtype=A_flat.dtype)
 
         # this is not the best way to do it but just try it for now
-        for k_comp, (rois, planes) in enumerate(zip(merged_ROIs, roi_planes)):
-            for roi, plane in zip(rois, planes):
+        for k_comp, (plane_rois, planes) in enumerate(zip(merged_ROIs, roi_planes)):
+            for roi, plane in zip(plane_rois, planes):
                 if plane == k_plane:
                     A_merged[:, k_comp] += A_flat[:, roi]
 

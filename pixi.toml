@@ -27,6 +27,9 @@ jupyter_bokeh = "*"
 pyqtgraph = "*"
 tk = "*"
 
+[package.extra-dependencies.dev]
+pytest = "*"
+
 
 [workspace]
 preview = ["pixi-build"]
