@@ -1,7 +1,10 @@
 """General setup for Ethan's Proekt Lab code"""
 # for some reason, we need to import QtWidgets before cellpose
 # and maybe other Qt imports to avoid lots of scary warnings
-from qtpy import QtWidgets  # noqa: F401
+try:
+    from qtpy import Qt, QtWidgets  # noqa: F401
+except Exception:
+    pass
 
 import logging
 from typing import Union

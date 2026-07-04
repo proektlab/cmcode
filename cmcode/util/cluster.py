@@ -3,7 +3,7 @@ from dataclasses import dataclass
 import logging
 from multiprocessing.pool import Pool
 from collections import namedtuple
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, BrokenExecutor
 from typing import Optional, Union, Callable, Iterable, TypeVar, Generic, Sequence
 
 from caiman.cluster import stop_server, setup_cluster
@@ -24,7 +24,14 @@ class FuturesDviewAdapter:
         self.client = FuturesDviewAdapter.Client(profile='default')
 
     def map_sync(self, fn: Callable[..., RetVal], args: Iterable) -> Sequence[RetVal]:
-        return list(self.executor.map(fn, args))
+        try:
+            return list(self.executor.map(fn, args))
+        except BrokenExecutor:
+            # recreate process pool and retry
+            logging.info('Process pool was broken - restarting and trying again')
+            self.executor.shutdown()
+            self.executor = ProcessPoolExecutor(max_workers=self.max_workers)
+            return list(self.executor.map(fn, args))
     
     class AsyncResultAdapter(Generic[RetVal]):
         """Doesn't actually process asynchronously, but pretends to"""
@@ -108,7 +115,7 @@ class Cluster:
         
         if self.info is not None:
             if self.info.dview is not None:
-                logging.info(f'Closing previous cluster')
+                logging.info('Closing previous cluster')
             self.shutdown()
         
         if backend == 'single':

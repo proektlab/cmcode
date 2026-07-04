@@ -9,6 +9,7 @@ from string import Template
 from typing import (Optional, Protocol, Union, Literal, Sequence, Callable, Generic, Generator,
                     Iterable, TypeVar, ParamSpec, Concatenate, runtime_checkable, overload)
 
+import mesmerize_core as mc
 import numpy as np
 
 from cmcode.remote.host_info import  HostInfo, get_network_hosts
@@ -30,7 +31,6 @@ def set_root_data_dir(path: Union[str, Path]):
     _root_data_dir = path
     
     # also update root dir for mesmerize-core
-    import mesmerize_core as mc  # importing locally for now to avoid import order issue with caiman
     mc.set_parent_raw_data_path(path / 'processed')
 
 def get_root_data_dir() -> Path:

@@ -20,7 +20,7 @@ dependencies = [
     "fastplotlib[notebook] @ git+https://github.com/ethanbb/fastplotlib.git@a16-numpy2",
     "h5py",
     "hdf5storage>=0.2.0",
-    "holoviews",
+    "holoviews>=1.23.1",  # fixes bug that affects mcorr shifts plot
     "ipympl",
     "mesmerize-core",
     "mesmerize-viz @ git+https://github.com/proektlab/mesmerize-viz",
