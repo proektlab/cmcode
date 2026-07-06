@@ -535,8 +535,9 @@ class ParamStruct(BaseModel, revalidate_instances='always', ser_json_inf_nan='co
                     yield key + '.' + param
         
     def do_params_match(self, other: Union['ParamStruct', params.CNMFParams], metadata: dict[str, Any],
-                        stage: Optional[AnalysisStage] = None, ignore_prereq_stages=False) -> bool:
-        return not any(self.get_differing_params(other, metadata=metadata, stage=stage, ignore_prereq_stages=ignore_prereq_stages))
+                        stage: Optional[AnalysisStage] = None, ignore_prereq_stages=False, exclude_quality=True) -> bool:
+        return not any(self.get_differing_params(
+            other, metadata=metadata, stage=stage, ignore_prereq_stages=ignore_prereq_stages, exclude_quality=exclude_quality))
 
     
     def get_differing_params_from_file(

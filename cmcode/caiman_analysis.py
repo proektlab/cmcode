@@ -1532,7 +1532,7 @@ class SessionAnalysis:
             except FileNotFoundError:
                 pass
             else:
-                if self.params.do_params_match(old_eval_params, self.metadata, stage=cmp.AnalysisStage.EVAL):
+                if self.params.do_params_match(old_eval_params, self.metadata, stage=cmp.AnalysisStage.EVAL, exclude_quality=False):
                     
                     # reload CNMF object if necessary (if eval was previously invalidated)
                     est = self.cnmf_fit.estimates
