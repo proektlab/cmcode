@@ -46,8 +46,19 @@ class BorderSpec:
     bottom_subpix: float
 
     def __init__(
-            self, left: CanFloat = 0., right: CanFloat = 0.,
-            top: CanFloat = 0., bottom: CanFloat = 0.):
+            self, left: Optional[CanFloat] = None, right: Optional[CanFloat] = None,
+            top: Optional[CanFloat] = None, bottom: Optional[CanFloat] = None,
+            *, left_subpix=0., right_subpix=0., top_subpix=0., bottom_subpix=0.):
+        """
+        Normal usage: provide borders as positional arguments, or nonzero borders as "left", "right", etc.
+        keyword arguments. The *_subpix arguments are also provided so that "replace" works; these are
+        used first as defaults, then the non-suffixed arguments are applied on top.
+        """
+        left = float(left) if left is not None else left_subpix
+        right = float(right) if right is not None else right_subpix
+        top = float(top) if top is not None else top_subpix
+        bottom = float(bottom) if bottom is not None else bottom_subpix
+
         object.__setattr__(self, 'left_subpix', float(left))
         object.__setattr__(self, 'right_subpix', float(right))
         object.__setattr__(self, 'top_subpix', float(top))
