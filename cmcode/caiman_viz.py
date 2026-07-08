@@ -40,7 +40,7 @@ from sidecar import Sidecar
 import caiman
 from caiman.utils import sbx_utils
 from caiman.source_extraction.cnmf import CNMF
-from mesmerize_core import MCorrExtensions, CaimanSeriesExtensions
+from mesmerize_core import MCorrExtensions, CaimanSeriesExtensions  # noqa: F401
 from mesmerize_viz._cnmf import CNMFVizContainer, CNMFDataFrameVizExtension, EvalController
 
 import cmcode
@@ -93,7 +93,7 @@ class ButtonWithFeedback(HBox):
         for callback in self.click_handlers.callbacks:
             try:
                 callback(obj)
-            except:
+            except Exception:
                 # show X and directions to look at console
                 self.feedback.clear_output()
                 with self.feedback:

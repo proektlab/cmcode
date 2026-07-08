@@ -6,6 +6,7 @@ import logging
 import math
 import os
 from pathlib import Path
+import sys
 from tempfile import NamedTemporaryFile
 from typing import Optional, Literal, Union
 
@@ -439,12 +440,18 @@ class CNMFExt(cnmf.CNMF):
 
         if safe and os.path.exists(filename):
             # save to temp file and then move
-            save_dir = os.path.split(filename)[0]
+            save_dir, file_tail = os.path.split(filename)
             with NamedTemporaryFile(dir=save_dir, delete=False) as tempf:
                 try:
                     cnmf.save_dict_to_hdf5(obj_dict, tempf)  # type: ignore
                     try:
-                        os.remove(filename)
+                        if sys.platform == 'win32':
+                            # rename first to avoid delay in deleting
+                            file_to_remove = os.path.join(save_dir, '~' + file_tail)
+                            os.rename(filename, file_to_remove)
+                        else:
+                            file_to_remove = filename
+                        os.remove(file_to_remove)
                     except FileNotFoundError:
                         pass
                     os.rename(tempf.name, filename)  # should work b/c on same filesystem

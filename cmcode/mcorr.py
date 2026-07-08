@@ -364,7 +364,7 @@ class MCResult(paths.CustomPathMappable):
         mov = cm.load(self.mmap_files[plane])
         _T, *dims = mov.shape
         slices = self.border_asym[plane].slices(dims)
-        mov_center = mov[:, *slices]
+        mov_center = mov[(slice(None),) + slices]
 
         if torch.cuda.is_available():
             device = torch.device('cuda')  # type: ignore

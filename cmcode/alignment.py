@@ -815,7 +815,7 @@ def load_offsets_for_sessions(
 
 
 def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=False,
-                    align_options: Optional[dict] = None, n_planes=1, border: Union[BorderSpec, int] = 0,
+                    align_options: Optional[dict] = None, n_planes=1, border: Union[int, BorderSpec, Sequence[BorderSpec]] = 0,
                     template2_shift_guess: tuple[float, float] = (0, 0)) -> tuple[np.ndarray, np.ndarray]:
     """
     Do just the template alignment step of registerROIs. This is just a single iteration of the
@@ -839,12 +839,15 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
 
     if isinstance(border, int):
         border = BorderSpec.equal(border)
+
+    if isinstance(border, BorderSpec):
+        border = [border] * n_planes
     
     x_plane_remaps = []
     y_plane_remaps = []
     planes1 = np.split(template1, n_planes, axis=1)
     planes2 = np.split(template2, n_planes, axis=1)
-    for k_plane, (plane1, plane2) in enumerate(zip(planes1, planes2)):
+    for k_plane, (plane1, plane2, plane_border) in enumerate(zip(planes1, planes2, border)):
         plane_dims = plane1.shape
         plane_inds = tuple(np.arange(0., dim).astype(np.float32) for dim in plane_dims)
 
@@ -853,16 +856,16 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
             # shift plane2 based on shift guess and adjust borders
             plane2 = ndimage.shift(plane2, template2_shift_guess)
             if guess_y > 0:
-                border = replace(border, top=border.top_subpix + guess_y)
+                plane_border = replace(plane_border, top=plane_border.top_subpix + guess_y)
             else:
-                border = replace(border, bottom=border.bottom_subpix - guess_y)
+                plane_border = replace(plane_border, bottom=plane_border.bottom_subpix - guess_y)
             if guess_x > 0:
-                border = replace(border, left=border.left_subpix + guess_x)
+                plane_border = replace(plane_border, left=plane_border.left_subpix + guess_x)
             else:
-                border = replace(border, right=border.right_subpix - guess_x)
+                plane_border = replace(plane_border, right=plane_border.right_subpix - guess_x)
 
         # get just non-blacked out center to compute transform
-        center_slices = border.slices(plane_dims)
+        center_slices = plane_border.slices(plane_dims)
         center1 = plane1[center_slices].copy()  # necessary to avoid mutating original array
         center2 = plane2[center_slices].copy()
         center_dims = center1.shape
@@ -921,8 +924,8 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
                     shifts_opencv=align_options["shifts_opencv"],
                     upsample_factor_grid=align_options["upsample_factor_grid"])
                 # account for border
-                patch_centers = (np.array(patch_centers[0]) + border.top,
-                                 np.array(patch_centers[1]) + border.left)
+                patch_centers = (np.array(patch_centers[0]) + plane_border.top,
+                                 np.array(patch_centers[1]) + plane_border.left)
                 patch_grid = tuple(len(centers) for centers in patch_centers)
                 _sh_ = np.stack(shifts, axis=0)
 
@@ -948,7 +951,7 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
 
 
 def align_templates_multiple(
-        templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[BorderSpec, int]]] = None,
+        templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[Sequence[BorderSpec], BorderSpec, int]]] = None,
         use_opt_flow=False, align_options: Optional[dict] = None, n_planes=1,
         yx_position_guesses: Union[onp.ToFloatStrict2D, None] = None) -> list[tuple[np.ndarray, np.ndarray]]:
     """
@@ -978,7 +981,10 @@ def align_templates_multiple(
 
     # always warp the first session, so it should be 'template2'
     for (template2, border2, pos2), (template1, border1, pos1) in pairwise(zip(templates, borders, yx_pos)):
-        border = BorderSpec.max(border1, border2)
+        borders1 = border1 if isinstance(border1, Sequence) else [border1] * n_planes
+        borders2 = border2 if isinstance(border2, Sequence) else [border2] * n_planes
+        border = [BorderSpec.max(b1, b2) for b1, b2 in zip(borders1, borders2)]
+
         # the guess is how to shift template 2, so we want to subtract its current position and add the position of template 1
         template2_shift_guess = (pos1[0] - pos2[0], pos1[1] - pos2[1])
         xy_remaps.append(align_templates(
@@ -987,7 +993,7 @@ def align_templates_multiple(
     return xy_remaps
 
 
-def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[BorderSpec, int]]] = None,
+def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[Sequence[BorderSpec], BorderSpec, int]]] = None,
                              use_opt_flow=False, align_options: Optional[dict] = None, n_planes=1,
                              yx_position_guesses: Union[Sequence, np.ndarray, None] = None,
                              precomputed_remaps: Optional[np.ndarray] = None, precomputed_mask: Sequence[bool] = ()) -> np.ndarray:
@@ -1034,7 +1040,10 @@ def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[
                 remaps[i_from, j_to-1] = precomputed_remaps[i_precomputed, j_precomputed-1]
                 remaps[j_to, i_from] = precomputed_remaps[j_precomputed, i_precomputed]
             else:
-                border = BorderSpec.max(border1, border2)
+                borders1 = border1 if isinstance(border1, Sequence) else [border1] * n_planes
+                borders2 = border2 if isinstance(border2, Sequence) else [border2] * n_planes
+                border = [BorderSpec.max(b1, b2) for b1, b2 in zip(borders1, borders2)]
+
                 # the guess is how to shift template 2, so we want to subtract its current position and add the position of template 1
                 template2_shift_guess = (pos1[0] - pos2[0], pos1[1] - pos2[1])
                 this_remap = align_templates(
@@ -1915,6 +1924,7 @@ def get_zmax_templates_and_borders_multisession(
     templates: list[np.ndarray] = []
     borders: list[BorderSpec] = []
     for sess_id, tag in zip(sess_ids, tags):
+        logging.debug(f'Gettng z-max projection for session {sess_id}')
         sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
         templates.append(sessinfo.get_zmax_projection(projection_params=projection_params))
 
