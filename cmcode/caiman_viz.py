@@ -1547,6 +1547,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
 
     # get templates and ROIs
     info1 = cma.load_latest(mouse_id, sessions.at[ind1, 'sess_id'], tag=sessions.at[ind1, 'tag'], rec_type=rec_type)
+    info1.select_gridsearch_run(sessions.at[ind1, 'cnmf_uuid'], quiet=True, save=False)
     plane_height, plane_width = info1.plane_size
     num_planes = info1.metadata['num_planes']
     background1 = info1.get_projection_for_seed(**background_params)[0]
@@ -1556,6 +1557,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         A1 = sparse.csc_array(A1)
 
     info2 = cma.load_latest(mouse_id, sessions.at[ind2, 'sess_id'], tag=sessions.at[ind2, 'tag'], rec_type=rec_type)
+    info2.select_gridsearch_run(sessions.at[ind2, 'cnmf_uuid'], quiet=True, save=False)
     background2 = info2.get_projection_for_seed(**background_params)[0]
     assert info2.cnmf_fit is not None and info2.cnmf_fit.estimates.A is not None, 'CNMF should be done'
     A2_orig = info2.cnmf_fit.estimates.A

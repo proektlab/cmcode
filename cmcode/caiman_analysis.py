@@ -447,15 +447,28 @@ class SessionAnalysis:
             case AnalysisStage.FINAL:
                 pass
 
-    def process_up_to_stage(self, stage: AnalysisStage, load: Optional[bool] = None, save=True):
+    def process_up_to_stage(
+        self, stage: AnalysisStage, load: Optional[bool] = None, save=True,
+        allow_skipping_missing_results=False):
         """Run or load pipeline from the last valid stage through the given stage"""
         curr_stage = self.last_valid_stage
+        excs: list[NoMatchingResultError] = []
+
         for stage_num in range(curr_stage + 1, stage + 1):
             next_stage = AnalysisStage(stage_num)
-            self.process_stage(next_stage, load=load, save=False)
+            try:
+                self.process_stage(next_stage, load=load, save=False)
+            except NoMatchingResultError as e:
+                if allow_skipping_missing_results:
+                    excs.append(e)
+                else:
+                    raise
         
         if save:
             self.save(save_cnmf=stage >= AnalysisStage.CNMF)
+        
+        if excs:
+            raise ExceptionGroup('One or more results was not loaded', excs)
 
     def run_to_end(self, save=True):
         self.process_up_to_stage(AnalysisStage.FINAL, save=save)
@@ -575,6 +588,17 @@ class SessionAnalysis:
         return widget.show()
 
 
+    def get_tif_file_path(self, plane: Optional[int]) -> str:
+        """Get path where TIF file should be saved for the given plane (or for 3D movie if None)"""
+        conversion_dir = os.path.join(self.data_dir, 'conversion')
+        tagstr = '_' + self.tag if self.tag is not None else ''
+        
+        if plane is None:
+            return os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}.tif')
+        else:
+            return os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_plane{plane}.tif')
+
+
     def convert_to_tif(self, load: Optional[bool] = None, save=True, **convert_kwargs):
         """
         Concatenate sbx files and convert each plane (by default) or the entire 3D movie to .tif file(s).
@@ -643,17 +667,14 @@ class SessionAnalysis:
                 self.sbx_files, fileout=filename, subindices=subindices, plane=plane, dview=cluster.dview, **param_dict)
             self.write_params_for_result_file(filename, AnalysisStage.CONVERT)
       
-        conversion_dir = os.path.join(self.data_dir, 'conversion')
-        os.makedirs(conversion_dir, exist_ok=True)
-        tagstr = '_' + self.tag if self.tag is not None else ''
-
         if self.params.conversion.keep_3d:
-            tif_filename = os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}.tif')
+            tif_filename = self.get_tif_file_path(plane=None)
+            os.makedirs(os.path.split(tif_filename)[0], exist_ok=True)
             convert_one(tif_filename, plane=None)
             tif_filenames = [tif_filename]
         else:
-            tif_filenames = [os.path.join(conversion_dir, f'{self.mouse_id}_{self.sess_id:03d}{tagstr}_plane{plane}.tif')
-                             for plane in range(self.metadata['num_planes'])]
+            tif_filenames = [self.get_tif_file_path(plane=plane) for plane in range(self.metadata['num_planes'])]
+            os.makedirs(os.path.split(tif_filenames[0])[0], exist_ok=True)
             
             if (len(tif_filenames) == 1):
                 convert_one(tif_filenames[0], plane=None)
@@ -681,9 +702,6 @@ class SessionAnalysis:
 
         save: Whether to save new MCResult object in pkl file (data file will be saved regardless)
         """
-        if self.plane_tifs is None:
-            raise RuntimeError('Must convert to TIF before doing motion correction')
-
         # update indices if necessary
         params = self.params
         motion_params = params.motion
@@ -698,8 +716,14 @@ class SessionAnalysis:
         plane_results: list[Optional[mcorr.PlaneMcorrResult]] = []  # will be filled with only new results
         is_piecewise = motion_params.pw_rigid
 
-        for k_plane, tif_path in enumerate(self.plane_tifs):
-            plane_prefix = f'Plane {k_plane}: ' if len(self.plane_tifs) > 1 else ''
+        for k_plane in range(self.metadata['num_planes']):
+            if self.plane_tifs is not None:
+                tif_path = self.plane_tifs[k_plane]
+            else:
+                # bypass, in the case we are loading without having TIF results
+                tif_path = self.get_tif_file_path(plane=k_plane)
+
+            plane_prefix = f'Plane {k_plane}: ' if self.metadata['num_planes'] > 1 else ''
 
             if load is not False:  # try to load existing results
                 candidate_files = mcorr.get_candidate_mcorr_result_files(tif_path, is_piecewise)
@@ -723,6 +747,9 @@ class SessionAnalysis:
                         raise NoMatchingResultError(no_match_msg)
             
             # we are doing mcorr for this plane
+            if self.plane_tifs is None:
+                raise RuntimeError('Must convert to TIF before doing motion correction')
+
             logging.info(plane_prefix + 'doing motion correction.')
 
             plane_result = mcorr.motion_correct_file(tif_path, params, dview=cluster.dview)
@@ -1026,7 +1053,7 @@ class SessionAnalysis:
                     )
 
                 if proj_type == 'corr':
-                    proj = make_correlation_parallel(mov_or_filename, cluster.dview)
+                    proj: onp.Array2D[np.floating] = make_correlation_parallel(mov_or_filename, cluster.dview)
                 else:
                     ignore_nan = self.params.motion.border_nan is True
                     proj = make_projection_parallel(mov_or_filename, proj_type, cluster.dview, ignore_nan=ignore_nan)
@@ -1041,7 +1068,7 @@ class SessionAnalysis:
                 post_blur = blur_kernel_size > 1
 
                 # do each pre-transposition/concatenation plane individually
-                plane_projs: list[np.ndarray] = []
+                plane_projs: list[onp.Array2D[np.floating]] = []
                 ignore_nan = self.params.motion.border_nan is True
 
                 for plane_mmap in self.mc_result.mmap_files:
@@ -1067,17 +1094,16 @@ class SessionAnalysis:
             plane_projs = []
             for plane_tif in self.plane_tifs:
                 if proj_type == 'corr':
-                    plane_proj = make_correlation_parallel(plane_tif, cluster.dview)
+                    plane_projs.append(make_correlation_parallel(plane_tif, cluster.dview))
                 else:
-                    plane_proj = make_projection_parallel(plane_tif, proj_type, cluster.dview)
-                plane_projs.append(plane_proj)
+                    plane_projs.append(make_projection_parallel(plane_tif, proj_type, cluster.dview))
             proj = np.concatenate(plane_projs, axis=1)
         
         if post_blur:
             # linear operation, can just blur here
-            proj = cv2.GaussianBlur(
+            proj = cast(onp.Array2D[np.floating], cv2.GaussianBlur(
                 proj, ksize=(blur_kernel_size, blur_kernel_size), sigmaX=blur_kernel_size/4,
-                sigmaY=blur_kernel_size/4, borderType=cv2.BORDER_REPLICATE)
+                sigmaY=blur_kernel_size/4, borderType=cv2.BORDER_REPLICATE))
 
         proj[np.isnan(proj)] = 0
         return proj
@@ -1713,9 +1739,9 @@ class SessionAnalysis:
         # try loading or running prerequisites to fill in invalidated data
         try:
             load = None if allow_rerunning_prereqs else True
-            self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load, save=False)
+            self.process_up_to_stage(AnalysisStage.TRANSPOSE, load=load, save=False, allow_skipping_missing_results=True)
 
-        except NoMatchingResultError as e:
+        except* NoMatchingResultError as e:
             logging.warning(
                 'Cannot load all prerequisite results of the selected CNMF run. '
                 'The CNMF result will still be loaded, but some functionality may not work '
@@ -1802,7 +1828,7 @@ class SessionAnalysis:
 
         return footprints.get_coms_3d(
             est.A, self.plane_size, um_per_pixel_x=spacing_x, um_per_pixel_y=spacing_y,
-            depths=self.get_relative_depths(), unit=unit)
+            depths=self.get_relative_depths().astype(float), unit=unit)
 
 
     @overload
