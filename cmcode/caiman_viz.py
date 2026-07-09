@@ -1484,10 +1484,11 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         xy_remappings: list[tuple[np.ndarray, np.ndarray]] = align_results['xy_remappings']
         xy_mapping = xy_remappings[ind2]
     else:
+        planewise = align_results.get('planewise', False)
         try:
             xy_mappings, _ = alignment.load_or_compute_remaps_for_sessions(
                 mouse_id, sess_ids=[sess2_id, sess1_id], rec_type=rec_type, tags=[sess2_tag, sess1_tag],
-                grouptag=grouptag, use_saved_mappings=True)
+                grouptag=grouptag, use_saved_mappings=True, planewise=planewise)
         except RuntimeError as e:
             if 'xy_remappings' in align_results:
                 raise NotImplementedError('Cannot compare non-consecutive results without saved full grid of mappings') from e

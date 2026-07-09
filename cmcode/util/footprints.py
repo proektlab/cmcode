@@ -1,9 +1,10 @@
 """Utilities for manipulating sets of cell footprints (A)"""
+from collections.abc import Sequence, Mapping, Callable
 from dataclasses import dataclass
 from functools import cache
 import logging
 import math
-from typing import Any, Literal, Union, Sequence, Callable, Optional, Mapping, overload
+from typing import Any, Literal, Union, Optional, overload, cast
 from warnings import warn
 
 import cellpose.models
@@ -12,6 +13,7 @@ import matplotlib.pyplot as plt
 import matplotlib.style as mplstyle
 import numpy as np
 import optype.numpy as onp
+import pandas as pd
 from scipy.interpolate import make_smoothing_spline
 from scipy.ndimage import gaussian_filter
 from scipy import sparse
@@ -22,6 +24,7 @@ from caiman.source_extraction.cnmf.merging import get_ROIs_to_merge
 
 from cmcode import caiman_analysis as cma, cmcustom, caiman_params as cmp
 from cmcode.cmcustom import my_get_contours
+from cmcode.util import scaled
 from cmcode.util.image import make_merge, BorderSpec
 from cmcode.util.naming import make_sess_name
 from cmcode.util.types import MaybeSparse, ST
@@ -184,6 +187,48 @@ def get_bboxes(
         else:
             bboxes.append(BorderSpec.maximal(dims))
     return bboxes
+
+
+def get_coms_3d(
+    A: MaybeSparse, plane_shape: tuple[int, int], um_per_pixel_x: float, um_per_pixel_y: float,
+    depths: onp.Array1D[np.floating], unit: Literal['um', 'pixels'] = 'pixels') -> scaled.ScaledDataFrame:
+    """
+    Calculates the center of mass of each component (distance from top left corner of top plane)
+    This weights the 2D COMs according to the number of pixels
+    The pixel size is taken into account, particularly spacing between z-planes which may be uneven.
+    Return value is a 3D position object with vectors for x y and z positions in um.
+    """
+    pix_y, pix_x = plane_shape
+    um_vals_y = np.arange(pix_y) * um_per_pixel_y
+    um_vals_x = np.arange(pix_x) * um_per_pixel_x
+    spacings = {'y': um_per_pixel_y, 'x': um_per_pixel_x}
+
+    depths = np.array(depths)
+    if depths.size == 1:
+        um_vals = (um_vals_y, um_vals_x)
+    else:
+        um_vals = (um_vals_y, um_vals_x, depths)
+        # if the planes are uniform, we save the spacing; otherwise just set it to None
+        spacings_z = np.diff(depths)
+        if np.all(spacings_z == spacings_z[0]):
+            spacings['plane'] = float(spacings_z[0])
+        else:
+            spacings['plane'] = None
+    
+    # now actually calculate the COMs, interpreting dims as being in 3D
+    coms_3d_um = cmcustom.my_com(A, *um_vals)
+
+    # if we want the result in pixels but the z-spacing is nonuniform, we have to interpolate
+    if 'plane' in spacings and spacings['plane'] is None and unit == 'pixels':
+        spacings.pop('plane')
+        yx_df = scaled.make_um_df(coms_3d_um[:, :-1], pixel_size=spacings)
+        plane_pix = np.interp(coms_3d_um[:, -1], um_vals[-1], range(len(um_vals[-1])))
+        plane_df = scaled.make_pixel_df({'plane': plane_pix})
+        coms_df = cast(scaled.ScaledDataFrame, pd.concat([yx_df, plane_df], axis=1))
+    else:
+        coms_df = scaled.make_um_df(coms_3d_um, pixel_size=spacings)
+
+    return coms_df.to_unit(unit)
 
 
 def smooth_footprints(

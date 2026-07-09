@@ -48,7 +48,7 @@ from cmcode.util.cluster import Cluster
 from cmcode.util.compat import reconstruct_sessdata_obj
 from cmcode.util.image import make_merge, remap_image, BorderSpec, preprocess_proj_for_seed, imshow_scaled
 from cmcode.util.sbx_data import find_sess_sbx_files, get_trial_numbers_from_files
-from cmcode.util.scaled import ScaledDataFrame, make_um_df, make_pixel_df
+from cmcode.util.scaled import ScaledDataFrame
 from cmcode.util.types import NoBatchFileError, NoMatchingResultError, MescoreBatch, MescoreSeries
 
 if TYPE_CHECKING or in_jupyter():
@@ -988,7 +988,7 @@ class SessionAnalysis:
 
 
     def make_projection(
-        self, proj_type: str, blur_kernel_size: Optional[int] = None, motion_corrected=True, from_transposed=True) -> np.ndarray:
+        self, proj_type: str, blur_kernel_size: Optional[int] = None, motion_corrected=True, from_transposed=True) -> onp.Array2D[np.floating]:
         """
         Make correlation image or {mean/std/max}-projection
         If blur_kernel_size > 1, do gaussian blur on a downsampled copy of the movie before computing projection
@@ -1083,7 +1083,7 @@ class SessionAnalysis:
         return proj
 
 
-    def load_projection_from_result(self, proj_type: str) -> tuple[np.ndarray, MescoreSeries]:
+    def load_projection_from_result(self, proj_type: str) -> tuple[onp.Array2D[np.floating], MescoreSeries]:
         """
         Attempt to load a projection (corr, mean, std, or max) from a previous mesmerize result.
         Returns the projection and the item the projection was pulled from (a Series).
@@ -1128,7 +1128,7 @@ class SessionAnalysis:
             return [BorderSpec.equal(0)] * len(self.plane_tifs)
 
 
-    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True, from_transposed=True) -> np.ndarray:
+    def get_projection(self, proj_type: str, blur_kernel_size=1, motion_corrected=True, from_transposed=True) -> onp.Array2D[np.floating]:
         if motion_corrected and from_transposed and proj_type in ('corr', 'mean', 'std', 'max'):
             # try loading from mesmerize
             if blur_kernel_size > 1:
@@ -1145,7 +1145,7 @@ class SessionAnalysis:
         
     def get_projection_for_seed(
         self, type='mean', motion_corrected=True, from_transposed=True, blur_size=1, norm_medw: Optional[int] = None,
-        borders: Optional[list[BorderSpec]] = None, **seed_params_extra) -> tuple[np.ndarray, dict]:
+        borders: Optional[list[BorderSpec]] = None, **seed_params_extra) -> tuple[onp.Array2D[np.floating], dict]:
         """
         Make 2D projection image to use for making seed with given params.
         Returns the projection along with any unused params
@@ -1164,7 +1164,8 @@ class SessionAnalysis:
     
 
     def get_plane_projections(
-        self, projection_params: Union[str, dict], motion_corrected=True, from_transposed=True, exclude_border=True) -> list[np.ndarray]:
+        self, projection_params: Union[str, dict], motion_corrected=True, from_transposed=True, exclude_border=True
+        ) -> list[onp.Array2D]:
         if isinstance(projection_params, str):
             projection_params = {'type': projection_params}
 
@@ -1178,35 +1179,42 @@ class SessionAnalysis:
         return plane_projs
 
 
+    def get_plane_projections_used_for_seed(self, exclude_border=False) -> list[onp.Array2D]:
+        """Get plane projections, loading from mesmerize result if possible or using seed_params"""
+        ind = self.get_selected_index()
+        plane_projs: Optional[list[np.ndarray]] = None
+        if ind is None:
+            logging.info('No selected CNMF run; computing with current seed params')
+        else:
+            item = cast(MescoreSeries, self.get_gridsearch_results().iloc[ind])
+            output_path = item.cnmf.get_output_path()
+            proj_path = output_path.parent / 'projection_for_seed.npy'
+            if proj_path.exists():
+                full_proj = np.load(proj_path)
+                plane_projs = np.split(full_proj, self.metadata['num_planes'], axis=1)
+                if exclude_border:
+                    borders = self.get_borders(motion_corrected=True)
+                    plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
+            else:
+                logging.warning('projection_for_seed not saved; recomputing with current seed params')
+        
+        if plane_projs is None:
+            # fall back to recomputing based on seed_params
+            seed_params = asdict(self.params.cnmf_extra.seed_params)
+            plane_projs = self.get_plane_projections(seed_params, exclude_border=exclude_border)
+        
+        return plane_projs
+
+
     def get_zmax_projection(self, projection_params: Optional[Union[str, dict]] = None,
-                            exclude_border=False) -> np.ndarray:
+                            exclude_border=False) -> onp.Array2D:
         """
         Get max of temporal projection over planes for the given session.
         Defaults to using the projection used for the seed of the selected CNMF run if projection_params
         are not given.
         """
         if projection_params is None:
-            ind = self.get_selected_index()
-            plane_projs: Optional[list[np.ndarray]] = None
-            if ind is None:
-                logging.info('No selected CNMF run; computing with current seed params')
-            else:
-                item = cast(MescoreSeries, self.get_gridsearch_results().iloc[ind])
-                output_path = item.cnmf.get_output_path()
-                proj_path = output_path.parent / 'projection_for_seed.npy'
-                if proj_path.exists():
-                    full_proj = np.load(proj_path)
-                    plane_projs = np.split(full_proj, self.metadata['num_planes'], axis=1)
-                    if exclude_border:
-                        borders = self.get_borders(motion_corrected=True)
-                        plane_projs = [plane[border.slices(plane.shape)] for plane, border in zip(plane_projs, borders)]
-                else:
-                    logging.warning('projection_for_seed not saved; recomputing with current seed params')
-            
-            if plane_projs is None:
-                # fall back to recomputing based on seed_params
-                seed_params = asdict(self.params.cnmf_extra.seed_params)
-                plane_projs = self.get_plane_projections(seed_params, exclude_border=exclude_border)
+            plane_projs = self.get_plane_projections_used_for_seed(exclude_border=exclude_border)
         else:
             plane_projs = self.get_plane_projections(projection_params, exclude_border=exclude_border)
 
@@ -1761,7 +1769,7 @@ class SessionAnalysis:
         return None
     
 
-    def get_relative_depths(self) -> np.ndarray:
+    def get_relative_depths(self) -> onp.Array1D[np.integer]:
         """Get depth of each plane, with top plane being 0, in um"""
         if self.metadata['num_planes'] == 1:
             return np.array([0.])
@@ -1789,40 +1797,12 @@ class SessionAnalysis:
         if est.A is None or est.dims is None:
             raise RuntimeError('CNMF not run')
 
-        # interpret dims as being in 3D
-        pix_y, pix_x = self.plane_size
         spacing_y = self.metadata['um_per_pixel_y']
-        um_vals_y = np.arange(pix_y) * spacing_y
         spacing_x = self.metadata['um_per_pixel_x']
-        um_vals_x = np.arange(pix_x) * spacing_x
 
-        spacings = {'y': spacing_y, 'x': spacing_x}
-        um_vals_z = self.get_relative_depths()
-        if len(um_vals_z) == 1:
-            um_vals = (um_vals_y, um_vals_x)
-        else:
-            um_vals = (um_vals_y, um_vals_x, um_vals_z)
-            # if the planes are uniform, we save the spacing; otherwise just set it to None
-            spacings_z = np.diff(um_vals_z)
-            if np.all(spacings_z == spacings_z[0]):
-                spacings['plane'] = float(spacings_z[0])
-            else:
-                spacings['plane'] = None
-
-        # now actually calculate the COMs
-        coms_3d_um = cmcustom.my_com(est.A, *um_vals)
-
-        # if we want the result in pixels but the z-spacing is nonuniform, we have to interpolate
-        if 'plane' in spacings and spacings['plane'] is None and unit == 'pixels':
-            spacings.pop('plane')
-            yx_df = make_um_df(coms_3d_um[:, :-1], pixel_size=spacings)
-            plane_pix = np.interp(coms_3d_um[:, -1], um_vals[-1], range(len(um_vals[-1])))
-            plane_df = make_pixel_df({'plane': plane_pix})
-            coms_df = cast(ScaledDataFrame, pd.concat([yx_df, plane_df], axis=1))
-        else:
-            coms_df = make_um_df(coms_3d_um, pixel_size=spacings)
-
-        return coms_df.to_unit(unit)
+        return footprints.get_coms_3d(
+            est.A, self.plane_size, um_per_pixel_x=spacing_x, um_per_pixel_y=spacing_y,
+            depths=self.get_relative_depths(), unit=unit)
 
 
     @overload

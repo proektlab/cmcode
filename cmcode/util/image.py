@@ -536,8 +536,8 @@ def remap_points_from_df(df: pd.DataFrame, x_remap: Optional[np.ndarray],
     return df_mapped
 
 
-def preprocess_proj_for_seed(mean_img: np.ndarray, med_w: int = 25,
-                             borders: list[BorderSpec] = [BorderSpec.equal(0)]) -> np.ndarray:
+def preprocess_proj_for_seed(mean_img: onp.Array2D[np.floating], med_w: int = 25,
+                             borders: list[BorderSpec] = [BorderSpec.equal(0)]) -> onp.Array2D[np.floating]:
     """Make a brightness-normalized mean image for CNMF seed calculation"""
     concat_planes = len(borders)
 

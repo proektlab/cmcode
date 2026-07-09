@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from datetime import date
@@ -6,7 +7,7 @@ import logging
 import math
 import os
 import pickle
-from typing import Optional, Sequence, Iterable, Literal, Union, cast
+from typing import Optional, Literal, Union, cast
 
 import caiman as cm
 from caiman.base.rois import com, distance_masks, find_matches
@@ -20,7 +21,7 @@ import numpy as np
 import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
-from scipy import sparse, ndimage, signal, optimize, stats
+from scipy import sparse, ndimage, signal, optimize, stats, interpolate
 
 from cmcode import caiman_analysis as cma
 from cmcode.cmcustom import compute_matching_performance
@@ -31,7 +32,7 @@ from cmcode.util.image import (BorderSpec, invert_mapping, remap_points, remap_p
 from cmcode.util.naming import make_sess_name, make_sess_names, split_sess_names, format_sess_name
 from cmcode.util.paths import get_root_data_dir, get_processed_dir, make_timestamped_filename, get_latest_timestamped_file
 from cmcode.util.scaled import ScaledDataFrame, ScaledSeries, make_um_df, make_pixel_df
-from cmcode.util.types import NoMultisessionResults, MaybeSparse, BadFitError
+from cmcode.util.types import NoMultisessionResults, MaybeSparse, BadFitError, Array5D
 
 # TODO can move to util.sbx_data if needed in other files
 @dataclass
@@ -814,9 +815,11 @@ def load_offsets_for_sessions(
 # - register_ROIs_multisession: like register_ROIs_multiple but loading from SessionAnalysis objects
 
 
-def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=False,
-                    align_options: Optional[dict] = None, n_planes=1, border: Union[int, BorderSpec, Sequence[BorderSpec]] = 0,
-                    template2_shift_guess: tuple[float, float] = (0, 0)) -> tuple[np.ndarray, np.ndarray]:
+def align_templates(
+    template1: Union[onp.Array2D, Mapping[float, onp.Array2D]], 
+    template2: Union[onp.Array2D, Mapping[float, onp.Array2D]], use_opt_flow=False,
+    align_options: Optional[dict] = None, n_planes=1, border: Union[int, BorderSpec, Sequence[BorderSpec]] = 0,
+    template2_shift_guess: tuple[float, float] = (0, 0)) -> tuple[np.ndarray, np.ndarray]:
     """
     Do just the template alignment step of registerROIs. This is just a single iteration of the
     motion-correction algorithm (or optical flow, if use_opt_flow is True) with some defaults
@@ -828,15 +831,51 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
     template2_shift_guess: (Y, X) amount to shift each plane of template 2 before attempting alignment.
         The resulting remaps will include this shift.
     
+    template1 and template2 can also be provided as mappings from plane positions in um to plane projections.
+        If both are mappings, interpolation is used to adjust template1 to compute a
+        mapping for each plane in template2. In this case, n_planes is ignored.
+
     Ouptput: (x_remap, y_remap) to be used in remap_image, etc.
     """
-    dims = template1.shape
-    if template2.shape != dims:
-        raise ValueError('Templates must have matching dimensions')
-    
-    if dims[1] % n_planes != 0:
-        raise ValueError('Template width is not a multiple of the # of planes')
+    if isinstance(template2, Mapping):
+        n_planes = len(template2)
+        plane_dims = next(iter(template2.values())).shape
+        planes2 = template2.values()
 
+        if isinstance(template1, Mapping):
+            logging.debug('Interpolating planes from session 1 to create mapping for session 2')
+            zs1 = sorted(list(template1.keys()))
+            zs_ext = [zs1[0] - 1] + zs1 + [zs1[-1] + 1]  # extend so that we don't extrapolate
+            planes1_in = np.stack([template1[z] for z in [zs1[0]] + zs1 + [zs1[-1]]])
+            plane_interpolator = interpolate.make_interp_spline(zs_ext, planes1_in, k=1)
+
+            planes1 = [plane_interpolator(z) for z in template2.keys()]
+        
+        else:
+            dims = (plane_dims[0], plane_dims[1] * n_planes)
+            if template1.shape != dims:
+                raise ValueError('Templates must have matching dimensions')
+
+            planes2 = np.split(template1, n_planes, axis=1)
+    else:
+        dims = template2.shape
+
+        if isinstance(template1, Mapping):
+            n_planes = len(template1)
+        
+        if dims[1] % n_planes != 0:
+            raise ValueError('Template width is not a multiple of the # of planes')
+        
+        planes2 = np.split(template2, n_planes, axis=1)
+
+        if isinstance(template1, Mapping):
+            planes1 = template1.values()
+        else:  # both not mappings
+            if template1.shape != dims:
+                raise ValueError('Templates must have matching dimensions')
+
+            planes1 = np.split(template1, n_planes, axis=1)
+    
     if isinstance(border, int):
         border = BorderSpec.equal(border)
 
@@ -845,8 +884,7 @@ def align_templates(template1: np.ndarray, template2: np.ndarray, use_opt_flow=F
     
     x_plane_remaps = []
     y_plane_remaps = []
-    planes1 = np.split(template1, n_planes, axis=1)
-    planes2 = np.split(template2, n_planes, axis=1)
+
     for k_plane, (plane1, plane2, plane_border) in enumerate(zip(planes1, planes2, border)):
         plane_dims = plane1.shape
         plane_inds = tuple(np.arange(0., dim).astype(np.float32) for dim in plane_dims)
@@ -993,10 +1031,13 @@ def align_templates_multiple(
     return xy_remaps
 
 
-def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[Sequence[Union[Sequence[BorderSpec], BorderSpec, int]]] = None,
-                             use_opt_flow=False, align_options: Optional[dict] = None, n_planes=1,
-                             yx_position_guesses: Union[Sequence, np.ndarray, None] = None,
-                             precomputed_remaps: Optional[np.ndarray] = None, precomputed_mask: Sequence[bool] = ()) -> np.ndarray:
+def align_templates_allpairs(
+    templates: Union[Sequence[onp.Array2D], Sequence[Mapping[float, onp.Array2D]]], 
+    borders: Optional[Sequence[Union[Sequence[BorderSpec], BorderSpec, int]]] = None,
+    use_opt_flow=False, align_options: Optional[dict] = None, n_planes=1,
+    yx_position_guesses: Union[Sequence, np.ndarray, None] = None,
+    precomputed_remaps: Optional[Array5D[np.floating]] = None, precomputed_mask: Sequence[bool] = ()
+    ) -> Array5D[np.floating]:
     """
     Align all pairs of given templates, similar to align_templates_multiple.
     The return value "remaps" is a 5-D NDArray of size (len(templates), len(templates)-1, 2) + templates[0].shape
@@ -1006,8 +1047,15 @@ def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[
     If precomputed_remaps is provided, should be a 5-D NDArray of the remaps between a subset of the given templates;
         these will not be recomputed. precomputed_mask should be provided along with it, indicating which of the templates
         were precomputed.
+
+    The templates can also be provided as a sequence of mappings from plane positions in um to plane projections.
+        In this case, all planes should be the same shape (borders should not be excluded). 
+        Interpolation is used to produce a template for session j at appropriate Z positions to compute a
+        planewise mapping for each session i. In this case, n_planes is ignored.
     """
     n_templates = len(templates)
+    if n_templates == 0:
+        raise ValueError('At least one template must be provided')
 
     if borders is None:
         borders = [0] * n_templates
@@ -1027,8 +1075,19 @@ def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[
             raise ValueError('Height of position guesses matrix does not match number of templates')
         if yx_position_guesses.shape[1] != 2:
             raise ValueError('Width of position guesses matrix should be 2 (y, x)')
+
+    if isinstance(templates[0], Mapping):
+        plane_shape = next(iter(templates[0].values())).shape
+        if any(any(pl.shape != plane_shape for pl in template.values()) for template in templates):
+            raise ValueError('If provided as mappings, each plane must have the same shape.')
+
+        shape = (plane_shape[0], plane_shape[1] * len(templates[0]))
+    else:
+        shape = templates[0].shape
+        if any(template.shape != shape for template in templates[1:]):
+            raise ValueError('All templates must have the same shape')
     
-    remaps = np.empty((n_templates, n_templates - 1, 2) + templates[0].shape, dtype=np.float32)
+    remaps = np.empty((n_templates, n_templates - 1, 2) + shape, dtype=np.float32)
     # like above, we call the "from" template template2 and the "to" template template1
     for i_from, (template2, border2, pos2) in enumerate(zip(templates, borders, yx_position_guesses)):
         for j_to, template1, border1, pos1 in zip(range(i_from+1, n_templates), templates[i_from+1:], borders[i_from+1:],
@@ -1056,7 +1115,7 @@ def align_templates_allpairs(templates: Sequence[np.ndarray], borders: Optional[
     return remaps
 
 
-def load_remaps_allpairs(mapping_path: str, sess_names: Sequence[str]) -> tuple[Sequence[bool], np.ndarray]:
+def load_remaps_allpairs(mapping_path: str, sess_names: Sequence[str]) -> tuple[Sequence[bool], Array5D[np.floating]]:
     """
     Load x/y mappings from an npz file, between the sessions specified in sess_names.
     The result is of shape from_session x to_session x (x,y) x source_x x source_y.
@@ -1082,13 +1141,86 @@ def load_remaps_allpairs(mapping_path: str, sess_names: Sequence[str]) -> tuple[
     return b_found, xy_remaps
 
 
+def compute_flat_remaps_for_sessions(
+        mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc',
+        tags: Union[None, Sequence[Optional[str]]] = None, rigid_offsets: Optional[ScaledDataFrame] = None,
+        max_initial_shift=50, max_additional_shift=10, max_deviation_rigid=6, projection_params: Optional[Union[str, dict]] = None,
+        precomputed_remaps: Optional[Array5D[np.floating]] = None, precomputed_mask: Sequence[bool] = ()) -> Array5D[np.floating]:
+    """
+    Compute all the flat (non-planewise) remaps between pairs of given sessions,
+    combining with any precomputed remaps that are provided.
+    """
+    logging.info('Loading z-stack for each session')
+    templates, borders = get_zmax_templates_and_borders_multisession(
+        mouse_id, sess_ids, rec_type=rec_type, tags=tags, include_dead_pixel_border=True, projection_params=projection_params)
+
+    if rigid_offsets is not None:
+        logging.info('Using saved rigid X/Y offsets')
+        yx_pos_df = rigid_offsets.loc[sess_ids, :]
+    else:
+        logging.info('Estimating rigid X/Y offsets')
+        yx_pos_df = guess_yx_positions_multiple(templates, borders=borders, max_shift=max_initial_shift)
+        
+    yx_position_guesses = yx_pos_df.loc[:, ['y', 'x']].to_pixels().to_numpy()
+
+    # compute every pair
+    logging.info('Estimating nonrigid X/Y mappings')
+    align_options = {'max_shifts': (max_additional_shift, max_additional_shift),
+                     'max_deviation_rigid': max_deviation_rigid}
+    return align_templates_allpairs(
+        templates, borders, align_options=align_options, yx_position_guesses=yx_position_guesses,
+        precomputed_remaps=precomputed_remaps, precomputed_mask=precomputed_mask)
+
+
+def compute_planewise_remaps_for_sessions(
+        mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc',
+        tags: Union[None, Sequence[Optional[str]]] = None, rigid_offsets: Optional[ScaledDataFrame] = None,
+        max_initial_shift=50, max_additional_shift=10, max_deviation_rigid=6, projection_params: Optional[Union[str, dict]] = None,
+        precomputed_remaps: Optional[Array5D[np.floating]] = None, precomputed_mask: Sequence[bool] = (),
+        use_rigid_offsets_for_yx_guess=False) -> Array5D[np.floating]:
+    """
+    Compute all the planewise remaps between pairs of given sessions, combining with any precomputed
+    remaps that are provided. If rigid_offsets is not given, assumes all sessions are aligned in Z.
+    """
+    if rigid_offsets is None or 'z' not in rigid_offsets:
+        logging.warning('Z offsets not provided - assuming sessions are aligned in Z')
+        z_positions = np.zeros(len(sess_ids))
+    else:
+        z_positions = rigid_offsets.to_um().loc[sess_ids, 'z'].to_numpy()
+
+    # load mapping from Z position in um to plane projection for each session
+    templates, borders = get_z_mapping_templates_and_borders_multisession(
+        mouse_id, sess_ids, z_positions, rec_type=rec_type, tags=tags, projection_params=projection_params,
+        include_dead_pixel_border=True)
+    
+    if rigid_offsets is not None and use_rigid_offsets_for_yx_guess:
+        logging.info('Using saved rigid X/Y offsets')
+        yx_pos_df = rigid_offsets.loc[sess_ids, :]
+    else:
+        logging.info('Estimating rigid X/Y offsets')
+        # compute using max-projections
+        max_templates = [np.max(list(templ_dict.values()), axis=0) for templ_dict in templates]
+        max_borders = [BorderSpec.max(sess_borders) for sess_borders in borders]
+        yx_pos_df = guess_yx_positions_multiple(max_templates, borders=max_borders, max_shift=max_initial_shift)
+
+    yx_position_guesses = yx_pos_df.loc[:, ['y', 'x']].to_pixels().to_numpy()
+
+    # compute every pair
+    logging.info('Estimating nonrigid X/Y mappings (planewise)')
+    align_options = {'max_shifts': (max_additional_shift, max_additional_shift),
+                     'max_deviation_rigid': max_deviation_rigid}
+    return align_templates_allpairs(
+        templates, borders, align_options=align_options, yx_position_guesses=yx_position_guesses,
+        precomputed_remaps=precomputed_remaps, precomputed_mask=precomputed_mask)
+
+
 def load_or_compute_remaps_for_sessions(
         mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc',
         tags: Union[None, Sequence[Optional[str]]] = None, grouptag: Optional[str] = None,
         use_saved_mappings: Optional[bool] = None,  # the remaining options are only relevant if computing mappings
         save_mappings_with_grouptag: Optional[bool] = None, rigid_offsets: Optional[ScaledDataFrame] = None,
-        max_initial_shift=50, max_additional_shift=10, max_deviation_rigid=6,
-        projection_params: Optional[Union[str, dict]] = None) -> tuple[np.ndarray, str]:
+        use_rigid_offsets_for_yx_guess=False, max_initial_shift=50, max_additional_shift=10, max_deviation_rigid=6,
+        projection_params: Optional[Union[str, dict]] = None, planewise=True) -> tuple[Array5D[np.floating], str]:
     """
     Helper to load nonrigid mappings between sessions for the given sessions or compute them if they
     are not saved. If computing mappings, rigid_offsets will be used for the initial guesses if it is not None.
@@ -1108,8 +1240,9 @@ def load_or_compute_remaps_for_sessions(
     processed_dir = get_processed_dir(mouse_id, rec_type=rec_type)
     alignment_dir = os.path.join(processed_dir, 'alignment')
 
-    untagged_fn_pattern = f'{mouse_id}_session_mappings_%dt.npz'
-    tagged_fn_pattern = f'{mouse_id}_{grouptag}_session_mappings_%dt.npz' if grouptag else None
+    planewise_str = 'planewise_' if planewise else ''
+    untagged_fn_pattern = f'{mouse_id}_session_mappings_{planewise_str}%dt.npz'
+    tagged_fn_pattern = f'{mouse_id}_{grouptag}_session_mappings_{planewise_str}%dt.npz' if grouptag else None
 
     mappings_found = [False] * len(sess_names)
     xy_remaps = None
@@ -1150,28 +1283,20 @@ def load_or_compute_remaps_for_sessions(
         raise RuntimeError('Failed to load mappings and use_saved_mappings is true, so not computing')
     elif use_saved_mappings is None:
         logging.info('Computing mappings for any/all missing sessions')
-
-    logging.info('Loading z-stack for each session')
-    templates, borders = get_zmax_templates_and_borders_multisession(
-        mouse_id, sess_names, rec_type=rec_type, include_dead_pixel_border=True, projection_params=projection_params)
-
-    if rigid_offsets is not None:
-        logging.info('Using saved rigid X/Y offsets')
-        yx_pos_df = rigid_offsets.loc[sess_ids, :]
-    else:
-        logging.info('Estimating rigid X/Y offsets')
-        yx_pos_df = guess_yx_positions_multiple(templates, borders=borders, max_shift=max_initial_shift)
-        
-    yx_position_guesses = yx_pos_df.loc[:, ['y', 'x']].to_pixels().to_numpy()
-
-    # compute every pair
-    logging.info('Estimating nonrigid X/Y mappings')
-    align_options = {'max_shifts': (max_additional_shift, max_additional_shift),
-                     'max_deviation_rigid': max_deviation_rigid}
-    xy_remaps = align_templates_allpairs(
-        templates, borders, align_options=align_options, yx_position_guesses=yx_position_guesses,
-        precomputed_remaps=xy_remaps, precomputed_mask=mappings_found)
     
+    if planewise:
+        xy_remaps = compute_planewise_remaps_for_sessions(
+            mouse_id, sess_ids, rec_type=rec_type, tags=tags, rigid_offsets=rigid_offsets, use_rigid_offsets_for_yx_guess=use_rigid_offsets_for_yx_guess,
+            max_initial_shift=max_initial_shift, max_additional_shift=max_additional_shift, max_deviation_rigid=max_deviation_rigid,
+            projection_params=projection_params, precomputed_remaps=xy_remaps, precomputed_mask=mappings_found
+        )
+    else:
+        xy_remaps = compute_flat_remaps_for_sessions(
+            mouse_id, sess_ids, rec_type=rec_type, tags=tags, rigid_offsets=rigid_offsets if use_rigid_offsets_for_yx_guess else None,
+            max_initial_shift=max_initial_shift, max_additional_shift=max_additional_shift, max_deviation_rigid=max_deviation_rigid,
+            projection_params=projection_params, precomputed_remaps=xy_remaps, precomputed_mask=mappings_found
+        )
+
     # save for next time
     logging.info('Saving X/Y mappings')
     if save_mappings_with_grouptag is None:
@@ -1916,15 +2041,15 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: onp.ToJustIn
 def get_zmax_templates_and_borders_multisession(
         mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc',
         tags: Union[None, Sequence[Optional[str]]] = None, projection_params: Optional[Union[str, dict]] = None,
-        include_dead_pixel_border=False) -> tuple[list[np.ndarray], list[BorderSpec]]:
+        include_dead_pixel_border=False) -> tuple[list[onp.Array2D], list[BorderSpec]]:
     """Load max-z templates and borders for a series of sessions (helper for register_ROIS_multisession_3D)"""
     if tags is None:
         tags = [None] * len(sess_ids)
     
-    templates: list[np.ndarray] = []
+    templates: list[onp.Array2D] = []
     borders: list[BorderSpec] = []
     for sess_id, tag in zip(sess_ids, tags):
-        logging.debug(f'Gettng z-max projection for session {sess_id}')
+        logging.debug(f'Getting z-max projection for session {sess_id}')
         sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
         templates.append(sessinfo.get_zmax_projection(projection_params=projection_params))
 
@@ -1946,6 +2071,49 @@ def get_zmax_templates_and_borders_multisession(
             border = BorderSpec.max(border, BorderSpec(left=n_to_clip))
 
         borders.append(border)
+    return templates, borders
+
+
+def get_z_mapping_templates_and_borders_multisession(
+        mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], z_offsets_um: onp.Array1D[np.floating],
+        rec_type='learning_ppc', tags: Union[None, Sequence[Optional[str]]] = None,
+        projection_params: Optional[Union[str, dict]] = None, include_dead_pixel_border=False
+        ) -> tuple[list[dict[float, onp.Array2D]], list[list[BorderSpec]]]:
+    """Load dict from Z position in um to plane projection for each given session, along with borders"""
+    if tags is None:
+        tags = [None] * len(sess_ids)
+
+    templates: list[dict[float, onp.Array2D]] = []
+    borders: list[list[BorderSpec]] = []
+    for sess_id, tag, z_offset in zip(sess_ids, tags, z_offsets_um):
+        logging.debug(f'Getting mapping from z to plane projections for session {sess_id}')
+        sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
+        if projection_params is None:
+            plane_projections = sessinfo.get_plane_projections_used_for_seed(exclude_border=False)
+        else:
+            plane_projections = sessinfo.get_plane_projections(projection_params, exclude_border=False)
+
+        z_rel = sessinfo.get_relative_depths()
+        z_abs = z_offset + z_rel
+        templates.append(dict(zip(z_abs, plane_projections, strict=True)))
+
+        if sessinfo.mc_result is None:
+            raise RuntimeError('Motion correction not run?')
+        
+        border = sessinfo.mc_result.border_asym
+
+        if include_dead_pixel_border:
+            # add border on left corresponding to dead pixels
+            ndead = sessinfo.params.conversion.odd_row_ndead
+            offset = sessinfo.params.conversion.odd_row_offset
+            crop = sessinfo.crop
+
+            ndead_max = 0 if ndead is None else max(ndead)
+            shift_max = 0 if offset is None else math.ceil(abs(offset) / 2)
+            n_to_clip = max(ndead_max + shift_max - crop.left, 0)
+            border = [BorderSpec.max(b, BorderSpec(left=n_to_clip)) for b in border]
+
+        borders.append(border) 
     return templates, borders
 
 
@@ -2152,6 +2320,7 @@ def make_cross_session_projection(
 @dataclass(init=False)
 class SessionMappingData:
     """Stores info about ROIs in a session and mappings to other sessions"""
+    sess_name: str
     xy_mappings_to_others: dict[str, onp.Array3D[np.floating]]  # maps other session names to X/Y remappings
     accepted: onp.Array1D[np.integer]  # idx_components
     uuid: str  # UUID of the CNMF run
@@ -2160,8 +2329,8 @@ class SessionMappingData:
     scan_date: date  # scan day
 
     def __init__(self, mouse_id: Union[int, str], sess_name: str,
-                 remaps_to_others: dict[str, np.ndarray], rec_type='learning_ppc',
-                 session_cell_ids: Optional[np.ndarray] = None):
+                 remaps_to_others: dict[str, onp.Array3D[np.floating]], rec_type='learning_ppc',
+                 session_cell_ids: Optional[onp.Array1D[np.integer]] = None):
         """
         Inputs:
             - remaps_to_others should be a mapping from names of *other* sessions to the X/Y remaps
@@ -2209,8 +2378,8 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
     weights: np.ndarray  # sum of masks for each component
 
     def __init__(self, mouse_id: Union[int, str], sess_name: str,
-                 remaps_to_others: dict[str, np.ndarray], rec_type='learning_ppc',
-                 session_cell_ids: Optional[np.ndarray] = None,
+                 remaps_to_others: dict[str, onp.Array3D[np.floating]], rec_type='learning_ppc',
+                 session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
                  session_z_offset_um: Optional[float] = None, max_thr=0.,
                  pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None):
         """
@@ -2225,14 +2394,9 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
         if pixel_thr is None:
             pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
 
+        # retrieve footprints
         sessinfo = cma.load_latest(mouse_id, sess_name, rec_type=rec_type, quiet=True)
-        if sessinfo.cnmf_fit is None:
-            raise RuntimeError('CNMF not run?')
-        est = sessinfo.cnmf_fit.estimates
-        if est.dims is None:
-            raise RuntimeError('No dims; CNMF not run?')
-        
-        self.dims = (int(est.dims[0]), int(est.dims[1]) // sessinfo.metadata['num_planes'])
+        self.dims = sessinfo.plane_size
         self.com = sessinfo.get_coms_3d(unit='um').iloc[self.session_cell_ids, :]
         if session_z_offset_um is None:
             # ignore Z
@@ -2247,12 +2411,113 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
         self.xy_footprints = xy_footprints
 
 
+    def get_flat_footprints_mapped_to_session(
+        self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> sparse.csc_matrix[np.float32]:
+        try:
+            xy_mapping = self.xy_mappings_to_others[sess_name]
+        except KeyError:
+            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
+        
+        return footprints.map_footprints(self.xy_footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
+
+    
+    def get_flat_footprints_and_coms_mapped_to_session(
+        self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> tuple[sparse.csc_matrix[np.float32], ScaledDataFrame]:
+        """Get footprints along with 3D COMs in um, mapped to given session"""
+        try:
+            xy_mapping = self.xy_mappings_to_others[sess_name]
+        except KeyError:
+            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
+
+        fps = self.get_flat_footprints_mapped_to_session(sess_name, which_cells)
+        coms = remap_points_from_df(self.com.loc[which_cells, :], *xy_mapping)
+        return fps, coms
+
+
+class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
+    """SessionMappingData that stores 3D footprints and planewise mappings to other sessions"""
+    footprints: sparse.csc_matrix[np.floating]  # non-flattened footprints (A)
+    # more data needed to compute COMs
+    um_per_pixel_x: float
+    um_per_pixel_y: float
+    depths: onp.Array1D[np.floating]
+
+    def __init__(
+        self, mouse_id: Union[int, str], sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]],
+        rec_type='learning_ppc', session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
+        session_z_offset_um: Optional[float] = None,
+        max_thr=0., pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None):
+        
+        super().__init__(
+            mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remaps_to_others,
+            rec_type=rec_type, session_cell_ids=session_cell_ids, session_z_offset_um=session_z_offset_um,
+            max_thr=max_thr, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr)
+        
+        if pixel_thr is None:
+            pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
+
+        # retrieve footprints
+        sessinfo = cma.load_latest(mouse_id, sess_name, rec_type=rec_type, quiet=True)
+        if sessinfo.cnmf_fit is None:
+            raise RuntimeError('CNMF not run?')
+        est = sessinfo.cnmf_fit.estimates
+        if est.A is None:
+            raise RuntimeError('CNMF not run?')
+        
+        self.um_per_pixel_x = sessinfo.metadata['um_per_pixel_x']
+        self.um_per_pixel_y = sessinfo.metadata['um_per_pixel_y']
+        self.depths = sessinfo.get_relative_depths().astype(float)
+        if session_z_offset_um is not None:
+            # account for session-specific Z offset
+            self.depths += session_z_offset_um
+        
+        # save 3D footprints to flatten later
+        self.footprints = footprints.normalize_footprints(est.A[:, self.session_cell_ids])
+        self.weights = footprints.count_pixels(self.footprints, method=pixel_thr_method, thr=pixel_thr)
+        threshold_masks(self.footprints, max_thr)
+
+    
+    def get_flat_footprints_mapped_to_session(
+        self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> sparse.csc_matrix[np.float32]:
+        try:
+            xy_mapping = self.xy_mappings_to_others[sess_name]
+        except KeyError:
+            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
+
+        mapped_footprints = footprints.map_footprints(self.footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
+        # flatten
+        n_planes = len(self.depths)
+        xy_footprints = footprints.collapse_footprints_to_xy(mapped_footprints, n_planes, binarize=False)
+        return footprints.normalize_footprints(xy_footprints)
+
+    
+    def get_flat_footprints_and_coms_mapped_to_session(
+        self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> tuple[sparse.csc_matrix[np.float32], ScaledDataFrame]:
+        # first map the footprints, then get the COMs from the unflattened footprints, finally flatten the footprints
+        try:
+            xy_mapping = self.xy_mappings_to_others[sess_name]
+        except KeyError:
+            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
+        
+        mapped_footprints = footprints.map_footprints(self.footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
+        coms = footprints.get_coms_3d(
+            mapped_footprints, plane_shape=self.dims, um_per_pixel_x=self.um_per_pixel_x, um_per_pixel_y=self.um_per_pixel_y,
+            depths=self.depths, unit='um')
+
+        # flatten footprints
+        n_planes = len(self.depths)
+        xy_footprints = footprints.collapse_footprints_to_xy(mapped_footprints, n_planes, binarize=False)
+        fps = footprints.normalize_footprints(xy_footprints)        
+        return fps, coms
+
+
 def register_ROIs_multisession_3D(
         mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc', tags: Union[None, Sequence[Optional[str]]] = None,
         grouptag: Optional[str] = None, max_thr=0., thresh_cost=0.7, max_dist_um=20., n_matched_weight=0.5,
         pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
         use_saved_xy_offsets=False, saved_offset_filename_fmt: Optional[str] = '{}_daily_offsets.csv',
-        use_saved_mappings: Optional[bool] = None, save_mappings_with_grouptag: Optional[bool] = None) -> dict:
+        use_saved_mappings: Optional[bool] = None, save_mappings_with_grouptag: Optional[bool] = None,
+        planewise_mappings=True) -> dict:
     """
     Register ROIs for individual planes while keeping track of the estimated Z position
     for each ROI, based on size of ROI in each session and estimated Z of each plane
@@ -2297,6 +2562,9 @@ def register_ROIs_multisession_3D(
             The mappings do not depend on the matching-related parameters, so most of the time it doesn't make sense to
             save them separately. However, there is no capacity to merge sets of mappings, so to avoid overwriting, by
             default they are saved with the grouptag if the main file contains sessions that are not used here.
+        
+        planewise_mappings (bool):
+            Whether to use planewise mapping method rather than assuming that the X/Y mapping is the same for each plane.
     """
     if len(sess_ids) == 0:
         raise ValueError('Must include at least one session in registration')
@@ -2315,11 +2583,10 @@ def register_ROIs_multisession_3D(
         offset_file = saved_offset_filename_fmt.format(mouse_id)
 
     ## Step 2: get nonrigid X/Y mappings between sessions
-    rigid_offsets = daily_offsets_um if use_saved_xy_offsets else None
     xy_remaps, xy_remap_path = load_or_compute_remaps_for_sessions(
         mouse_id, sess_names, rec_type=rec_type, grouptag=grouptag, use_saved_mappings=use_saved_mappings,
-        save_mappings_with_grouptag=save_mappings_with_grouptag,
-        rigid_offsets=rigid_offsets)
+        save_mappings_with_grouptag=save_mappings_with_grouptag, rigid_offsets=daily_offsets_um,
+        use_rigid_offsets_for_yx_guess=use_saved_xy_offsets, planewise=planewise_mappings)
         
     ## Step 3: load each session and collect masks, COMs, mappings, etc.
     logging.info('Loading ROI info from each session')
@@ -2333,7 +2600,8 @@ def register_ROIs_multisession_3D(
             session_z_offset_um = daily_offsets_um.iloc[i].at['z']
             assert isinstance(session_z_offset_um, float)
 
-        this_session_data = SessionMappingDataWithFlatFootprints(
+        MappingDataClass = SessionMappingDataWith3DFootprints if planewise_mappings else SessionMappingDataWithFlatFootprints
+        this_session_data = MappingDataClass(
             mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remap_dict, rec_type=rec_type,
             session_z_offset_um=session_z_offset_um, max_thr=max_thr, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr
         )
@@ -2362,11 +2630,10 @@ def register_ROIs_multisession_3D(
             # map ROIs
             map_mask: onp.Array1D[np.bool_] = np.isin(other_session.matchings, cells_to_map)
             mapped_cell_ids = other_session.matchings[map_mask]
-            xy_mapping = other_session.xy_mappings_to_others[session.sess_name]
-            A_mapped = footprints.map_footprints(other_session.xy_footprints[:, map_mask],  # type: ignore
-                                                 (xy_mapping[0], xy_mapping[1]))
+            A_mapped, coms_mapped = other_session.get_flat_footprints_and_coms_mapped_to_session(
+                session.sess_name, map_mask)
+
             A_union[:, mapped_cell_ids] += A_mapped.multiply(other_session.weights[map_mask])
-            coms_mapped = remap_points_from_df(other_session.com.loc[map_mask, :], *xy_mapping)
             coms_weighted = coms_mapped.to_numpy() * other_session.weights[map_mask, np.newaxis]
             com_union[mapped_cell_ids, :] += coms_weighted
         
@@ -2423,7 +2690,8 @@ def register_ROIs_multisession_3D(
         'cell_subset_name': '',
         'xy_remap_file': os.path.split(xy_remap_path)[1],
         'offset_file': offset_file,
-        'dates': [data.scan_date for data in session_data]
+        'dates': [data.scan_date for data in session_data],
+        'planewise': planewise_mappings
     }
     save_data = tabularize_multisession_data(**save_data)
     save_multisession(save_data)

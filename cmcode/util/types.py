@@ -44,6 +44,7 @@ MaybeSparse = Union[onp.Array2D[ST], sparse.csc_matrix[ST], sparse.csc_array[ST]
 
 # we need moar dimensions
 Array4D = onp.Array[tuple[int, int, int, int], onp._array._SCT]
+Array5D = onp.Array[tuple[int, int, int, int, int], onp._array._SCT]
 
 
 # helpers for mesmerize-core
