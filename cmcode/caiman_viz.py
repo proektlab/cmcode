@@ -1047,17 +1047,22 @@ def view_mcorr_pcs(pc_metrics: Sequence[tuple[onp.Array2D[np.floating], Array4D[
 
 
 def make_template_registration_gridplot(
-        mouse_id: Union[str, int], sess_ids: Sequence[int], registration_info: Union[None, np.ndarray, ScaledDataFrame],
+        mouse_id: Union[str, int], sess_ids: Sequence[Union[str, int]], 
+        registration_info: Union[None, np.ndarray, Sequence[np.ndarray], ScaledDataFrame, Sequence[ScaledDataFrame]],
         tags: Union[None, Sequence[Optional[str]]] = None, rec_type='learning_ppc',
-        projection_params: Optional[Union[str, dict]] = None, from_color='m', to_color='g'):
+        projection_params: Optional[Union[str, dict]] = None, from_color='m', to_color='g',
+        planewise=False):
     """
-    Make a grid of Z-max merge images after registration between all pairs of given sessions.
+    Make a grid of Z-max or planewise merge images after registration between all pairs of given sessions.
     
     registration_info can be:
         * a len(sess_ids) x len(sess_ids)-1 x ... array of nonrigid remappings,
-          as returned from load_or_compute_remaps_for_sessions
+          as returned from load_or_compute_remaps_for_sessions.
+          If planewise is True, this can either be one array with the remappings for the concatenated
+          projections, or a sequence with one remapping array per plane.
         * a ScaledDataFrame containing rigid relative x/y locations for each session,
-          as returned from load_offsets_for_sessions or guess_yx_positions_multiple
+          as returned from load_offsets_for_sessions or guess_yx_positions_multiple,
+          or a list of ScaledDataFrames (1 for each plane) if planewise is True.
         * None to just plot merge images with no registration.
 
     If projection_params is not provided, there must be a saved seed projection from a CNMF
@@ -1066,12 +1071,32 @@ def make_template_registration_gridplot(
     if tags is None:
         tags = [None] * len(sess_ids)
 
+    if isinstance(registration_info, Sequence):
+        planewise = True
+    elif isinstance(registration_info, (ScaledDataFrame, type(None))):
+        planewise = False
+
     # validated registration_info
-    if isinstance(registration_info, np.ndarray):
-        if registration_info.shape[:2] != (len(sess_ids), len(sess_ids) - 1):
+    if isinstance(registration_info, np.ndarray) or (
+        isinstance(registration_info, Sequence) and isinstance(registration_info[0], np.ndarray)):
+
+        all_arrs = [registration_info] if not isinstance(registration_info, Sequence) else registration_info
+        if not all(arr.shape[:2] == (len(sess_ids), len(sess_ids) - 1) for arr in all_arrs):
             raise ValueError('registration_info has the wrong leading shape (should be (n_sess, n_sess-1))')
         corrected_str = 'nonrigid aligned'
-    elif isinstance(registration_info, ScaledDataFrame):
+
+        if planewise and not isinstance(registration_info, Sequence):
+            # figure out how to split & correct the remappings to be per-plane
+            first_sess = cma.load_latest(mouse_id, sess_ids[0], tag=tags[0], rec_type=rec_type)
+            n_planes = first_sess.metadata['num_planes']
+            plane_size_x = first_sess.plane_size[1]
+            registration_info = [
+                plane_remap - np.array([x_offset, 0], dtype=registration_info.dtype)[:, np.newaxis, np.newaxis]
+                for plane_remap, x_offset in zip(np.split(registration_info, n_planes, axis=4), plane_size_x * np.arange(n_planes))
+            ]
+
+    elif isinstance(registration_info, ScaledDataFrame) or (
+        isinstance(registration_info, Sequence) and isinstance(registration_info[0], ScaledDataFrame)):
         corrected_str = 'rigid aligned'
     else:
         if registration_info is not None:
@@ -1079,36 +1104,52 @@ def make_template_registration_gridplot(
         corrected_str = 'not aligned'
 
     # load all projections
-    z_projections: list[np.ndarray] = []
+    projections: list[list[np.ndarray]] = []
     for sess_id, tag in zip(sess_ids, tags):
         sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
-        z_projections.append(sessinfo.get_zmax_projection(projection_params))
+        if isinstance(registration_info, Sequence):
+            # get projection for each plane
+            if projection_params is None:
+                projections.append(sessinfo.get_plane_projections_used_for_seed(exclude_border=False))
+            else:
+                projections.append(sessinfo.get_plane_projections(projection_params, exclude_border=False))
+        else:
+            projections.append([sessinfo.get_zmax_projection(projection_params, exclude_border=False)])
     
     # make each plot
     with mplstyle.context('dark_background'):  # type: ignore
         fig, axss = plt.subplots(len(sess_ids), len(sess_ids), sharex=True, sharey=True, squeeze=False)
         fig.suptitle(f'Mouse {mouse_id}, {rec_type}, {corrected_str}')
-        for kFrom, (axs, from_proj) in enumerate(zip(axss, z_projections)):
-            for kTo, (ax, to_proj) in enumerate(zip(axs, z_projections)):
+        for kFrom, (axs, from_proj) in enumerate(zip(axss, projections)):
+            for kTo, (ax, to_proj) in enumerate(zip(axs, projections)):
                 if kFrom == kTo:
                     ax = cast(Axes, ax)
-                    ax.imshow(from_proj, cmap='gray',
-                              vmin=float(np.percentile(from_proj, 40)),
-                              vmax=float(np.percentile(from_proj, 99.7)))
+                    from_maxproj = np.max(from_proj, axis=0)
+                    ax.imshow(from_maxproj, cmap='gray',
+                              vmin=float(np.percentile(from_maxproj, 40)),
+                              vmax=float(np.percentile(from_maxproj, 99.7)))
                     ax.set_title(f'Session {sess_ids[kFrom]}{tags[kFrom] or ""}')
                 else:
-                    if isinstance(registration_info, np.ndarray):
-                        x_remap, y_remap = registration_info[kFrom, kTo if kTo < kFrom else kTo-1]
-                        from_mapped = remap_image(from_proj, x_remap=x_remap, y_remap=y_remap)
+                    def map_plane(plane: np.ndarray, reg_info: Union[np.ndarray, ScaledDataFrame, None]) -> np.ndarray:
+                        if isinstance(reg_info, np.ndarray):
+                            x_remap, y_remap = reg_info[kFrom, kTo if kTo < kFrom else kTo-1]
+                            return remap_image(plane, x_remap=x_remap, y_remap=y_remap)
 
-                    elif isinstance(registration_info, ScaledDataFrame):
-                        # shift by the difference between locations in pixels (to - from)
-                        from_mapped = shift_image_location(from_proj, start_loc=registration_info[kFrom], end_loc=registration_info[kTo])
-                        
-                    else:
-                        from_mapped = from_proj
+                        elif isinstance(reg_info, ScaledDataFrame):
+                            # shift by the difference between locations in pixels (to - from)
+                            return shift_image_location(plane, start_loc=reg_info[kFrom], end_loc=reg_info[kTo])
+                            
+                        else:
+                            return plane
                     
-                    merge = make_merge(from_mapped, to_proj, color1=from_color, color2=to_color)
+                    if isinstance(registration_info, Sequence):
+                        mapped_planes = [map_plane(plane, reg_info) for plane, reg_info in zip(from_proj, registration_info)]
+                        from_mapped = np.max(mapped_planes, axis=0)
+                    else:
+                        from_mapped = map_plane(from_proj[0], registration_info)
+                    
+                    to_maxproj = np.max(to_proj, axis=0)                    
+                    merge = make_merge(from_mapped, to_maxproj, color1=from_color, color2=to_color)
                     ax.imshow(merge)
                     ax.set_title(f'{sess_ids[kFrom]}{tags[kFrom] or ""} ({from_color}) to '
                                  f'{sess_ids[kTo]}{tags[kTo] or ""}')
@@ -1143,7 +1184,7 @@ def my_check_register_ROIs(matched1: list[int],
                            highlight1: Sequence[int] = (),  # cell ids to highlight
                            highlight2: Sequence[int] = (),
                            show_single_plot_contours=True,
-                           plot_labels=True,
+                           plot_labels: Union[bool, onp.Array1D[np.integer]] = True,
                            sharexy=True):
     """Plot results from register_ROIs using matplotlib or fastplotlib"""
     pct_1 = performance['recall'] * 100
@@ -1254,7 +1295,7 @@ def make_registration_plot_fpl(images: list[np.ndarray], coordinates1: list[np.n
                                cmap: str, clims1: tuple[float, float], clims2: tuple[float, float],
                                contour1_color: str, contour2_color: str, use_contour_colors_for_top_plot: bool,
                                highlight1: Sequence[int] = (), highlight2: Sequence[int] = (), show_single_plot_contours=True,
-                               plot_labels=True, sharexy=True):
+                               plot_labels: Union[bool, onp.Array1D[np.integer]] = True, sharexy=True):
     if not sharexy:
         logging.warning('Ignoring sharexy=False - not implemented for fastplotlib')
 
@@ -1274,13 +1315,14 @@ def make_registration_plot_fpl(images: list[np.ndarray], coordinates1: list[np.n
             histogram_lut.vmin = clims[0]
 
     def add_contours(plotind: tuple[int, int], coords: list, selection: Sequence[Optional[int]], thickness,
-                     color: str = 'w', plot_labels=False):
+                     color: str = 'w', plot_labels: Union[bool, onp.Array1D[np.integer]] = False):
         sub_selection = [ind for ind in selection if ind is not None and coords[ind].size > 0]
         iw.gridplot[plotind].add_line_collection([coords[ind] for ind in sub_selection],
             colors=color, thickness=list(thickness[sub_selection]))  # type: ignore
 
-        if plot_labels:  # add numeric labels
-            for i, ind in enumerate(selection):  # make sure inds correspond to the original selection
+        if plot_labels is not False:  # add numeric labels
+            labels = range(len(selection)) if plot_labels is True else plot_labels
+            for i, ind in zip(labels, selection):  # make sure inds correspond to the original selection
                 if ind is None or coords[ind].size <= 0:
                     continue
 
@@ -1320,11 +1362,16 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
                                cmap: str, clims1: tuple[float, float], clims2: tuple[float, float],
                                contour1_color: str, contour2_color: str, use_contour_colors_for_top_plot: bool,
                                highlight1: Sequence[int] = (), highlight2: Sequence[int] = (), show_single_plot_contours=True,
-                               plot_labels=True, sharexy=True):
+                               plot_labels: Union[bool, onp.Array1D[np.integer]] = True, sharexy=True):
     lws1 = np.full(len(coordinates1), 1.)
     lws1[highlight1] = 2.
     lws2 = np.full(len(coordinates2), 1.)
     lws2[highlight2] = 2.
+
+    if plot_labels is False:
+        plot_labels = np.full(len(matched1), -1)
+    elif plot_labels is True:
+        plot_labels = np.arange(len(matched1))
 
     with mplstyle.context('dark_background'):  # type: ignore
         fig, axs = plt.subplots(2, 2, sharex=sharexy, sharey=sharexy)
@@ -1335,16 +1382,16 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
         ):
             ax.imshow(image, interpolation=None, cmap=cmap, vmin=clims[0], vmax=clims[1])
             if show_single_plot_contours:
-                for i, cellid in enumerate(matched):
+                for label, cellid in zip(plot_labels, matched):
                     if cellid is None or coords[cellid].size == 0:
                         continue
                     color = contour_color if use_contour_colors_for_top_plot else 'w'
                     ax.plot(*coords[cellid].T, lw=lws[cellid], c=color)
-                    if plot_labels:
+                    if label != -1:
                         # make sure to plot labels on every plane where the component appears
                         coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
                         for com in coms:
-                            ax.text(*(com + (5, 5)), str(i), c=color, clip_on=True, size='small')
+                            ax.text(*(com + (5, 5)), str(label), c=color, clip_on=True, size='small')
                 
                 for cellid in unmatched:
                     if coords[cellid].size == 0:
@@ -1365,11 +1412,11 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
                     if cellid is None or coords[cellid].size == 0:
                         continue
                     ax.plot(*coords[cellid].T, lw=lws[cellid], c=color)
-                    if b_matched and plot_labels:
+                    if b_matched and plot_labels[i] != -1:
                         # make sure to plot labels on every plane where the component appears
                         coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
                         for com in coms:
-                            ax.text(*(com + (5, 5)), str(i), c=color, clip_on=True, size='small')
+                            ax.text(*(com + (5, 5)), str(plot_labels[i]), c=color, clip_on=True, size='small')
             
             ax.set_axis_off()
             ax.set_title(title)
@@ -1428,7 +1475,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         plot contours for these cells with a thicker line
     
     plot_labels (bool):
-        Whether to label matched cells with numeric IDs starting at 0 (not the same as union cell IDs)
+        Whether to label matched cells with union cell IDs
     
     use_zproj (bool):
         Whether to collapse projections and contours in Z rather than showing each plane side by side.
@@ -1452,10 +1499,11 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
     # here (and below) "1" refers to the second session chronologically and vice versa
     # this is because we are aligning the earlier session to the later one, while check_register_ROIs expects the opposite
     def get_session_index(name_or_id: Union[str, int]) -> int:
-        if isinstance(name_or_id, int):
-            inds = np.flatnonzero(sessions.sess_id == name_or_id)
-        else:
+        if isinstance(name_or_id, str):
             inds = np.flatnonzero(sessions.sess_name == name_or_id)
+        else:
+            inds = np.flatnonzero(sessions.sess_id == name_or_id)
+            
         if np.size(inds) == 1:
             return inds.item()
         else:
@@ -1476,7 +1524,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
     
     row1 = sessions.iloc[ind1]
     sess1_name = str(row1.at['sess_name'])
-    sess1_id = int(row1.at['sess_id'])
+    sess1_id = cast(int, row1.at['sess_id'])
     sess1_tag = str(row1.at['tag'])
     
     # find mapping
@@ -1529,7 +1577,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
     else:
         title_addon = ''
 
-    intersection_ids = np.intersect1d(matchings1.union_cell_id, matchings2.union_cell_id)
+    intersection_ids = cast(onp.Array1D[np.integer], np.intersect1d(matchings1.union_cell_id, matchings2.union_cell_id))
 
     b_matched1 = matchings1.union_cell_id.isin(intersection_ids)
     b_matched2 = matchings2.union_cell_id.isin(intersection_ids)
@@ -1643,7 +1691,8 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         contour1_name=f'Session {sess1_name}' + title_addon,
         contour2_name=f'Session {sess2_name}' + title_addon,
         x_remap=xy_mapping[0], y_remap=xy_mapping[1], xrange=xrange,
-        highlight1=highlight1, highlight2=highlight2, plot_labels=plot_labels, **check_register_ROIs_kwargs)
+        highlight1=highlight1, highlight2=highlight2, plot_labels=intersection_ids if plot_labels else False,
+        **check_register_ROIs_kwargs)
 
 
 def plot_aligned_ROIs(align_results: dict, border_pix=5, map_to: Optional[Union[str, int]] = None,

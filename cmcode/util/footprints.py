@@ -201,25 +201,22 @@ def get_coms_3d(
     pix_y, pix_x = plane_shape
     um_vals_y = np.arange(pix_y) * um_per_pixel_y
     um_vals_x = np.arange(pix_x) * um_per_pixel_x
-    spacings = {'y': um_per_pixel_y, 'x': um_per_pixel_x}
+    spacings: dict[str, Optional[float]] = {'y': um_per_pixel_y, 'x': um_per_pixel_x}
 
     depths = np.array(depths)
-    if depths.size == 1:
-        um_vals = (um_vals_y, um_vals_x)
+    um_vals = (um_vals_y, um_vals_x, depths)
+    # if the planes are uniform, we save the spacing; otherwise just set it to None
+    spacings_z = np.diff(depths)
+    if spacings_z.size > 0 and np.all(spacings_z == spacings_z[0]):
+        spacings['plane'] = float(spacings_z[0])
     else:
-        um_vals = (um_vals_y, um_vals_x, depths)
-        # if the planes are uniform, we save the spacing; otherwise just set it to None
-        spacings_z = np.diff(depths)
-        if np.all(spacings_z == spacings_z[0]):
-            spacings['plane'] = float(spacings_z[0])
-        else:
-            spacings['plane'] = None
+        spacings['plane'] = None
     
     # now actually calculate the COMs, interpreting dims as being in 3D
     coms_3d_um = cmcustom.my_com(A, *um_vals)
 
     # if we want the result in pixels but the z-spacing is nonuniform, we have to interpolate
-    if 'plane' in spacings and spacings['plane'] is None and unit == 'pixels':
+    if spacings['plane'] is None and unit == 'pixels':
         spacings.pop('plane')
         yx_df = scaled.make_um_df(coms_3d_um[:, :-1], pixel_size=spacings)
         plane_pix = np.interp(coms_3d_um[:, -1], um_vals[-1], range(len(um_vals[-1])))

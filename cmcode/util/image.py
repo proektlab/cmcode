@@ -3,7 +3,7 @@ from collections.abc import Mapping, Sequence, Callable
 from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
-from typing import Union, Optional, Any
+from typing import Union, Optional, Any, TypeVar
 from typing_extensions import Self
 
 import cv2
@@ -118,7 +118,7 @@ class BorderSpec:
                 ) for side in sides})
         else:
             return NotImplemented
-        return type(self).max(res, type(self).equal(0))
+        return type(self).max(res, 0)
 
     def increased(self, other: Union[CanFloat, 'BorderSpec'], shape: Optional[tuple[int, int]] = None) -> Self:
         """Increase borders, limiting result to maximal borders if shape is given"""
@@ -133,6 +133,16 @@ class BorderSpec:
 
     __mul__ = partialmethod(_arithmetic_op, '__mul__')
     __truediv__ = partialmethod(_arithmetic_op, '__truediv__')
+
+    def shifted(self, x_shift: CanFloat, y_shift: CanFloat) -> Self:
+        """Rigidly shift borders, clipping to 0"""
+        res = type(self)(
+            left=self.left_subpix + x_shift,
+            right=self.right_subpix - x_shift,
+            top=self.top_subpix + y_shift,
+            bottom=self.bottom_subpix - y_shift
+        )
+        return type(self).max(res, 0)
 
     def _comparison_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> bool:
         """Delegate comparisons to int comparisons of all sides"""
@@ -241,6 +251,10 @@ class BorderSpec:
         """Make indexing slices for these borders given an image shape"""
         shape2d = shape[:2]
         return (slice(self.top, shape2d[0]-self.bottom), slice(self.left, shape2d[1]-self.right))
+
+    def pad_widths(self) -> tuple[tuple[int, int], tuple[int, int]]:
+        """Make pad_width to input to np.pad"""
+        return ((self.top, self.bottom), (self.left, self.right))
     
     def center_shape(self, shape: tuple[int, int]) -> tuple[int, int]:
         """Make shape of center with borders removed"""
@@ -408,7 +422,7 @@ def merge_to_rgb(
 def shift_image(image: onp.ToFloat2D, x_shift: float, y_shift: float) -> np.ndarray:
     """Shift image by a number of pixels in X and Y"""
     shifts = (y_shift, x_shift)
-    return ndimage.shift(image, shifts)
+    return ndimage.shift(image, shifts, order=1)
 
 
 def shift_image_location(image: onp.ToFloat2D, start_loc: ScaledDataFrame, end_loc: ScaledDataFrame):
@@ -499,8 +513,9 @@ def remap_points(points: onp.Array2D, x_remap: Optional[onp.Array2D], y_remap: O
     return np.column_stack(mapped_vals)
 
 
-def remap_points_from_df(df: pd.DataFrame, x_remap: Optional[np.ndarray],
-                         y_remap: Optional[np.ndarray]) -> pd.DataFrame:
+DataFrameType = TypeVar('DataFrameType', bound=pd.DataFrame)
+def remap_points_from_df(df: DataFrameType, x_remap: Optional[np.ndarray],
+                         y_remap: Optional[np.ndarray]) -> DataFrameType:
     """
     Map a set of points from one coordinate system to another using a nonrigid mapping
     There must be 2 columns called x and y. A copy will be returned with x and y mapped

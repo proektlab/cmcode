@@ -354,7 +354,7 @@ class SeedParams(StageParams):
             norm_medw=25,
             gSig=np.unique(round_to_odd(np.array([5, 7, 9]) * scale)).tolist(),
             use_cellpose=use_cellpose,
-            cellpose_params=CellposeParams(flow_threshold=None)
+            cellpose_params=CellposeParams(flow_threshold=None, diameter=15.)
             )
 
     def get_differing_params(self, other: Self, metadata: dict[str, Any], ignore: Collection[str] = ()) -> Iterator[str]:

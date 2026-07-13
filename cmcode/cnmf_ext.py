@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import sys
 from tempfile import NamedTemporaryFile
+import time
 from typing import Optional, Literal, Union
 
 import numpy as np
@@ -449,6 +450,7 @@ class CNMFExt(cnmf.CNMF):
                             # rename first to avoid delay in deleting
                             file_to_remove = os.path.join(save_dir, '~' + file_tail)
                             os.rename(filename, file_to_remove)
+                            time.sleep(0.5)
                         else:
                             file_to_remove = filename
                         os.remove(file_to_remove)
