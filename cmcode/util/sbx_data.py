@@ -54,7 +54,7 @@ def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]
 
 def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], *, channel: Optional[int] = 0,
                        subinds_spatial: Sequence[sbx_utils.DimSubindices] = (), crop_dead=True,
-                       plane: Optional[int] = None, dtype: Optional[DTypeLike] = None, quiet=False, dview=None,
+                       plane: Optional[int] = None, dtype: Optional[DTypeLike] = np.float64, quiet=False, dview=None,
                        odd_row_offset=0) -> np.ndarray:
     """load frames, slicing across all given files, and take mean projection"""
     subinds_map, total_frames, dims = subinds_per_file(sbx_files, frames)

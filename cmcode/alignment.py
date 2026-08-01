@@ -18,6 +18,7 @@ from caiman.utils import sbx_utils
 import cv2
 import matplotlib.pyplot as plt
 import numpy as np
+from numpy.typing import DTypeLike
 import optype.numpy as onp
 import pandas as pd
 from pandas._libs.missing import NAType
@@ -85,7 +86,7 @@ def get_stack_file(mouse_id: Union[int, str], sess_id: int, run_id: Optional[int
 
 
 def load_zstack(filename: str, plane: Union[int, slice, None] = None, channel=1, average=True, skip_odd=False, knobby_frames_to_discard=2,
-                info: Optional[dict] = None, shape: Optional[SbxShape] = None, odd_row_offset=0, crop_dead=True
+                info: Optional[dict] = None, shape: Optional[SbxShape] = None, odd_row_offset=0, crop_dead=True, dtype: Optional[DTypeLike] = np.float64
                 ) -> tuple[np.ndarray, dict[str, float], np.ndarray]:
         """
         Returns the data for a single plane along with um per pixel in x, y, and z and relative z-positions
@@ -156,14 +157,14 @@ def load_zstack(filename: str, plane: Union[int, slice, None] = None, channel=1,
         if average:
             stack_planes = [
                 average_raw_frames([filename], frames=slice(start, end), channel=channel, subinds_spatial=subinds_spatial,
-                                   crop_dead=crop_dead, plane=plane, dtype=np.float32, quiet=True, odd_row_offset=odd_row_offset)
+                                   crop_dead=crop_dead, plane=plane, dtype=dtype, quiet=True, odd_row_offset=odd_row_offset)
                 for start, end in zip(step_starts, step_ends)
             ]
         else:
             stack_planes = [
                 sbx_utils.sbxread(filename, subindices=(slice(start, end),) + subinds_spatial, channel=channel,
                                   plane=plane, odd_row_ndead=0, odd_row_offset=odd_row_offset, interp=False,
-                                  dview=cma.cluster.dview, quiet=True, dtype=np.float32)
+                                  dview=cma.cluster.dview, quiet=True, dtype=dtype)
                 for start, end in zip(step_starts, step_ends)
             ]
         stack = np.stack(stack_planes, axis=-1)
@@ -172,7 +173,8 @@ def load_zstack(filename: str, plane: Union[int, slice, None] = None, channel=1,
 
 def load_n_zstacks(stack_files: Sequence[str], planes: Union[int, Sequence[int]], channel=1, average=True, skip_odd=False,
                    knobby_frames_to_discard=2, center_and_norm=False, infos: Optional[Sequence[Optional[dict]]] = None,
-                   shapes: Optional[Sequence[Optional[SbxShape]]] = None) -> tuple[list[np.ndarray], dict[str, float], np.ndarray]:
+                   shapes: Optional[Sequence[Optional[SbxShape]]] = None, dtype: Optional[DTypeLike] = np.float64
+                   ) -> tuple[list[np.ndarray], dict[str, float], np.ndarray]:
     """
     Load each z-stack in the list stack_files (optionally averaging across time).
     Shapes may be truncated in the X and Z dimensions in order to ensure all outputs are the same shape
@@ -201,7 +203,7 @@ def load_n_zstacks(stack_files: Sequence[str], planes: Union[int, Sequence[int]]
     # first load all the stacks without truncating
     zstack_infos = [
         load_zstack(file, plane=plane, channel=channel, average=average, skip_odd=skip_odd,
-                          knobby_frames_to_discard=knobby_frames_to_discard, info=info, shape=shape)
+                    knobby_frames_to_discard=knobby_frames_to_discard, info=info, shape=shape, dtype=dtype)
         for file, plane, info, shape in zip(stack_files, planes, infos, shapes)
     ]
 
@@ -389,7 +391,8 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
                                  ref_trial=0, stack_trial: Optional[int] = None, ref_rec_type='learning_ppc_dlx',
                                  stack_rec_type='dlx_calibration', top_n_planes: Optional[int] = None,
                                  knobby_frames_to_discard=2,  plot=False, xy_offset: Optional[ScaledDataFrame] = None,
-                                 bad_fit_behavior: Literal['warning', 'error'] = 'warning', allow_stack_as_backup=True
+                                 bad_fit_behavior: Literal['warning', 'error'] = 'warning', allow_stack_as_backup=True,
+                                 max_shift=100  # in pixels
                                  ) -> ScaledDataFrame:
     """
     Estimate X/Y/Z offset in um of the center of a Dlx stack recording from a reference Dlx recording
@@ -410,7 +413,7 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
         subinds_y = slice(0, None, 2) if skip_odd else slice(None)
         ref = average_raw_frames(
             [ref_file], frames=slice(None), channel=1, subinds_spatial=(subinds_y, slice(None), slice(0, top_n_planes)),
-            crop_dead=False, dtype=np.float32, quiet=True)
+            crop_dead=False, dtype=np.float64, quiet=True)
 
     elif not allow_stack_as_backup:
         raise RuntimeError('Reference file not found')
@@ -442,25 +445,41 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
     
 
     def norm2d(img: np.ndarray) -> np.ndarray:
-        img_centered = img - np.mean(img, axis=(0, 1), keepdims=True)
-        return img_centered / np.std(img, axis=(0, 1), keepdims=True)
+        img_centered = img - np.mean(img, axis=(0, 1), keepdims=True, dtype=np.float64) # numpy's mean in float32 is inaccurate
+        # use biased std for correlation so we can just take mean later rather than dividing by N-1
+        return img_centered / np.std(img_centered, axis=(0, 1), keepdims=True)
 
     # Step 1: X/Y offset estimation, if not provided
+    max_shift_y = max_shift // 2 if skip_odd else max_shift
     if xy_offset is None:
         # cross-correlate top planes of stack and reference
         ref_topplane = norm2d(ref[:, :, [0]])  # keep 3D
         stack_topplane = norm2d(stack[:, :, 0])
         xcorr = signal.correlate(ref_topplane, stack_topplane)
+        # normalize by # of points included
+        n_pts = signal.correlate(np.ones(ref_topplane.shape), np.ones(ref_topplane.shape))
+        xcorr /= n_pts
+        # because the index in Z is how much the stack should be *shifted* to get this result,
+        # e.g. the first page is the result for correlating after shifting up maximally,
+        # i.e. with the bottom plane, so the result must be flipped in Z.
+        xcorr = xcorr[:, :, ::-1]
+
+        # enforce max_shift
+        y_shifts = signal.correlation_lags(ref_topplane.shape[0], stack_topplane.shape[0])
+        x_shifts = signal.correlation_lags(ref_topplane.shape[1], stack_topplane.shape[1])
+        xcorr[np.abs(y_shifts) > max_shift_y, :, :] = -np.inf
+        xcorr[:, np.abs(x_shifts) > max_shift, :] = -np.inf
+
         # get indices of peak correlation
         max_y, max_x, max_z = np.unravel_index(np.argmax(xcorr), xcorr.shape)
-        y_shift = max_y - (stack.shape[0] - 1)
-        x_shift = max_x - (stack.shape[1] - 1)
-        xcorr_best = xcorr[:, :, max_z]
+        y_shift = y_shifts[max_y]
+        x_shift = x_shifts[max_x]
+        xcorr_best = xcorr[np.ix_(np.abs(y_shifts) <= max_shift_y, np.abs(x_shifts) <= max_shift, [max_z])]
     else:
         xy_offset_pix = xy_offset.to_pixels()
         x_shift = round(xy_offset_pix.at[0, 'x'])  # type: ignore
         y_shift = round(xy_offset_pix.at[0, 'y'])  # type: ignore
-        xcorr_best = max_x = max_y = None
+        xcorr_best = None
     
     # shift matrices 
     if x_shift >= 0:
@@ -481,7 +500,8 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
     # do correlation broadcasting across Z axis, using all planes
     ref_norm = norm2d(ref)
     stack_norm = norm2d(stack)
-    corr = np.sum(ref_norm[..., np.newaxis] * stack_norm, axis=(0, 1, 2))
+    # this is actually a mean of 2D correlations for each plane
+    corr = np.mean(ref_norm[..., np.newaxis] * stack_norm, axis=(0, 1, 2))
 
     # fit linear-offset gaussian to correlation across Z
     def gauss_offset_lin(z, loga, center, logsigma, m, b):
@@ -518,6 +538,11 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
     # the amount we need to shift the stack. Also no Knobby weirdness.
     x_um = -x_shift * um_per_pixel['x']
     y_um = -y_shift * um_per_pixel['y']
+
+    # get max shift for plot taking potential skipping odd rows into account
+    x_extent = (max_shift + 0.5) * um_per_pixel['x']
+    y_extent = (max_shift_y + 0.5) * um_per_pixel['y']
+
     if skip_odd:
         # change um_per_pixel to be accurate for the original movie
         um_per_pixel['y'] /= 2
@@ -526,15 +551,15 @@ def get_offset_of_stack_from_ref(mouse_id: Union[int, str], ref_sess: int, stack
 
     if plot:
         fig = plt.figure()
-        if xcorr_best is not None and max_x is not None and max_y is not None:  # plot X/Y cross-correlation in top subplot
+        if xcorr_best is not None:  # plot X/Y cross-correlation in top subplot
             gs = fig.add_gridspec(2, 1)
             xy_ax = fig.add_subplot(gs[0, 0])
-            z_ax = fig.add_subplot(gs[0, 0])
-            im = xy_ax.imshow(xcorr_best)
-            xy_ax.plot(max_x, max_y, 'r.')
+            z_ax = fig.add_subplot(gs[1, 0])
+            im = xy_ax.imshow(xcorr_best, extent=(-x_extent, x_extent, y_extent, -y_extent))
+            xy_ax.plot(-x_um, -y_um, 'r.')
             xy_ax.set_title('Cross-correlation of best plane')
-            xy_ax.set_xlabel('X (pixels)')
-            xy_ax.set_ylabel('Y (pixels)')
+            xy_ax.set_xlabel('X shift (um)')
+            xy_ax.set_ylabel('Y shift (um)')
             fig.colorbar(im)
         else:
             z_ax = fig.add_subplot()
