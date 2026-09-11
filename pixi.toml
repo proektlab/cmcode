@@ -34,13 +34,61 @@ pytest = "*"
 [workspace]
 preview = ["pixi-build"]
 channels = ["conda-forge"]
-platforms = ["win-64", "linux-64", "osx-arm64", "osx-64"]
+platforms = [
+    { name = "win-64-cpu", platform = "win-64"},
+    { name = "win-64-cuda", platform = "win-64", cuda = "12" },
+    { name = "linux-64-cpu", platform = "linux-64"},
+    { name = "linux-64-cuda", platform = "linux-64", cuda = "12" },
+    "osx-arm64",
+]
+
+# Seems to not be able to automatically determine which VS to use?
+# Specifying manually - on Windows, Visual C++ 2019 build tools must be installed
+[workspace.target.win.build-variants]
+c_compiler = ["vs2019"]
+cxx_compiler = ["vs2019"]
+
+[activation.env]
+QT_API = "pyside6"  # specify for qtpy
+
+# Uncomment and modify if you want your caiman_data folder to be somewhere other than your home directory (CAIMAN_DATA)
+# or to set the root data path using an environment variable (CMCODE_ROOT_DATA_DIR).
+# If you prefer, you can set these paths using private/local_environment.py (see README); however,
+#   note that in that case operations that read CAIMAN_DATA outside of cmcode (like caimanmanager commands) won't work.
+# Here, separate network paths are given for Unix and Windows platforms (pointing to the same location).
+# Note: You will also have to set up root_mappings in local_environment.py for Unix/Windows interop to work reliably.
+
+# [target.unix.activation.env]
+# CAIMAN_DATA = "/mnt/bigdata/eblackwood/caiman_data"
+# CMCODE_ROOT_DATA_DIR = "/mnt/bigdata/eblackwood/2p_data"
+
+# [target.win.activation.env]
+# CAIMAN_DATA = "Y:\\eblackwood\\caiman_data"
+# CMCODE_ROOT_DATA_DIR = "Y:\\eblackwood\\2p_data"
+
 
 [dependencies]
-caiman = { path = "../CaImAn" }
-mesmerize-core = { path = "../mesmerize-core" }
+caiman = { git = "https://github.com/proektlab/CaImAn", branch = "new-dev" }
+mesmerize-core = { git = "https://github.com/proektlab/mesmerize-core", branch = "new-dev" }
 cmcode = { path = "." }
+ipykernel = "<7" # maybe helps with matplotlib?
+pandas = "2.*"  # compatibility with older python version for loading in matlab
 
 [pypi-dependencies]
 suite2p = { git = "https://github.com/proektlab/suite2p", branch = "proekt-dev" }
-hdf5storage = ">=0.2.0"  # version on conda-forge is out of date
+hdf5storage = ">=0.2.2, <0.3"  # version on conda-forge is out of date
+
+
+[feature.cuda]
+platforms = ["win-64-cuda", "linux-64-cuda", "osx-arm64"]
+
+[feature.cuda.dependencies]
+pytorch = { version = "*", build = "cuda*" }
+
+# cuda pytorch doesn't exist for osx, so don't require it for default environment
+[feature.cuda.target."osx-*".dependencies]
+pytorch = { version = "*" }
+
+[environments]
+default = ["cuda"]
+cpu = []
