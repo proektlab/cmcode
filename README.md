@@ -1,5 +1,7 @@
 # cmcode: a suite for organized 2P data analysis
 
+[![DOI](https://zenodo.org/badge/1063561641.svg)](https://zenodo.org/badge/latestdoi/1063561641)
+
 This repository contains Python code to manage signal extraction from multi-plane two-photon (2P) calcium imaging recordings using [CNMF](https://www.sciencedirect.com/science/article/pii/S0896627315010843) (as implemented in [CaImAn](https://caiman.readthedocs.io/en/latest/)). It also has various convenient functions for visualizing and interacting with results on a remote server. The `alignment` module has routines to aid matching cells between different sessions with slightly different fields of view (including in Z). Everything is designed to work seamlessly across Windows and Linux workstations, after some initial configuration.
 
 ## Installation
