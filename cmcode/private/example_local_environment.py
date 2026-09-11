@@ -80,15 +80,14 @@ labstuff_local = labstuff.get_local_path()
 # Root data dir - this is where raw input data and processed results live, as well as
 # a few other utility directories. The raw files should be located at:
 #   <root_data_dir>/raw/<rec_type>/<mouse_id>/<mouse_id>_<session_number>_<trial_number>.sbx
-# allow overriding using environment variable if desired
-if (root_data_dir := os.environ.get('CMCODE_ROOT_DATA_DIR')) is None:
-    root_data_dir = labstuff_local / '2p_imaging'
+# Modifiy this line if you are not managing the root dir using CMCODE_ROOT_DATA_DIR
+root_data_dir = os.environ.get('CMCODE_ROOT_DATA_DIR', labstuff_local / '2p_imaging')
 
 # Caiman data dir - the location of the caiman_data folder. By default this gets put in
 # your home directory when you install CaImAn, and this is only necessary if you have
-# overridden that default; otherwise it can be set to None.
+# overridden that default and don't want to manage it at the environment variable (CAIMAN_DATA) level.
 # caiman_data_dir = labstuff_local / 'caiman_data'
-caiman_data_dir = None
+caiman_data_dir = os.environ.get('CAIMAN_DATA')
 
 # Shared profile directory for ipyparallel - if you want to use ipyparallel to open a cluster
 # spanning multiple hosts, this must be located in a directory accessible to all of them.
@@ -100,7 +99,7 @@ ipyprofile_dir = None
 # CNMF remotely or on a cluster (including a SLURM cluster).
 network_hosts = NetworkInfo()
 
-# Normal PCs for cluster/remote processing
+# Normal PCs for cluster/remote processing - replace with your actual machines! Or comment out.
 # See definition of HostInfo class in host_info.py for what each field means
 network_hosts.add_host(
     name='happy',

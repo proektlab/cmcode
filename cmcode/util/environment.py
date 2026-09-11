@@ -1,4 +1,5 @@
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import os
 from pathlib import Path
 from typing import Iterable, Optional, Union
 
@@ -18,7 +19,10 @@ class ComputingEnvironment:
     computing_environment, it will automatically be applied using the appropriate
     global variable setters when cmcode is imported.
     """
-    caiman_data_dir: Optional[Union[str, Path]] = None # path to caiman_data, must be set before root_data_dir
+    # path to caiman_data, must be set before root_data_dir. None = unset CAIMAN_DATA.
+    caiman_data_dir: Optional[Union[str, Path]] = field(
+        default_factory=lambda: os.environ.get('CAIMAN_DATA')  # read from existing CAIMAN_DATA by default
+    )
     network_hosts: NetworkInfo = NetworkInfo()         # hosts available to do work
     root_mappings: Iterable[paths.EquivalentPaths] = ()      # equivalent root paths
     root_data_dir: Optional[Union[str, Path]] = None   # path with 'processed' and 'raw' folders (required to do anything)
@@ -27,7 +31,7 @@ class ComputingEnvironment:
 
     def apply(self):
         """Apply ComputingEnvironment by calling global variable setters"""
-        # caiman_data_dir must be done first to avoid import order issue
+        # caiman_data_dir must be done first to avoid import order issue (2026 edit: may not be true anymore)
         paths.set_caiman_data_dir(self.caiman_data_dir)
         host_info.set_network_hosts(self.network_hosts)
         paths.set_root_mappings(self.root_mappings)
