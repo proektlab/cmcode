@@ -55,6 +55,7 @@ QT_API = "pyside6"  # specify for qtpy
 # or to set the root data path using an environment variable (CMCODE_ROOT_DATA_DIR).
 # If you prefer, you can set these paths using private/local_environment.py (see README); however,
 #   note that in that case operations that read CAIMAN_DATA outside of cmcode (like caimanmanager commands) won't work.
+#   Settings in the local_environment.py file take precedence over environment variables.
 # Here, separate network paths are given for Unix and Windows platforms (pointing to the same location).
 # Note: You will also have to set up root_mappings in local_environment.py for Unix/Windows interop to work reliably.
 
