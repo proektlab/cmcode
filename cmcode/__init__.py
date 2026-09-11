@@ -7,16 +7,20 @@ except Exception:
     pass
 
 import logging
+import os
 from typing import Union
 
 import nest_asyncio
 
 from cmcode.util.environment import ComputingEnvironment
+from cmcode.util.paths import set_root_data_dir
 
 try:
     from cmcode.private.local_environment import computing_environment
 except ImportError:
-    pass
+    # try to set root data dir using environment variable (must exist)
+    if (root_dir := os.environ.get('CMCODE_ROOT_DATA_DIR')) is not None:
+        set_root_data_dir(root_dir)
 else:
     assert isinstance(computing_environment, ComputingEnvironment), \
         'computing_environment should be an instance of ComputingEnvironment'

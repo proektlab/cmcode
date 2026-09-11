@@ -18,7 +18,6 @@ from cmcode.remote.host_info import  HostInfo, get_network_hosts
 _root_data_dir: Optional[Path] = None
 _ipyprofile_dir: str = ''
 _root_mappings: Iterable['EquivalentPaths'] = ()
-_caiman_data_dir: Optional[Path] = None
 
 
 def set_root_data_dir(path: Union[str, Path]):
@@ -57,15 +56,14 @@ def get_root_mappings() -> Iterable['EquivalentPaths']:
     return _root_mappings
 
 def set_caiman_data_dir(path: Union[str, Path, None]):
-    global _caiman_data_dir
+    curr_data_dir = os.environ.get('CAIMAN_DATA')
+    curr_path = None if curr_data_dir is None else Path(curr_data_dir)
     path = path if path is None else Path(path) 
-    if path == _caiman_data_dir:
+    if path == curr_path:
         return
     
-    _caiman_data_dir = path
     if path is None:
-        if 'CAIMAN_DATA' in os.environ:
-            del os.environ['CAIMAN_DATA']
+        del os.environ['CAIMAN_DATA']
     else:
         os.environ['CAIMAN_DATA'] = str(path)
 
