@@ -1461,20 +1461,6 @@ class RegisterROIsResults:
     components_used: Optional[onp.Array1D[np.integer]]  = None  # which of original components were used for registration
 
 
-def threshold_masks(A: sparse.csc_matrix, max_thr: float):
-    """Modify masks to apply given threshold (fraction of max value in each mask)"""
-    remove_rows = np.array([], dtype=np.int32)
-    remove_cols = np.array([], dtype=np.int32)
-    for k in range(A.shape[1]):
-        roi = A[:, [k]].toarray()  # type: ignore
-        below_thr = np.flatnonzero(np.squeeze(roi) < roi.max() * max_thr)
-        remove_rows = np.concatenate((remove_rows, below_thr))
-        remove_cols = np.concatenate((remove_cols, np.repeat(k, len(below_thr))))
-    remove_data = np.repeat(True, len(remove_rows))
-    remove_mask = sparse.coo_matrix((remove_data, (remove_rows, remove_cols)), shape=A.shape)
-    A[remove_mask] = 0
-
-
 def register_ROIs(
         A1: MaybeSparse,
         A2: MaybeSparse,
@@ -1487,7 +1473,8 @@ def register_ROIs(
         com2: Optional[np.ndarray] = None,
         D: Optional[list[np.ndarray]] = None,
         D_pow: Optional[np.ndarray] = None,
-        max_thr: float = 0,
+        thr_method: Literal['nrg', 'max'] = 'max',
+        thr=0.,
         use_opt_flow=False,
         thresh_cost=.7,
         max_dist=10.,
@@ -1499,7 +1486,7 @@ def register_ROIs(
         template2_shift_guess: tuple[float, float] = (0, 0)) -> RegisterROIsResults:
     """
     See caiman.base.rois.register_ROIs for documentation
-    Modified to return both A1 (filtered taking max_thr into account) and A2.
+    Modified to return both A1 (filtered taking max_thr or nrg_thr into account) and A2.
     xy_remap: tuple of (x_remap, y_remap) to map template2 onto template1.
         If provided, skips registration step but uses these to map A2.
     n_planes (positive int): if not equal to 1, separate planes along x axis before doing registration.
@@ -1507,8 +1494,8 @@ def register_ROIs(
     D_pow_A2: if specified, raise distances (which are in range [0, 1]) to this power (should broadcast with D)
     """
 
-    A1 = sparse.csc_matrix(A1)
-    A2 = sparse.csc_matrix(A2)
+    A1 = sparse.csc_matrix(A1, copy=D is None)  # must make a copy if we are computing distance matrix
+    A2 = sparse.csc_matrix(A2, copy=D is None)
     
     if xy_remap is None and align_flag and (template1 is not None and template2 is not None):
         if template1 is None or template2 is None:
@@ -1525,10 +1512,6 @@ def register_ROIs(
     else:
         A2_aligned = A2
 
-    # apply max_thr
-    for A in [A1, A2_aligned]:
-        threshold_masks(A, max_thr)
-
     if D is None:
         if com1 is None:
             com1 = com(A1, *dims)
@@ -1538,8 +1521,14 @@ def register_ROIs(
         elif xy_remap is not None:
             com2 = remap_points(com2, *xy_remap)
 
+        # apply threshold (also for output)
+        for A in [A1, A2_aligned]:
+            footprints.threshold_sparse_footprints_inplace(A, method=thr_method, thr=thr)
+
+        # binarize thresholded masks (but keep as float)
         A1_tr = (A1 > 0).astype(float)
-        A2_tr = (A2_aligned > 0).astype(float)
+        A2_tr = (A2_aligned > 0).astype(float)  # type: ignore
+
         D = distance_masks([A1_tr, A2_tr], [com1, com2], max_dist, enclosed_thr=enclosed_thr)  # type: ignore
 
     if D_pow is not None:
@@ -1693,7 +1682,7 @@ def register_ROIs_multiple(
 
     for sess, xy_remap in zip(range(1, n_sessions), xy_remaps_in):
         reg_results = register_ROIs(
-            A[sess], A_union, dims, align_flag=False, max_thr=max_thr, thresh_cost=thresh_cost,
+            A[sess], A_union, dims, align_flag=False, thr_method='max', thr=max_thr, thresh_cost=thresh_cost,
             max_dist=max_dist, enclosed_thr=enclosed_thr, xy_remap=xy_remap)
 
         matched_session = reg_results.matched1
@@ -2443,13 +2432,12 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
     def __init__(self, mouse_id: Union[int, str], sess_name: str,
                  remaps_to_others: dict[str, onp.Array3D[np.floating]], rec_type='learning_ppc',
                  session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
-                 session_z_offset_um: Optional[float] = None, max_thr=0.,
+                 session_z_offset_um: Optional[float] = None,
                  pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
                  include_snr_in_weights=False):
         """
         Additional inputs:
             - session_z_offset_um: Offset of this session in the Z axis (if none, ignore Z axis)
-            - max_thr: see caiman.base.rois.register_ROIs
             - pixel_thr_method, pixel_thr: parameters for counting pixels in each mask to make weights
         """
         super().__init__(mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remaps_to_others,
@@ -2473,7 +2461,6 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
         self.weights = footprints.count_pixels(xy_footprints, method=pixel_thr_method, thr=pixel_thr)
         if include_snr_in_weights:
             self.weights = self.weights * np.clip(self.snr, 0, None)
-        threshold_masks(xy_footprints, max_thr)
         self.xy_footprints = xy_footprints
 
 
@@ -2512,14 +2499,13 @@ class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
         self, mouse_id: Union[int, str], sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]],
         rec_type='learning_ppc', session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
         session_z_offset_um: Optional[float] = None,
-        max_thr=0., pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
+        pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
         include_snr_in_weights=False):
         
         super().__init__(
             mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remaps_to_others,
             rec_type=rec_type, session_cell_ids=session_cell_ids, session_z_offset_um=session_z_offset_um,
-            max_thr=max_thr, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr,
-            include_snr_in_weights=include_snr_in_weights)
+            pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr, include_snr_in_weights=include_snr_in_weights)
         
         if pixel_thr is None:
             pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
@@ -2543,7 +2529,6 @@ class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
         
         # save 3D footprints to flatten later
         self.footprints = footprints.normalize_footprints(est.A[:, self.session_cell_ids])
-        threshold_masks(self.footprints, max_thr)
 
     
     def get_flat_footprints_mapped_to_session(
@@ -2582,7 +2567,7 @@ class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
 
 def register_ROIs_multisession_3D(
         mouse_id: Union[int, str], sess_ids: Sequence[Union[int, str]], rec_type='learning_ppc', tags: Union[None, Sequence[Optional[str]]] = None,
-        grouptag: Optional[str] = None, max_thr=0., thresh_cost=0.7, max_dist_um=20., n_matched_weight=0.5,
+        grouptag: Optional[str] = None, thresh_cost=0.7, max_dist_um=20., n_matched_weight=0.5,
         pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
         use_saved_xy_offsets=False, saved_offset_filename_fmt: Optional[str] = '{}_daily_offsets.csv',
         use_saved_mappings: Optional[bool] = None, save_mappings_with_grouptag: Optional[bool] = None,
@@ -2607,9 +2592,11 @@ def register_ROIs_multisession_3D(
         pixel_thr_method (Literal['nrg', 'max']):
             Method of thresholding pixel values in each ROI to obtain a weight for combining with other
             ROIs based on number of pixels. Either cumulative energy or fraction of max value.
+            Edited 2026-09-14: also now controls thresholding for matching ROIs.
         
         pixel_thr (Optional[float]):
             The value of the energy or max threshold, see above. Defaults to 0.9 for energy or 0.2 for max.
+            Edited 2026-09-14: also now controls thresholding for matching ROIs.
 
         use_saved_xy_offsets (bool):
             Load X/Y um offsets of each session from the first from a file and convert to pixels.
@@ -2638,6 +2625,9 @@ def register_ROIs_multisession_3D(
     """
     if len(sess_ids) == 0:
         raise ValueError('Must include at least one session in registration')
+
+    if pixel_thr is None:
+        pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
 
     sess_names = make_sess_names(sess_ids, tags)
     sess_ids, tags = split_sess_names(sess_names)
@@ -2673,7 +2663,7 @@ def register_ROIs_multisession_3D(
         MappingDataClass = SessionMappingDataWith3DFootprints if planewise_mappings else SessionMappingDataWithFlatFootprints
         this_session_data = MappingDataClass(
             mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remap_dict, rec_type=rec_type,
-            session_z_offset_um=session_z_offset_um, max_thr=max_thr, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr,
+            session_z_offset_um=session_z_offset_um, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr,
             include_snr_in_weights=include_snr_in_weights
         )
         session_data.append(this_session_data)
@@ -2733,8 +2723,8 @@ def register_ROIs_multisession_3D(
 
         reg_results = register_ROIs(
             A1=session.xy_footprints, A2=A_union, dims=session.dims, align_flag=False,
-            com1=session.com.to_um().to_numpy(), com2=com_union,
-            max_thr=max_thr, thresh_cost=thresh_cost, max_dist=max_dist_um, D_pow=D_pow
+            com1=session.com.to_um().to_numpy(), com2=com_union, thr_method=pixel_thr_method,
+            thr=pixel_thr, thresh_cost=thresh_cost, max_dist=max_dist_um, D_pow=D_pow
         )
         # update matchings and other info
         matched_session_inds = reg_results.matched1

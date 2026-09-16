@@ -1,5 +1,5 @@
 """Utilities for manipulating sets of cell footprints (A)"""
-from collections.abc import Sequence, Mapping, Callable
+from collections.abc import Sequence, Mapping, Callable, Generator
 from dataclasses import dataclass
 from functools import cache
 import logging
@@ -45,6 +45,53 @@ def normalize_footprints(A: MaybeSparse[np.floating]) -> sparse.csc_matrix[np.fl
     return A
 
 
+def get_threshold_mask_per_comp(
+    A: sparse.csc_matrix, method: Literal['nrg', 'max'], thr: float, among_nonzero=True
+    ) -> Generator[onp.Array1D[np.bool_]]:
+    """
+    For each column of A, yield a boolean mask for which pixels pass the threshold
+    If among_nonzero is true, the indices are among the "filled" indices of A (A.indices) for each component.
+    """
+    use_max = method == 'max'
+    if not use_max and method != 'nrg':
+        raise ValueError(f'Unrecognized threshold method {method}')
+
+    for c in range(A.shape[1]):
+        comp = A.data[A.indptr[c]:A.indptr[c+1]]
+
+        if comp.size == 0:
+            if among_nonzero:  # handle no-data case separately, since it messes with the nrg method
+                yield np.array([], dtype=bool)
+            else:
+                yield np.zeros(A.shape[0], dtype=bool)
+        elif use_max:
+            above_thresh = comp > comp.max() * thr
+            if among_nonzero:
+                yield above_thresh
+            else:
+                mask = np.zeros(A.shape[0], dtype=bool)
+                mask[A.indices[A.indptr[c]:A.indptr[c+1]]] = above_thresh
+                yield mask
+        else:
+            idx_sorted = np.argsort(comp)[::-1]
+            cumEn = np.cumsum(comp[idx_sorted]**2)
+            sorted_above_thresh = cumEn < thr * cumEn[-1]
+
+            if among_nonzero:
+                above_thresh = np.zeros(comp.size, dtype=bool)
+                above_thresh[idx_sorted] = sorted_above_thresh
+                yield above_thresh
+            else:
+                mask = np.zeros(A.shape[0], dtype=bool)
+                mask[A.indices[A.indptr[c]:A.indptr[c+1]][idx_sorted]] = sorted_above_thresh
+                yield mask
+
+
+def count_pixels(A: sparse.csc_matrix, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9) -> onp.Array1D[np.integer]:
+    """Just count pixels for each component in A after applying energy or max threshold"""
+    return np.array([mask.sum() for mask in get_threshold_mask_per_comp(A, method=method, thr=thr)])
+
+
 def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9,
                         nonempty_filter: Optional[onp.Array1D[Union[np.bool_, np.integer]]] = None
                         ) -> sparse.csc_matrix[np.bool_]:
@@ -67,43 +114,14 @@ def binarize_footprints(A: MaybeSparse, method: Literal['nrg', 'max'] = 'nrg', t
     elif not onp.is_array_1d(nonempty_filter, np.integer):
         raise TypeError('nonempty_filter must be a 1D array of ints or bools')
 
-    if method == 'max':
-        max_vals = A.max(axis=0)
-        return A > max_vals * thr
-    else:
-        if method != 'nrg':
-            raise ValueError(f'Unrecogized thresholding method {thr}')
-        A_binarized = sparse.lil_matrix(A.T.shape, dtype=np.bool_)  # construct transposed
-        for c in nonempty_filter:
-            c = int(c)
-            patch_data = A.data[A.indptr[c]:A.indptr[c+1]]
-            if len(patch_data) == 0:
-                continue
+    A_binarized = sparse.lil_matrix(A.T.shape, dtype=np.bool_)  # construct transposed
+    # compute mask for each nonempty component
+    for c, comp_mask in zip(
+        nonempty_filter,
+        get_threshold_mask_per_comp(A[:, nonempty_filter], method=method, thr=thr, among_nonzero=False)):
+        A_binarized[int(c), :] = comp_mask
 
-            indx_sorted = np.argsort(patch_data)[::-1]
-            cumEn = np.cumsum(patch_data[indx_sorted]**2)
-            above_thresh = np.zeros(len(patch_data), dtype=bool)  # in row order
-            above_thresh[indx_sorted] = cumEn < thr * cumEn[-1]
-            true_inds = A.indices[A.indptr[c]:A.indptr[c+1]][above_thresh]
-            A_binarized[c, true_inds] = True
-        return A_binarized.tocsr().T
-
-
-def count_pixels(A: sparse.csc_matrix, method: Literal['nrg', 'max'] = 'nrg', thr: float = 0.9) -> onp.Array1D[np.integer]:
-    """Just count pixels for each component in A after applying energy or max threshold"""
-    if method == 'max' or A.dtype == bool:
-        A_binarized = binarize_footprints(A, method, thr)
-        return np.asarray(A_binarized.sum(axis=0))[0]
-    else:
-        if method != 'nrg':
-            raise ValueError(f'Unrecogized thresholding method {thr}')
-        n_pix = np.empty(A.shape[1], dtype=int)
-        for c in range(A.shape[1]):
-            patch_data = A.data[A.indptr[c]:A.indptr[c+1]]
-            indx_sorted = np.argsort(patch_data)[::-1]
-            cumEn = np.cumsum(patch_data[indx_sorted]**2)
-            n_pix[c] = np.sum(cumEn < thr * cumEn[-1])
-        return n_pix
+    return A_binarized.tocsr().T
 
 
 def binarize_and_collapse_to_xy(A: MaybeSparse, n_planes: int, **binarize_kwargs) -> sparse.csc_matrix[np.bool_]:
@@ -120,6 +138,21 @@ def binarize_and_collapse_to_xy(A: MaybeSparse, n_planes: int, **binarize_kwargs
 
     return xy_mask
     
+
+def threshold_sparse_footprints_inplace(A: sparse.csc_matrix, method: Literal['nrg', 'max'], thr: float):
+    """Modify masks to apply given threshold"""
+    remove_rows = np.array([], dtype=np.int32)
+    remove_cols = np.array([], dtype=np.int32)
+
+    for c, keep_mask in enumerate(get_threshold_mask_per_comp(A, method=method, thr=thr, among_nonzero=True)):
+        below_thr_rows = A.indices[A.indptr[c]:A.indptr[c+1]][~keep_mask]
+        remove_rows = np.concatenate((remove_rows, below_thr_rows))
+        remove_cols = np.concatenate((remove_cols, np.full_like(below_thr_rows, c)))
+
+    remove_data = np.repeat(True, len(remove_rows))
+    remove_mask = sparse.coo_matrix((remove_data, (remove_rows, remove_cols)), shape=A.shape)
+    A[remove_mask] = 0
+
 
 @overload
 def collapse_footprints_to_xy(A: MaybeSparse[ST], n_planes: int, binarize: Literal[False], **binarize_kwargs) -> sparse.csc_matrix[ST]:
