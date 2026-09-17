@@ -3,7 +3,7 @@ from collections.abc import Mapping, Sequence, Callable
 from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
-from typing import Union, Optional, Any, TypeVar
+from typing import Union, Optional, Any, TypeVar, overload
 from typing_extensions import Self
 
 import cv2
@@ -137,10 +137,10 @@ class BorderSpec:
     def shifted(self, x_shift: CanFloat, y_shift: CanFloat) -> Self:
         """Rigidly shift borders, clipping to 0"""
         res = type(self)(
-            left=self.left_subpix + x_shift,
-            right=self.right_subpix - x_shift,
-            top=self.top_subpix + y_shift,
-            bottom=self.bottom_subpix - y_shift
+            left=self.left_subpix + float(x_shift),
+            right=self.right_subpix - float(x_shift),
+            top=self.top_subpix + float(y_shift),
+            bottom=self.bottom_subpix - float(y_shift)
         )
         return type(self).max(res, 0)
 
@@ -445,17 +445,36 @@ def remap_image(image: np.ndarray, x_remap: Optional[onp.Array2D[np.floating]], 
     return cv2.remap(image.astype(np.float32), x_remap, y_remap, cv2.INTER_CUBIC)
 
 
-def invert_mapping(x_remap: onp.Array2D[np.floating], y_remap: onp.Array2D[np.floating]
-                   ) -> tuple[onp.Array2D[np.floating], onp.Array2D[np.floating]]:
-    y_grid: onp.Array2D[np.floating]
-    x_grid: onp.Array2D[np.floating]
-    y_grid, x_grid = np.meshgrid(
-        np.arange(x_remap.shape[0], dtype=x_remap.dtype),
-        np.arange(x_remap.shape[1], dtype=x_remap.dtype), indexing='ij')
-    x_remap_inv = -(x_remap - x_grid) + x_grid
-    y_remap_inv = -(y_remap - y_grid) + y_grid
-    return x_remap_inv, y_remap_inv
+def invert_mapping(
+    x_remap: onp.Array2D[np.floating], y_remap: onp.Array2D[np.floating], n_iters=10, damping=0.5
+    ) -> tuple[onp.Array2D[np.floating], onp.Array2D[np.floating]]:
+    """Adapted from https://stackoverflow.com/questions/72635492/what-are-the-inaccuracies-of-this-inverse-map-function-in-opencv"""
+    # create ground-truth identity map
+    I_y, I_x = np.indices(x_remap.shape, dtype=x_remap.dtype)
 
+    # create matrices to hold the inverse
+    x_inv = np.copy(I_x)
+    y_inv = np.copy(I_y)
+
+    for _ in range(n_iters):
+        I_est_x, I_est_y = compose_mappings((x_remap, y_remap), (x_inv, y_inv))
+        x_inv += (I_x - I_est_x) * damping
+        y_inv += (I_y - I_est_y) * damping
+
+    return x_inv, y_inv
+
+
+@overload
+def compose_mappings(
+    xy_remap1: tuple[onp.Array2D, onp.Array2D], /, *xy_remaps: tuple[onp.Array2D, onp.Array2D]
+    ) -> tuple[onp.Array2D, onp.Array2D]:
+    ...
+
+@overload
+def compose_mappings(
+    *xy_remaps: Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]
+    ) -> Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]:
+    ...
 
 def compose_mappings(*xy_remaps: Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]
                      ) -> Union[tuple[onp.Array2D, onp.Array2D], tuple[None, None]]:
@@ -476,19 +495,16 @@ def compose_mappings(*xy_remaps: Union[tuple[onp.Array2D, onp.Array2D], tuple[No
     return cum_remap_x, cum_remap_y
 
 
-def inverse_remap_image(image: np.ndarray, x_remap: Optional[onp.Array2D], y_remap: Optional[onp.Array2D]):
-    """Use CV2 to inverse-remap an image according to remap function as returned from register_ROIs"""
-    if x_remap is None or y_remap is None:
-        if y_remap is not None or x_remap is not None:
-            raise ValueError('x_remap and y_remap should both be either defined or not')
-        return image
-    return remap_image(image, *invert_mapping(x_remap=x_remap, y_remap=y_remap))
-
-
-def remap_points(points: onp.Array2D, x_remap: Optional[onp.Array2D], y_remap: Optional[onp.Array2D]) -> np.ndarray:
+def remap_points(
+    points: onp.Array2D, x_remap: Optional[onp.Array2D], y_remap: Optional[onp.Array2D],
+    mapping_is_inverted=False) -> np.ndarray:
     """
     Map a set of points from one coordinate system to another using a nonrigid mapping
     There must be 2 columns and they are assumed to be (Y, X).
+
+    If mapping_is_inverted is true, and we are mapping points from session i to j,
+        x_remap and y_remap should be a precomputed inverse of the mapping matrices
+        used to map an *image* from session i to j (obtained using invert_mapping).
     """
     points = np.atleast_2d(points)
     if points.ndim > 2 or points.shape[1] != 2:
@@ -501,9 +517,13 @@ def remap_points(points: onp.Array2D, x_remap: Optional[onp.Array2D], y_remap: O
             raise ValueError('x_remap and y_remap should both be either defined or not')
         mapped_vals = (yvals, xvals)
     else:
-        # take inverse of remapping so that we can do regular-grid interpolation
-        # we want to map (y, x) locations to the coordinates in the new space (given by the inverted mapping)
-        remap_inv_x, remap_inv_y = invert_mapping(x_remap=x_remap, y_remap=y_remap)
+        if mapping_is_inverted:
+            remap_inv_x, remap_inv_y = x_remap, y_remap
+        else:
+            # take inverse of remapping so that we can do regular-grid interpolation
+            # we want to map (y, x) locations to the coordinates in the new space (given by the inverted mapping)
+            remap_inv_x, remap_inv_y = invert_mapping(x_remap=x_remap, y_remap=y_remap)
+
         interpolants = [
             interpolate.RectBivariateSpline(range(x_remap.shape[0]), range(x_remap.shape[1]), remap_dim)
             for remap_dim in (remap_inv_y, remap_inv_x)

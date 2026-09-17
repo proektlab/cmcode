@@ -2,7 +2,7 @@ from collections.abc import Mapping, Sequence, Iterable
 from copy import deepcopy
 from dataclasses import dataclass, field
 from datetime import date
-from itertools import pairwise
+from itertools import pairwise, chain
 import logging
 import math
 import os
@@ -28,7 +28,7 @@ from cmcode import caiman_analysis as cma
 from cmcode.cmcustom import compute_matching_performance
 from cmcode.util import footprints
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files, get_trial_numbers_from_files
-from cmcode.util.image import (BorderSpec, invert_mapping, remap_points, remap_points_from_df,
+from cmcode.util.image import (BorderSpec, remap_points, remap_points_from_df,
                                remap_image, shift_image, calc_weighted_median)
 from cmcode.util.naming import make_sess_name, make_sess_names, split_sess_names, format_sess_name
 from cmcode.util.paths import get_root_data_dir, get_processed_dir, make_timestamped_filename, get_latest_timestamped_file
@@ -1086,11 +1086,15 @@ def align_templates_allpairs(
     
     if precomputed_remaps is not None:
         # validate precomputed remaps
-        if len(precomputed_mask) != len(templates):
+        if len(precomputed_mask) != n_templates:
             raise ValueError('precomputed_mask of same length as templates must be provided along with precomputed_remaps')
         if sum(precomputed_mask) != precomputed_remaps.shape[0]:
             raise ValueError('Total number of precomputed sessions does not match size of precomputed_remaps')
     
+        precomputed_inds = [i for i in range(n_templates) if precomputed_mask[i]]
+    else:
+        precomputed_inds = []
+
     if yx_position_guesses is None:
         yx_pos = np.zeros((n_templates, 2))
     else:
@@ -1114,27 +1118,32 @@ def align_templates_allpairs(
     remaps = np.empty((n_templates, n_templates - 1, 2) + shape, dtype=np.float32)
     # like above, we call the "from" template template2 and the "to" template template1
     for i_from, (template2, border2, pos2) in enumerate(zip(templates, borders, yx_pos)):
-        for j_to, template1, border1, pos1 in zip(range(i_from+1, n_templates), templates[i_from+1:], borders[i_from+1:], yx_pos[i_from+1:]):
+        for to_ind, j_to in enumerate(chain(range(i_from), range(i_from + 1, n_templates))):
             if precomputed_remaps is not None and precomputed_mask[i_from] and precomputed_mask[j_to]:
                 # reuse precomputed remap
-                i_precomputed = sum(precomputed_mask[:i_from])
-                j_precomputed = sum(precomputed_mask[:j_to])  # j_to > i_from => j_precomputed > i_precomputed
-                remaps[i_from, j_to-1] = precomputed_remaps[i_precomputed, j_precomputed-1]
-                remaps[j_to, i_from] = precomputed_remaps[j_precomputed, i_precomputed]
+                i_precomputed = precomputed_inds.index(i_from)
+                j_precomputed = precomputed_inds.index(j_to)
+                if j_precomputed > i_precomputed:
+                    j_precomputed -= 1  # account for diagonal compression
+
+                remaps[i_from, to_ind] = precomputed_remaps[i_precomputed, j_precomputed]
             else:
+                border1 = borders[j_to]
                 borders1 = border1 if isinstance(border1, Sequence) else [border1] * n_planes
                 borders2 = border2 if isinstance(border2, Sequence) else [border2] * n_planes
                 border = [BorderSpec.max(b1, b2) for b1, b2 in zip(borders1, borders2)]
 
                 # the guess is how to shift template 2, so we want to subtract its current position and add the position of template 1
+                pos1 = yx_pos[j_to]
                 template2_shift_guess = (pos1[0] - pos2[0], pos1[1] - pos2[1])
+
+                template1 = templates[j_to]
+                logging.debug(f'Computing a map from {i_from} to {j_to}')
                 this_remap = align_templates(
                     template1, template2, use_opt_flow=use_opt_flow, align_options=align_options,
                     n_planes=n_planes, border=border, template2_shift_guess=template2_shift_guess
                 )
-                remaps[i_from, j_to-1] = this_remap
-                remaps[j_to, i_from] = invert_mapping(*this_remap)
-            
+                remaps[i_from, to_ind] = this_remap
     return remaps
 
 
