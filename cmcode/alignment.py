@@ -2076,12 +2076,11 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: onp.ToJustIn
         sess_cell_ids = list(match_res.loc[matched, 'session_cell_id'].astype(int))
         
         # load session and select correct CNMF run
-        sess_id = session_table.at[sess_ind, 'sess_id']
-        assert isinstance(sess_id, int)
+        sess_id = cast(onp.ToInt, session_table.at[sess_ind, 'sess_id'])
         tag = session_table.at[sess_ind, 'tag']
         assert isinstance(tag, (str, type(None)))
         uuid = str(session_table.at[sess_ind, 'cnmf_uuid'])
-        sessinfo = cma.load_latest(mouse_id, sess_id, tag=tag, rec_type=rec_type)
+        sessinfo = cma.load_latest(mouse_id, int(sess_id), tag=tag, rec_type=rec_type)
         sessinfo.select_gridsearch_run(uuid=uuid, force_reload=False)
 
         # save thumbnails

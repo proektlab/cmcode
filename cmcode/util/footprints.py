@@ -226,7 +226,8 @@ def get_coms_3d(
     A: MaybeSparse, plane_shape: tuple[int, int], um_per_pixel_x: float, um_per_pixel_y: float,
     depths: onp.Array1D[np.floating], unit: Literal['um', 'pixels'] = 'pixels') -> scaled.ScaledDataFrame:
     """
-    Calculates the center of mass of each component (distance from top left corner of top plane)
+    Calculates the center of mass of each component
+    (distance from top left corner and using the given depths for each plane)
     This weights the 2D COMs according to the number of pixels
     The pixel size is taken into account, particularly spacing between z-planes which may be uneven.
     Return value is a 3D position object with vectors for x y and z positions in um.
@@ -237,7 +238,6 @@ def get_coms_3d(
     spacings: dict[str, Optional[float]] = {'y': um_per_pixel_y, 'x': um_per_pixel_x}
 
     depths = np.array(depths)
-    um_vals = (um_vals_y, um_vals_x, depths)
     # if the planes are uniform, we save the spacing; otherwise just set it to None
     spacings_z = np.diff(depths)
     if spacings_z.size > 0 and np.all(spacings_z == spacings_z[0]):
@@ -246,13 +246,14 @@ def get_coms_3d(
         spacings['plane'] = None
     
     # now actually calculate the COMs, interpreting dims as being in 3D
-    coms_3d_um = cmcustom.my_com(A, *um_vals)
+    coms_3d_um = cmcustom.my_com(A, um_vals_y, um_vals_x, depths)
 
     # if we want the result in pixels but the z-spacing is nonuniform, we have to interpolate
     if spacings['plane'] is None and unit == 'pixels':
         spacings.pop('plane')
         yx_df = scaled.make_um_df(coms_3d_um[:, :-1], pixel_size=spacings)
-        plane_pix = np.interp(coms_3d_um[:, -1], um_vals[-1], range(len(um_vals[-1])))
+        depth_sortinds = np.argsort(depths)  # np.interp requires sorted xp
+        plane_pix = np.interp(coms_3d_um[:, -1], depths[depth_sortinds], depth_sortinds)
         plane_df = scaled.make_pixel_df({'plane': plane_pix})
         coms_df = cast(scaled.ScaledDataFrame, pd.concat([yx_df, plane_df], axis=1))
     else:
