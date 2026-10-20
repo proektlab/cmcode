@@ -9,3 +9,7 @@ __pycache__
 # Distribution/packaging
 *.egg-info/
 build/
+
+# Misc. filesystem stuff
+.DS_Store
+@eaDir

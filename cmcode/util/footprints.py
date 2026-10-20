@@ -477,7 +477,7 @@ def make_footprint_interpolator(footprints: onp.ToArrayStrict2D, zs: Union[Seque
     The length of zs should equal footprints.shape[0]. Typically this is in um although it only has to be in the 
         same unit as z_border.
     z_border is the maximum distance past the edge where the footprint might be nonzero;
-        z values less than min(zs) - z_border or greater than max(zs) + z_border will always yiels all 0s.
+        z values less than min(zs) - z_border or greater than max(zs) + z_border will always yield all 0s.
     mss_kwargs are passed on to make_smoothing_spline. For example, "lam" controls the smoothness (larger = smoother);
         by default this is estimated automatically.
     The return value of the interpolator will be a vector, again flattened in F-order.
