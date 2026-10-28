@@ -322,9 +322,9 @@ def _validate_or_write_missing_params_files(sessdata: 'cma.SessionAnalysis'):
     if sessdata.cnmf_fit_filename is not None:
         try:
             if not sessdata.result_file_matches_params(
-                sessdata.cnmf_fit_filename, cmp.AnalysisStage.CNMF, raise_on_missing_params=True):
+                sessdata.cnmf_fit_filename, cmp.AnalysisStage.CNMF_POST, raise_on_missing_params=True):
                 logging.warning('CNMF had non-matching parameters')
-                sessdata.invalidate_from_stage(cmp.AnalysisStage.CNMF)
+                sessdata.invalidate_from_stage(cmp.AnalysisStage.CNMF_POST)
         except FileNotFoundError:
             logging.info('Params file not found for CNMF')
             # find params from the CNMF object itself and write missing params file

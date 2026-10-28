@@ -1,4 +1,5 @@
 """Wrappers for CNMF and Estimates classes"""
+from collections.abc import Sequence
 from copy import copy
 from dataclasses import dataclass, asdict
 from functools import lru_cache
@@ -18,9 +19,10 @@ from pandas import NA
 from scipy import sparse
 from scipy.interpolate import PchipInterpolator, interp1d
 from caiman.source_extraction.cnmf import cnmf, params, merging
+from caiman.source_extraction.cnmf.utilities import detrend_df_f
 
 from cmcode import alignment, caiman_params as cmp
-from cmcode.cmcustom import compute_snr_gamma
+from cmcode.cmcustom import compute_snr_gamma, get_ROIs_to_merge_w_dilation
 from cmcode.util import paths, types
 
 @dataclass
@@ -56,6 +58,8 @@ class EstimatesExt(cnmf.Estimates):
         self.snr_type: Literal['normal', 'gamma'] = getattr(base_obj, 'snr_type', 'normal')
         self.snr_gamma_vals: Optional[np.ndarray] = getattr(base_obj, 'snr_gamma_vals', None)
         self.crossplane_merge_thr_used: Optional[float] = getattr(base_obj, 'crossplane_merge_thr_used', None)
+        self.have_post_merged_within_planes: bool = getattr(base_obj, 'have_post_merged_within_planes', False)
+        self.dilation_used: int = getattr(base_obj, 'dilation_used', 0)
     
     def __getattribute__(self, name):
         """defer to estimates object"""
@@ -93,7 +97,7 @@ class EstimatesExt(cnmf.Estimates):
         """Combines automatic evaluation and manual curation to produce idx_components"""
         if self.idx_components_eval is None:
             return None
-        return np.setdiff1d(np.union1d(self.accepted_list, self.idx_components_eval), self.rejected_list)
+        return np.setdiff1d(np.union1d(self.accepted_list, self.idx_components_eval), self.rejected_list).astype(int)
 
     @idx_components.setter
     def idx_components(self, _):
@@ -104,7 +108,7 @@ class EstimatesExt(cnmf.Estimates):
         """Combines automatic evaluation and manual curation to produce idx_components_bad"""
         if self.idx_components_bad_eval is None:
             return None
-        return np.setdiff1d(np.union1d(self.rejected_list, self.idx_components_bad_eval), self.accepted_list)
+        return np.setdiff1d(np.union1d(self.rejected_list, self.idx_components_bad_eval), self.accepted_list).astype(int)
     
     @idx_components_bad.setter
     def idx_components_bad(self, _):
@@ -315,15 +319,23 @@ class EstimatesExt(cnmf.Estimates):
         if self.F_dff_denoised is not None:
             self.F_dff_denoised = interpolate_each_trial(self.F_dff_denoised, method=method)
     
-    def merge_components_crossplane(self, n_planes: int, params: params.CNMFParams, thr: Optional[float] = 0.7) -> int:
+    def merge_components_crossplane(
+        self, dims: tuple[int, int], n_planes: int, params: params.CNMFParams, dff_params: cmp.DffParams,
+        thr: Optional[float] = 0.7, include_within_planes=True, dilation=0) -> int:
         """
         Merge components across planes as if they were in the same plane, by flattening A
         Returns number of sets that were merged.
         """
-        if self.crossplane_merge_thr_used is not None:
-            raise RuntimeError(f'Crossplane merging already run with threshold {self.crossplane_merge_thr_used}; cannot re-run.')
+        # this is a semi-irreversible operation, so check that what we want to do is valid
+        old_thr = self.crossplane_merge_thr_used
+        if old_thr is not None and (thr is None or thr > old_thr):
+            raise RuntimeError(f'Merging cannot be redone with a higher threshold (previously: {old_thr}; requested: {thr}')
         
-        self.crossplane_merge_thr_used = thr
+        if self.have_post_merged_within_planes and not include_within_planes:
+            raise RuntimeError('Cannot do only-crossplane merging when merging within planes has been done')
+        
+        if self.dilation_used > dilation:
+            raise RuntimeError(f'Merging cannot be redone with a lower dilation (previously: {self.dilation_used})')
 
         if thr is None:
             return 0
@@ -333,30 +345,120 @@ class EstimatesExt(cnmf.Estimates):
         A = est.A
         if not isinstance(A, sparse.csc_matrix):
             A = sparse.csc_matrix(A)
-        plane_pixels = A.shape[0] // n_planes
-        plane_per_comp = A.indices[A.indptr[:-1]] // plane_pixels  # assumes each comp is just in one plane
-        A_flat = sparse.csc_matrix((A.data, A.indices % plane_pixels, A.indptr), shape=(plane_pixels, A.shape[1]))
+
+        nr_orig = A.shape[1]
+
+        plane_pixels = dims[0] * dims[1]
+        planes_per_comp = np.zeros((nr_orig, n_planes), dtype=bool)
+
+        # this will create duplicate entries if there are already cross-plane components,
+        # but it's fine, they will be summed which is what we want
+        A_flat = sparse.csc_matrix((A.data, A.indices % plane_pixels, A.indptr), shape=(plane_pixels, nr_orig))
 
         # find which components to merge
-        rois_to_merge = merging.get_ROIs_to_merge(A_flat, self.C, thr=thr)[0]
+        if dilation == 0:
+            rois_to_merge = merging.get_ROIs_to_merge(A_flat, self.C, thr=thr)[0]
+        else:
+            rois_to_merge = get_ROIs_to_merge_w_dilation(A_flat, self.C, dims=dims, thr=thr, dilation=dilation)[0]
 
-        # only keep groups that span more than one plane
-        rois_to_merge = [group for group in rois_to_merge if not np.all(np.diff(plane_per_comp[group]) == 0)]
+        if not include_within_planes:
+            # get plane(s) each component occupies
+            if old_thr is None:
+                # we can assume each comp is just in one plane - use the first index
+                nonempty_comps = A.getnnz(axis=0) > 0
+                plane_per_comp = A.indices[A.indptr[:-1]] // plane_pixels
+                planes_per_comp[nonempty_comps, plane_per_comp[nonempty_comps]] = True
+            else:
+                inds, nonempty_comps = A.nonzero()
+                planes = inds // plane_pixels
+                planes_per_comp[nonempty_comps, planes] = True
+
+            # only keep groups that span more than one plane
+            rois_to_merge = [group for group in rois_to_merge if np.sum(np.any(planes_per_comp[group], axis=0)) > 1]
 
         n_to_merge = len(rois_to_merge)
         if n_to_merge > 0:
             # now merge the original components using manual_merge
             self.estimates.manual_merge(rois_to_merge, params=params)
 
+            merged_comps = np.concatenate(rois_to_merge)
+            kept_comps = np.setdiff1d(range(nr_orig), merged_comps).astype(int)
+            new_comps = range(len(kept_comps), len(kept_comps) + len(rois_to_merge))
+            assert self.estimates.C is not None and len(kept_comps) + len(new_comps) == self.estimates.C.shape[0], \
+                'my assumptions are wrong...'
+
             # invalidate evaluation stuff which will have to be re-run
-            for field in ['F_dff', 'SNR_comp', 'r_values', 'cnn_preds', 'idx_components', 'idx_components_bad']:
+            for field in ['SNR_comp', 'r_values', 'cnn_preds', 'idx_components', 'idx_components_bad']:
                 setattr(self.estimates, field, None)
             
-            self.F_dff_denoised = None
             self.snr_gamma_vals = None
-            self.accepted_list = np.array([], dtype=int)
-            self.rejected_list = np.array([], dtype=int)
+
+            # subset and recompute df/f
+            if self.F_dff is not None:
+                logging.info('Computing df/f of merged components')
+                F_dff_of_new = self.calc_df_over_f(use_residuals=True, roi_subset=new_comps, dff_params=dff_params)
+                self.F_dff = np.concatenate([self.F_dff[kept_comps, :], F_dff_of_new], axis=0)
+                
+            if self.F_dff_denoised is not None:
+                logging.info('Computing denoised df/f of merged components')
+                F_dff_denoised_of_new = self.calc_df_over_f(use_residuals=False, roi_subset=new_comps, dff_params=dff_params)
+                self.F_dff_denoised = np.concatenate([self.F_dff_denoised[kept_comps, :], F_dff_denoised_of_new], axis=0)
+
+            # now keep accepted_list and rejected_list, for kept neurons, to avoid duplicating work
+            mapping_mat = np.zeros(nr_orig, dtype=int)
+            mapping_mat[kept_comps] = range(len(kept_comps))
+
+            acc_new = mapping_mat[self.accepted_list]
+            self.accepted_list = acc_new[acc_new != 0]
+
+            rej_new = mapping_mat[self.rejected_list]
+            self.rejected_list = rej_new[rej_new != 0]
+
+        # record what operations were done
+        self.crossplane_merge_thr_used = thr
+        self.have_post_merged_within_planes = include_within_planes
+        self.dilation_used = dilation
         return n_to_merge
+
+
+    def calc_df_over_f(
+        self, use_residuals=True, roi_subset: Optional[Sequence[int]] = None, dff_params=cmp.DffParams()) -> onp.Array2D[np.floating]:
+        """
+        Calculates dF/F using CaImAn background components to define baseline, which is the default in CaImAn.
+        The default here is now to use residuals, i.e. not just rescale the "denoised" traces (C) from CaImAn.
+        However, both could potentially be useful - including noise is more trustworthy for initial evaluation/
+        data inspection, whereas the denoised dF/F could be better to feed into a downstream analysis.
+
+        Update 8/11/25: considering changing the default number of frames the baseline is calculated over from 500 to 5000
+        because I saw that what was being removed looked more like a scaled version of the original data than a trend.
+        However, still looking into this.
+        """
+        if self.A is None or self.b is None or self.C is None or self.f is None or self.YrA is None:
+            raise RuntimeError('CNMF fit is not complete; do not have data needed for dF/F')
+
+        if roi_subset is not None:
+            A = self.A[:, roi_subset]
+            C = self.C[roi_subset]
+            YrA = self.YrA[roi_subset]
+        else:
+            A = self.A
+            C = self.C
+            YrA = self.YrA
+
+        dff = detrend_df_f(
+            A, self.b, C, self.f, YrA if use_residuals else None, flag_auto=dff_params.auto_pctile,
+            quantileMin=dff_params.baseline_pctile, frames_window=dff_params.baseline_window)  # type: ignore
+        assert isinstance(dff, np.ndarray), 'detrend_df_f returned something unexpected'
+        return dff
+
+
+    def fill_dff_raw(self, dff_params=cmp.DffParams()):
+        """Calculate and set F_dff"""
+        self.F_dff = self.calc_df_over_f(use_residuals=True, dff_params=dff_params)
+
+    def fill_dff_denoised(self, dff_params=cmp.DffParams()):
+        """Calculate and set F_dff_denoised"""
+        self.F_dff_denoised = self.calc_df_over_f(use_residuals=False, dff_params=dff_params)
 
 
 class CNMFExt(cnmf.CNMF):

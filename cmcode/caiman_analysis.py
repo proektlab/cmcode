@@ -31,7 +31,6 @@ from scipy import sparse
 import caiman as cm
 from caiman.base.movies import get_file_size, load_iter
 from caiman.source_extraction.cnmf.params import CNMFParams
-from caiman.source_extraction.cnmf.utilities import detrend_df_f
 from caiman.utils import sbx_utils
 from caiman.utils.visualization import view_quilt
 import mesmerize_core as mc
@@ -188,7 +187,8 @@ class SessionAnalysis:
         self.plane_tifs: Optional[list[str]] = None      # flag for CONVERT stage; paths to plane TIF files
         self.mc_result: Optional[mcorr.MCResult] = None  # flag for MCORR stage; results of motion correction
         self.mmap_file_transposed: Optional[str] = None  # flag for TRANSPOSE stage; transposed, concatenated video
-        self.cnmf_fit_filename: Optional[str] = None     # flag for CNMF stage; path to save location for CNMF results (HDF5 file)
+        self._cnmf_uuid: Optional[str] = None             # flag for CNMF stage (property reads from cnmf_fit_filename first)
+        self.cnmf_fit_filename: Optional[str] = None     # flag for CNMF_POST stage; path to save location for CNMF results (HDF5 file)
 
         self.params_to_search: Optional[Union[ParamGrid, Sequence[ParamGrid]]] = None   # used if we are doing a CNMF gridsearch
 
@@ -256,6 +256,9 @@ class SessionAnalysis:
                 # re-read metadata
                 self.read_metadata(verbose=False)
 
+            # fix int16 plane size
+            self.metadata['frame_size'] = [int(sz) for sz in self.metadata['frame_size']]
+
     @property
     def trial_numbers(self) -> np.ndarray:
         nums, b_valid = get_trial_numbers_from_files(self.sbx_files)
@@ -271,6 +274,28 @@ class SessionAnalysis:
             # do not care about downsampling for frames per trial
             self._frames_per_trial = np.array([sbx_utils.sbx_shape(fn)[-1] for fn in self.sbx_files])
         return self._frames_per_trial
+
+
+    @property
+    def cnmf_uuid(self) -> Optional[str]:
+        """
+        read UUID from cnmf_fit_filename, falling back to _cnmf_uuid if unset
+        (checking that the result still exists)
+        """
+        if (uuid := self.get_selected_uuid()) is None and (uuid := self._cnmf_uuid) is not None:
+            # check it hasn't been deleted
+            batch = self.get_gridsearch_results()
+            if uuid not in batch.uuid.values:
+                uuid = None
+        self._cnmf_uuid = uuid
+        return uuid
+
+    @cnmf_uuid.setter
+    def cnmf_uuid(self, value: Optional[str]):
+        # potentially unset cnmf_fit_filename if they don't match
+        if self.cnmf_fit_filename is not None and self.get_selected_uuid() != value:
+            self.cnmf_fit_filename = None  
+        self._cnmf_uuid = value
 
 
     @property
@@ -355,7 +380,7 @@ class SessionAnalysis:
     
     @property
     def crossplane_merge_thr(self) -> Optional[float]:
-        return self.params.cnmf_extra.crossplane_merge_thr
+        return self.params.cnmf_post.crossplane_merge_thr
     
     @property
     def highpass_cutoff(self) -> float:
@@ -372,10 +397,12 @@ class SessionAnalysis:
             return AnalysisStage.CONVERT
         if self.mmap_file_transposed is None:
             return AnalysisStage.MCORR
-        if self.cnmf_fit is None:
+        if self.cnmf_uuid is None:
             return AnalysisStage.TRANSPOSE
-        if self.cnmf_fit.estimates.F_dff_denoised is None:
+        if self.cnmf_fit is None:
             return AnalysisStage.CNMF
+        if self.cnmf_fit.estimates.F_dff_denoised is None:
+            return AnalysisStage.CNMF_POST
         if self.cnmf_fit.estimates.idx_components_eval is None:
             return AnalysisStage.DFF
         return AnalysisStage.EVAL
@@ -386,6 +413,9 @@ class SessionAnalysis:
         meta = sbx_utils.sbx_meta_data(self.sbx_files[file_ind])
         if meta['ended_time'] is None:
             logging.warning("Ended time is missing from at least the first SBX file's metadata. Inferring from modified time instead.")
+
+        # potentially other values might have to be converted from small integer types
+        meta['frame_size'] = [int(sz) for sz in meta['frame_size']]
 
         if verbose:
             logging.info(f'Shape of SBX file #{file_ind}: ' + 
@@ -411,8 +441,11 @@ class SessionAnalysis:
         
         if stage <= AnalysisStage.TRANSPOSE:
             self.mmap_file_transposed = None
-        
+
         if stage <= AnalysisStage.CNMF:
+            self.cnmf_uuid = None
+        
+        if stage <= AnalysisStage.CNMF_POST:
             self.cnmf_fit_filename = None
             self._cnmf_fit = None
 
@@ -439,7 +472,9 @@ class SessionAnalysis:
             case AnalysisStage.TRANSPOSE:
                 self.concat_and_transpose(load=load, save=save)
             case AnalysisStage.CNMF:
-                self.do_cnmf(load=load, save=save)
+                self.do_cnmf(load=load, save=save, do_postprocessing=False)
+            case AnalysisStage.CNMF_POST:
+                self.do_cnmf_postprocessing(load=load, save=save)  # also includes DFF and EVAL
             case AnalysisStage.DFF:
                 self.make_df_over_f(recalc=(load is False), save=save)
             case AnalysisStage.EVAL:
@@ -463,6 +498,8 @@ class SessionAnalysis:
                     excs.append(e)
                 else:
                     raise
+            if next_stage == AnalysisStage.CNMF_POST:
+                break  # this does all remaining stages
         
         if save:
             self.save(save_cnmf=stage >= AnalysisStage.CNMF)
@@ -1281,7 +1318,7 @@ class SessionAnalysis:
         patch_ax.set_title(f'width={patch_width}\noverlap={patch_overlap}')
     
 
-    def do_cnmf(self, load: Optional[bool] = None, save=True) -> None:
+    def do_cnmf(self, load: Optional[bool] = None, do_postprocessing=True, save=True) -> None:
         """
         Do or load CNMF.
 
@@ -1290,10 +1327,14 @@ class SessionAnalysis:
             True: use previous results if params match, otherwise raise NoMatchingResultError
             False: recompute results even if they already exist.
 
+        do_postprocessing: If true, also bundles postprocessing steps (including dff and eval)
+            into the same call. Estimates are unavailable until postprocessing is run.
+
         save: Whether to save updated cnmf results path in pkl file (data file will be saved regardless)
         """
-        uuid, _ = self.start_cnmf_with_mescore(load=load, backend='local', wait=True)
-        self.finish_cnmf_processing(uuid, save=save)
+        self.cnmf_uuid, _ = self.start_cnmf_with_mescore(load=load, backend='local', wait=True)
+        if do_postprocessing:
+            self.do_cnmf_postprocessing(load=load, save=save)
 
 
     def start_cnmf_with_mescore(self, load: Optional[bool] = None, backend='local_async', wait=False,
@@ -1403,58 +1444,103 @@ class SessionAnalysis:
         return uuid, proc
     
 
-    def finish_cnmf_processing(self, finished_or_loaded_cnmf_uuid: str, save=True):
+    def do_cnmf_postprocessing(self, load: Optional[bool] = None, save=True):
         """
         Post-processing to do after a mesmerize CNMF run has finished or been loaded,
         to select (load) the run and ensure results match cnmf_extra and eval parameters.
+
+        The logic here is: we have target parameters in self.params, and we load the given 
+        CNMF run which may not match these perfectly (i.e., in the cnmf_extra, dff and quality sections).
+        We try to do post-processing to make this CNMF run match the target parameters.
+        If possible, the run stays selected; if not, it is invalidated (making no run selected).
 
         save: Whether to save selection/params changes to pkl file
         """
         # Load results from mesmerize. We want the params actually used to match current self.params
         # once this method is done.
         target_params = self.params
-        self.select_gridsearch_run(finished_or_loaded_cnmf_uuid, quiet=True, save=save)
+
+        # we have to force_reload because we want to load params even if the current uuid matches
+        # use enforce_matches_to_cnmf to fail if our target_params don't match at least to the CNMF stage
+        self.select_cnmf_run(quiet=True, force_reload=True, enforce_matches_to_cnmf=True, save=False)
+
         assert self.cnmf_fit is not None, 'cnmf_fit must be assigned if select_gridsearch_run succeeds'
+        diff_params = self.params.get_differing_params(target_params, metadata=self.metadata)
+        self.params = target_params # reset from temporary variable
 
         # fix remaining differences
-        do_crossplane_merge = False
-        redo_eval = False
-        diff_params = self.params.get_differing_params(target_params, metadata=self.metadata)
-        self.params = target_params  # reset from temporary variable
+        do_crossplane_merge = load is False
+        redo_eval = load is False
 
         for diff_param in diff_params:
-            if diff_param == 'cnmf_extra.crossplane_merge_thr':
-                do_crossplane_merge = self.metadata['num_planes'] > 1  # only matters if there are at least 2 planes
+            if load is True:
+                self.invalidate_from_stage(cmp.AnalysisStage.CNMF_POST)
+                raise NoMatchingResultError('CNMF run could not be just loaded; params did not match')
+            elif diff_param in ('cnmf_post.crossplane_merge_thr', 'cnmf_post.post_merge_within_planes', 'cnmf_post.post_merge_dilation'):
+                do_crossplane_merge = True
             elif diff_param.split('.')[0] in cmp.EvalParamStruct.model_fields:
                 redo_eval = True
             else:
-                self.invalidate_from_stage(cmp.AnalysisStage.CNMF)
-                raise RuntimeError('Unexpected differences between current parameters and those used in CNMF run; invalidating')
+                self.invalidate_from_stage(cmp.AnalysisStage.CNMF_POST)
+                raise RuntimeError('Passed params cannot be satisfied with current CNMF results')
+
+        if load is True:
+            # if all params match, we should be fine; make sure we don't recompute any data
+            if save:
+                self.save(save_cnmf=True)
+            return
+
+        # before anything else, ensure we're accounting for any downsamping
+        if self.downsample_factor is not None:
+            try:
+                assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
+                self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)
+            except Exception as e:
+                self.invalidate_from_stage(AnalysisStage.CNMF_POST)
+                raise RuntimeError('Downsampling failed') from e
 
         # do crossplane merging if necessary
         if do_crossplane_merge:
-            logging.info('Doing crossplane merging')
-            n_merged = self.cnmf_fit.estimates.merge_components_crossplane(
-                n_planes=self.metadata['num_planes'], params=self.cnmf_fit.params, thr=self.crossplane_merge_thr)
-            logging.info(f'Merged {n_merged} sets of components')
-            if n_merged > 0:
-                logging.info('Redoing evaluation after merging')
-                redo_eval = True
+            try:
+                if not self.params.cnmf_post.post_merge_within_planes:
+                    logging.info('Doing crossplane merging')
+                elif (dil := self.params.cnmf_post.post_merge_dilation) > 0:
+                    logging.info(f'Redoing merging with dilation of {dil} pixel(s)')
+                else:
+                    logging.info(f'Redoing merging with threshold of {self.crossplane_merge_thr}')
+
+                n_merged = self.cnmf_fit.estimates.merge_components_crossplane(
+                    dims=self.plane_size, n_planes=self.metadata['num_planes'], params=self.cnmf_fit.params,
+                    dff_params=self.params.dff, thr=self.crossplane_merge_thr,
+                    include_within_planes=self.params.cnmf_post.post_merge_within_planes,
+                    dilation=self.params.cnmf_post.post_merge_dilation)
+
+                logging.info(f'Merged {n_merged} sets of components')
+                if n_merged > 0:
+                    logging.info('Redoing evaluation after merging')
+                    redo_eval = True
+            except Exception as e:
+                self.invalidate_from_stage(AnalysisStage.CNMF_POST)
+                raise RuntimeError('Post-processing failed') from e
         else:
             n_merged = 0
-        
+
+        try:
+            self.make_df_over_f(recalc=load is False, save=False)
+        except Exception as e:
+            self.invalidate_from_stage(AnalysisStage.DFF)
+            raise RuntimeError('dF/F computation failed') from e
+
         # redo evaluation after merging or switching SNR type
         if redo_eval:
             if n_merged == 0:
                 logging.info(f'Redoing evaluation with {self.snr_type} SNR type')
-            self.do_cnmf_evaluation(recalc=True)
+            try:
+                self.do_cnmf_evaluation(recalc=True, save=False)
+            except Exception as e:
+                self.invalidate_from_stage(AnalysisStage.EVAL)
+                raise RuntimeError('Eval failed') from e
 
-        self.make_df_over_f(recalc=False)
-
-        if self.downsample_factor is not None:
-            assert self.frames_per_trial is not None, 'frames per trial should be set during conversion'
-            self.cnmf_fit.estimates.interpolate_t(self.downsample_factor, self.frames_per_trial)
-        
         if save:
             self.save(save_cnmf=True)
 
@@ -1529,13 +1615,13 @@ class SessionAnalysis:
     
         if recalc or est.F_dff is None:
             logging.info('Calculating df/f')
-            est.F_dff = calc_df_over_f(est, use_residuals=True, **asdict(self.params.dff))
+            est.fill_dff_raw(self.params.dff)
         else:
             logging.info('Found df/f - not recalculating')
     
         if recalc or est.F_dff_denoised is None:
             logging.info('Calculating denoised df/f')
-            est.F_dff_denoised = calc_df_over_f(est, use_residuals=False, **asdict(self.params.dff))
+            est.fill_dff_denoised(self.params.dff)
         else:
             logging.info('Found denoised df/f - not recalculating')
 
@@ -1546,7 +1632,7 @@ class SessionAnalysis:
     #------------------------- ROI EVALUATION -----------------------------#
 
 
-    def do_cnmf_evaluation(self, recalc=False):
+    def do_cnmf_evaluation(self, recalc=False, save=True):
         """
         Recalculates idx_components based on automatic criteria.
         new_quality_params: Unused, throws an error if not None, use self.update_params({'quality': <new params>}) instead
@@ -1594,7 +1680,7 @@ class SessionAnalysis:
 
         # re-save cnmf object with evaluation data added
         logging.info('Re-saving CNMF object with evaluation data')
-        self.save(save_cnmf=True, save_analysis=False)  # nothing should have changed in SessionAnalysis
+        self.save(save_cnmf=save, save_analysis=False)  # nothing should have changed in SessionAnalysis
 
     
     #--------------------- ACCESSING CNMF RESULTS -----------------------------#
@@ -1665,8 +1751,9 @@ class SessionAnalysis:
         return pd.DataFrame(records, dtype=object, index=sub_df.index)
             
 
-    def select_gridsearch_run(self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
-                              allow_rerunning_prereqs=False, save=True) -> str:
+    def select_cnmf_run(
+        self, uuid: Optional[str] = None, *_, index=None, quiet=False, force_reload=True,
+        allow_rerunning_prereqs=False, enforce_matches_to_cnmf=False, save=True) -> str:
         """
         Select a CNMF gridsearch run by either UUID or index in the dataframe, and make it the current run
         Sets params and prerequisite and CNMF outputs to match the selected run
@@ -1675,44 +1762,42 @@ class SessionAnalysis:
         allow_rerunning_prereqs: Set to true to re-compute prerequisites (motion correction, etc.) 
             rather than just loading if outputs matching the saved params are not found (or if it's indeterminate)
 
+        enforce_matches_to_cnmf: Only load if the params for this run match up to at least the CNMF
+            stage (thus, not requiring another CNMF run to match the current params).
+            Used to ensure validity when performing CNMF post-processing.
+
         save: Whether to save the selection in the pkl file (including any loaded/re-run data)
         """
         if index is not None and uuid is not None:
             raise ValueError('Cannot specify both uuid and index')
         
-        if index is None and uuid is None:
-            raise ValueError('Must specify either uuid or index')
+        df = self.get_gridsearch_results()
+
+        if uuid is None:
+            if index is not None:
+                uuid = cast(str, df.iloc[index].uuid)
+            else:
+                logging.info('Loading current CNMF run')
+                if self.cnmf_uuid is None:
+                    # try loading
+                    logging.info('No current CNMF UUID; trying to load')
+                    self.do_cnmf(load=True)
+                    # if successful, this also calls select_cnmf_run so we should be done
+                    assert (uuid := self.cnmf_uuid) is not None
+                    return uuid
+                else:
+                    uuid = self.cnmf_uuid
 
         if not force_reload:
             # see if it is already loaded
             curr_uuid = self.get_selected_uuid()
-            if index is not None:
-                curr_idx = self.get_selected_index()
-                matched = curr_idx is not None and curr_idx == index
-            else:
-                assert uuid is not None
-                matched = curr_uuid is not None and curr_uuid == uuid
-
-            if matched:
-                assert curr_uuid is not None
+            if curr_uuid is not None and curr_uuid == uuid:
                 if not quiet:
                     logging.info('Requested CNMF run is already selected')
+                self.cnmf_uuid = uuid
                 return curr_uuid
 
-        df = self.get_gridsearch_results()
-
-        if index is not None:
-            try:
-                row = cast(MescoreSeries, df.iloc[index])
-                uuid = str(row.uuid)
-            except KeyError:
-                raise ValueError(f'Index {index} not present in gridsearch dataframe')
-        else:
-            assert uuid is not None
-            rows = df.loc[df.uuid == uuid]
-            if len(rows) != 1:
-                raise ValueError(f'UUID {uuid} not present in gridsearch dataframe')
-            row = cast(MescoreSeries, rows.iloc[0])
+        row = cast(MescoreSeries, df.caiman.uloc(uuid))
 
         if row.outputs is None or not row.outputs['success']:
             raise RuntimeError('Run has not completed or did not succeed')
@@ -1728,6 +1813,9 @@ class SessionAnalysis:
         try:
             loaded_params = cmp.SessionAnalysisParams.read_from_file(params_path)
             stage_to_invalidate = self.params.get_first_nonmatching_stage(loaded_params, metadata=self.metadata)
+            if enforce_matches_to_cnmf and stage_to_invalidate <= AnalysisStage.CNMF:
+                raise NoMatchingResultError('Result does not match up to CNMF params; not selected')
+
             self.invalidate_from_stage(stage_to_invalidate)
             self.params = loaded_params
 
@@ -1747,6 +1835,7 @@ class SessionAnalysis:
                 'The CNMF result will still be loaded, but some functionality may not work '
                 'without re-running to get the missing results (see exception info).', exc_info=e)
 
+        self.cnmf_uuid = uuid
         self.cnmf_fit_filename = cnmf_path
         cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=quiet)
         self.cnmf_fit = cnmf_fit
@@ -1761,15 +1850,15 @@ class SessionAnalysis:
         df = self.get_gridsearch_results()
         df_successful = df.loc[[out is not None and out['success'] for out in df.outputs], :]
         if df_successful.shape[0] == 1:
-            return self.select_gridsearch_run(uuid=df_successful.iloc[0].uuid, quiet=quiet)
+            return self.select_cnmf_run(uuid=df_successful.iloc[0].uuid, quiet=quiet)
         else:
             return None
         
     def get_selected_index(self) -> Optional[int]:
-        """Get index of selected CNMF run in gridsearch results table, if any"""
+        """Get index of selected CNMF run (i.e., loaded, post-processed results), if any"""
         if self.cnmf_fit_filename is None:
             return None
-        
+
         try:
             batch = self.get_gridsearch_results()
         except NoBatchFileError:
@@ -1788,11 +1877,63 @@ class SessionAnalysis:
         return None
         
     def get_selected_uuid(self) -> Optional[str]:
+        """Get UUID of selected CNMF run (i.e., loaded, post-processed results), if any"""
         index = self.get_selected_index()
         if index is not None:
             batch = self.get_gridsearch_results()
             return str(batch.loc[index, 'uuid'])
         return None
+
+
+    def clone_cnmf_result(self, select_new=True) -> str:
+        """
+        Create a new entry in the batch (and results folder on disk) that is
+        identical to the currently selected one. Returns new UUID.
+        """
+        if (curr_uuid := self.cnmf_uuid) is None:
+            raise RuntimeError('No current CNMF result; cannot clone')
+        
+        batch = self.get_gridsearch_results()
+        item = cast(MescoreSeries, batch.caiman.uloc(curr_uuid))
+
+        # create new item to get a new uuid
+        batch.caiman.add_item(
+            algo=item.algo,
+            item_name=item.item_name,
+            input_movie_path=item.input_movie_path,
+            params=item.params
+        )
+        new_uuid: str = batch.iloc[-1].uuid
+        if item.outputs is not None:
+            new_outputs = {
+                key: val.replace(curr_uuid, new_uuid) if isinstance(val, str) else val
+                for key, val in item.outputs.items()
+            }
+        else:
+            new_outputs = None
+
+        batch.caiman.update_item(index=-1, updates={
+            'outputs': new_outputs,
+            'ran_time': item.ran_time,
+            'algo_duration': item.algo_duration,
+            'comments': item.comments
+        })
+
+        # create new folder and copy results files
+        batch_path = batch.paths.get_batch_path()
+        curr_output_dir = batch_path.parent / curr_uuid
+        new_output_dir = batch_path.parent / new_uuid
+        new_output_dir.mkdir()
+
+        for res_path in curr_output_dir.iterdir():
+            filename = res_path.name
+            new_path = new_output_dir / filename.replace(curr_uuid, new_uuid)
+            shutil.copyfile(res_path, new_path)
+        
+        if select_new:
+            self.select_cnmf_run(new_uuid)
+
+        return new_uuid
     
 
     def get_relative_depths(self) -> onp.Array1D[np.integer]:
@@ -1904,7 +2045,7 @@ class SessionAnalysis:
 
 
     def save_estimates(self, save_background=False, format: Literal['.mat', '.npz'] = '.mat', 
-                       separate_metadata=True, force_dff=True) -> tuple[str, str]:
+                       separate_metadata=True, force_dff=True, save_fluor_data=True) -> tuple[str, str]:
         """
         Export CNMF results to .mat or .npz data file.
         If separate_metadata is true, info about the recording and each cell is reformatted into a 
@@ -1918,6 +2059,10 @@ class SessionAnalysis:
             else:
                 logging.info(f'Auto-selected successful run with uuid {uuid}')
                 assert self.cnmf_fit_filename is not None
+
+        if not save_fluor_data and not separate_metadata:
+            logging.warning('Cannot save metadata without fluorescence data when separate_metadata is False; overwriting')
+            save_fluor_data = True
 
         # reload from disk (e.g. to sync changes from mesmerize_viz)
         cnmf_fit = cnmf_ext.load_CNMFExt(self.cnmf_fit_filename, dview=cluster.dview, quiet=True)
@@ -1969,15 +2114,16 @@ class SessionAnalysis:
             save_data['com_3d'] = np.stack([save_data['com_3d'].y, save_data['com_3d'].x, save_data['com_3d'].plane],
                                            axis=1)
 
-        if format == '.mat':
-            # truncate_existing is necessary to avoid error re-saving dict when file already exists (https://github.com/frejanordsiek/hdf5storage/issues/127)
-            savemat(filename_data, save_data, truncate_existing=True)
-        elif format == '.npz':
-            np.savez_compressed(filename_data, **save_data)
-        else:
-            raise RuntimeError('Unrecognized save format')
+        if save_fluor_data:
+            if format == '.mat':
+                # truncate_existing is necessary to avoid error re-saving dict when file already exists (https://github.com/frejanordsiek/hdf5storage/issues/127)
+                savemat(filename_data, save_data, truncate_existing=True)
+            elif format == '.npz':
+                np.savez_compressed(filename_data, **save_data)
+            else:
+                raise RuntimeError('Unrecognized save format')
         
-        logging.info(f'Saved estimates to {filename_data}')
+            logging.info(f'Saved estimates to {filename_data}')
 
         # save metadata
         if separate_metadata:
@@ -2651,37 +2797,6 @@ def identify_marked_rois(cnmf_obj: 'cnmf_ext.CNMFExt', cnmf_filename: Optional[s
         cnmf_ext.clear_cnmf_cache()
     else:
         logging.warning('CNMF not saved - no filename')
-
-
-def calc_df_over_f(est: cnmf_ext.EstimatesExt, use_residuals=True, roi_subset: Optional[Sequence[int]] = None,
-                   baseline_pctile=8., auto_pctile=False, baseline_window: Optional[int] = 500) -> np.ndarray:
-    """
-    Calculates dF/F using CaImAn background components to define baseline, which is the default in CaImAn.
-    The default here is now to use residuals, i.e. not just rescale the "denoised" traces (C) from CaImAn.
-    However, both could potentially be useful - including noise is more trustworthy for initial evaluation/
-    data inspection, whereas the denoised dF/F could be better to feed into a downstream analysis.
-
-    Update 8/11/25: considering changing the default number of frames the baseline is calculated over from 500 to 5000
-    because I saw that what was being removed looked more like a scaled version of the original data than a trend.
-    However, still looking into this.
-    """
-    if est.A is None or est.b is None or est.C is None or est.f is None or est.YrA is None:
-        raise RuntimeError('CNMF fit is not complete; do not have data needed for dF/F')
-
-    if roi_subset is not None:
-        A = est.A[:, roi_subset]
-        C = est.C[roi_subset]
-        YrA = est.YrA[roi_subset]
-    else:
-        A = est.A
-        C = est.C
-        YrA = est.YrA
-
-    dff = detrend_df_f(
-        A, est.b, C, est.f, YrA if use_residuals else None, flag_auto=auto_pctile,
-        quantileMin=baseline_pctile, frames_window=baseline_window)  # type: ignore
-    assert isinstance(dff, np.ndarray), 'detrend_df_f returned something unexpected'
-    return dff
 
 
 def tabularize_estimates_metadata(estimates_data: dict, *, com_3d: ScaledDataFrame, SNR_comp: np.ndarray, r_values: np.ndarray,

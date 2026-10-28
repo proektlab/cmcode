@@ -1,13 +1,15 @@
 from collections.abc import Mapping, Sequence, Iterable
 from copy import deepcopy
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, InitVar
 from datetime import date
+from functools import partial
 from itertools import pairwise, chain
 import logging
 import math
 import os
 import pickle
-from typing import Optional, Literal, Union, cast
+from typing import Optional, Literal, Union, cast, Protocol, Any
+from typing_extensions import Self
 
 import caiman as cm
 from caiman.base.rois import com, distance_masks, find_matches
@@ -25,8 +27,8 @@ from pandas._libs.missing import NAType
 from scipy import sparse, signal, optimize, stats, interpolate
 
 from cmcode import caiman_analysis as cma
-from cmcode.cmcustom import compute_matching_performance
-from cmcode.util import footprints
+from cmcode.cmcustom import compute_matching_performance, my_com, distance_masks_per_plane
+from cmcode.util import footprints as footprint_utils
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files, get_trial_numbers_from_files
 from cmcode.util.image import (BorderSpec, remap_points, remap_points_from_df,
                                remap_image, shift_image, calc_weighted_median)
@@ -617,7 +619,7 @@ def get_daily_offsets_robust(mouse_id: Union[int, str], sess_ids: Union[Sequence
     for sess in sess_ids:
         for rec_type in ['learning_ppc_dlx', 'dlx_calibration']:  # use stack as backup for ref
             try:
-                sessinfo = cma.SessionAnalysis(mouse_id, sess_id=sess, rec_type=rec_type)
+                sessinfo = cma.SessionAnalysis(mouse_id, sess_id=int(sess), rec_type=rec_type)
             except RuntimeError as e:
                 if e.args[0] == 'No .sbx files found':
                     if allow_gaps or rec_type == 'learning_ppc_dlx':
@@ -630,7 +632,7 @@ def get_daily_offsets_robust(mouse_id: Union[int, str], sess_ids: Union[Sequence
             scan_day = sessinfo.scan_day
             if scan_day is None:
                 raise RuntimeError(f'Could not determine scan day for session {sess}')
-            sess_dates[sess] = scan_day
+            sess_dates[int(sess)] = scan_day
             break
     
     sess_ids = list(sess_dates.keys())
@@ -844,7 +846,7 @@ def align_templates(
     template1: Union[onp.Array2D, Mapping[float, onp.Array2D]], 
     template2: Union[onp.Array2D, Mapping[float, onp.Array2D]], use_opt_flow=False,
     align_options: Optional[dict] = None, n_planes=1, border: Union[int, BorderSpec, Sequence[BorderSpec]] = 0,
-    template2_shift_guess: tuple[Union[float, onp.Array1D[np.floating]], Union[float, onp.Array1D[np.floating]]] = (0, 0)
+    template2_shift_guess: tuple[Union[float, onp.Array1D[np.floating]], Union[float, onp.Array1D[np.floating]]] = (0., 0.)
     ) -> tuple[np.ndarray, np.ndarray]:
     """
     Do just the template alignment step of registerROIs. This is just a single iteration of the
@@ -924,7 +926,7 @@ def align_templates(
 
         if plane_guess_y != 0 or plane_guess_x != 0:
             # shift plane2 based on shift guess and adjust borders
-            plane2 = shift_image(plane2, x_shift=plane_guess_x, y_shift=plane_guess_y)
+            plane2 = shift_image(plane2, x_shift=float(plane_guess_x), y_shift=float(plane_guess_y))
             plane_border = plane_border.shifted(x_shift=plane_guess_x, y_shift=plane_guess_y)
 
         # get just non-blacked out center to compute transform
@@ -1473,7 +1475,7 @@ class RegisterROIsResults:
 def register_ROIs(
         A1: MaybeSparse,
         A2: MaybeSparse,
-        dims: tuple[int, int],
+        dims: tuple[int, ...],
         template1: Optional[np.ndarray] = None,
         template2: Optional[np.ndarray] = None,
         align_flag=True,
@@ -1492,7 +1494,9 @@ def register_ROIs(
         align_options: Optional[dict] = None,
         n_planes=1,
         border: Union[BorderSpec, int] = 0,
-        template2_shift_guess: tuple[float, float] = (0, 0)) -> RegisterROIsResults:
+        template2_shift_guess: tuple[float, float] = (0, 0),
+        A1_has_comp_per_plane: Optional[onp.Array2D[np.bool_]] = None
+        ) -> RegisterROIsResults:
     """
     See caiman.base.rois.register_ROIs for documentation
     Modified to return both A1 (filtered taking max_thr or nrg_thr into account) and A2.
@@ -1501,6 +1505,8 @@ def register_ROIs(
     n_planes (positive int): if not equal to 1, separate planes along x axis before doing registration.
     border: border to exclude when doing registration
     D_pow_A2: if specified, raise distances (which are in range [0, 1]) to this power (should broadcast with D)
+    if A1_has_comp_per_plane is given, uses an algorithm that only considers pixels of A2 in planes that 
+        in which A1 has nonzero pixels (for each cell),
     """
 
     A1 = sparse.csc_matrix(A1, copy=D is None)  # must make a copy if we are computing distance matrix
@@ -1517,28 +1523,34 @@ def register_ROIs(
 
     if xy_remap is not None:
         # Build new A2 by remapping each ROI
-        A2_aligned = footprints.map_footprints(A2, xy_remap)
+        A2_aligned = footprint_utils.map_footprints(A2, xy_remap)
     else:
         A2_aligned = A2
 
     if D is None:
         if com1 is None:
-            com1 = com(A1, *dims)
+            com1 = my_com(A1, *dims)
     
         if com2 is None:
-            com2 = com(A2_aligned, *dims)
+            com2 = my_com(A2_aligned, *dims)
         elif xy_remap is not None:
             com2 = remap_points(com2, *xy_remap)
 
         # apply threshold (also for output)
+        A_tr = []
+
         for A in [A1, A2_aligned]:
-            footprints.threshold_sparse_footprints_inplace(A, method=thr_method, thr=thr)
+            if A.dtype.kind != 'b':  # (if not already binary)
+                footprint_utils.threshold_sparse_footprints_inplace(A, method=thr_method, thr=thr)
+                A_tr.append((A > 0).astype(float))  # binarize but keep as float
+            else:
+                A_tr.append(A.astype(float))
 
-        # binarize thresholded masks (but keep as float)
-        A1_tr = (A1 > 0).astype(float)
-        A2_tr = (A2_aligned > 0).astype(float)  # type: ignore
-
-        D = distance_masks([A1_tr, A2_tr], [com1, com2], max_dist, enclosed_thr=enclosed_thr)  # type: ignore
+        if A1_has_comp_per_plane is not None:
+            D = distance_masks_per_plane(A_tr, (com1, com2), max_dist,
+                use_comp_per_plane=(A1_has_comp_per_plane,), enclosed_thr=enclosed_thr)
+        else:
+            D = distance_masks(A_tr, [com1, com2], max_dist, enclosed_thr=enclosed_thr)  # type: ignore
 
     if D_pow is not None:
         D = [d ** D_pow for d in D]
@@ -1708,7 +1720,7 @@ def register_ROIs_multiple(
 
         A_union = sparse.csc_array(A2, copy=True)
         A_sess = sparse.csc_array(A[sess])
-        A_union[:, matched_union] = A_sess[:, matched_session]
+        A_union[:, matched_union] = A_sess[:, matched_session]  # type: ignore
         A_union = sparse.hstack((A_union, A_sess[:, nonmatch_session]))
         new_match = np.zeros(A_sess.shape[-1], dtype=int)
         new_match[matched_session] = matched_union
@@ -2003,7 +2015,7 @@ def load_multisession(multisession_res_path: str) -> dict:
                 included_rois: list[np.ndarray] = [] 
                 for sess_id, tag, uuid in zip(data['processed_sess_ids'], data['processed_tags'], data['cnmf_uuids']):
                     sessinfo = cma.load_latest(data['mouse_id'], sess_id, rec_type=data['rec_type'], tag=tag)
-                    sessinfo.select_gridsearch_run(uuid=uuid, force_reload=False, quiet=True)
+                    sessinfo.select_cnmf_run(uuid=uuid, force_reload=False, quiet=True)
                     assert sessinfo.cnmf_fit is not None and sessinfo.cnmf_fit.estimates.idx_components is not None, \
                         'No CNMF or evaluation results?'
                     included_rois.append(sessinfo.cnmf_fit.estimates.idx_components)
@@ -2081,7 +2093,7 @@ def save_matched_thumbnails(multisession_res: dict, union_cell_ids: onp.ToJustIn
         assert isinstance(tag, (str, type(None)))
         uuid = str(session_table.at[sess_ind, 'cnmf_uuid'])
         sessinfo = cma.load_latest(mouse_id, int(sess_id), tag=tag, rec_type=rec_type)
-        sessinfo.select_gridsearch_run(uuid=uuid, force_reload=False)
+        sessinfo.select_cnmf_run(uuid=uuid, force_reload=False)
 
         # save thumbnails
         saved_paths = sessinfo.save_roi_thumbnails(sess_cell_ids, **save_roi_thumbnails_opts)
@@ -2375,31 +2387,59 @@ def make_cross_session_projection(
     return avg_proj
 
 
-@dataclass(init=False)
-class SessionMappingData:
+@dataclass
+class SessionMappingData(Protocol):
     """Stores info about ROIs in a session and mappings to other sessions"""
-    sess_name: str
-    xy_mappings_to_others: dict[str, onp.Array3D[np.floating]]  # maps other session names to X/Y remappings
-    accepted: onp.Array1D[np.integer]  # idx_components
-    snr: onp.Array1D[np.floating]
-    uuid: str  # UUID of the CNMF run
-    matchings: onp.Array1D[np.integer]  # union cell IDs of matched components
-    session_cell_ids: onp.Array1D[np.integer]  # same length as matchings with the session cell IDs (defaults to all, in order)
-    scan_date: date  # scan day
+    mouse_id: Union[int, str] = field()  # explicit field() needed so type checker doesn't think it's abstract
+    sess_name: str = field()
+    xy_mappings_to_others: dict[str, onp.Array3D[np.floating]] = field()  # maps other session names to X/Y remappings
+    rec_type: InitVar[str] = 'learning_ppc'
+    cell_id_subset: InitVar[Optional[onp.Array1D[np.integer]]] = None
+    pixel_thr_method: Literal['nrg', 'max'] = 'nrg'
+    pixel_thr: Optional[float] = None
+    req_uuid: InitVar[Optional[str]] = None
+    session_z_offset_um: InitVar[Optional[float]] = None
 
-    def __init__(self, mouse_id: Union[int, str], sess_name: str,
-                 remaps_to_others: dict[str, onp.Array3D[np.floating]], rec_type='learning_ppc',
-                 session_cell_ids: Optional[onp.Array1D[np.integer]] = None):
-        """
-        Inputs:
-            - remaps_to_others should be a mapping from names of *other* sessions to the X/Y remaps
-            from this session to others.
-            - if dims is passed it will be verified, else it will be read from the saved SessionAnalysis.
-        """
-        self.sess_name = sess_name
-        self.xy_mappings_to_others = remaps_to_others
+    # non-constructor fields
+    dims: tuple[int, int] = field(init=False) # Y, X dimensions of each plane
+    accepted: onp.Array1D[np.integer] = field(init=False) # idx_components
+    snr: onp.Array1D[np.floating] = field(init=False)
+    uuid: str = field(init=False) # UUID of the CNMF run
+    matchings: onp.Array1D[np.integer] = field(init=False) # union cell IDs of matched components
+    session_cell_ids: onp.Array1D[np.integer] = field(init=False)  # same length as matchings with the session cell IDs (defaults to all, in order)
+    scan_date: date  = field(init=False) # scan day
+    com: ScaledDataFrame = field(init=False)  # centers of mass 
 
-        sessinfo = cma.load_latest(mouse_id, sess_name, rec_type=rec_type, quiet=True)
+    
+    @property
+    def footprints(self) -> MaybeSparse:
+        ...
+
+    @property
+    def footprint_dims(self) -> tuple[int, ...]:
+        """Dimensions of footprints (e.g., could be 2D or 3D)"""
+        ...
+
+    @property
+    def binarize_thr(self) -> float:
+        if self.pixel_thr is None:
+            return 0.9 if self.pixel_thr_method == 'nrg' else 0.2
+        return self.pixel_thr
+
+    def __post_init__(
+        self, rec_type: str, cell_id_subset: Optional[onp.Array1D[np.integer]], req_uuid: Optional[str],
+        session_z_offset_um: Optional[float]):
+        sessinfo = cma.load_latest(self.mouse_id, self.sess_name, rec_type=rec_type, quiet=True)
+        if req_uuid is not None:
+            # try to select the given UUID
+            sessinfo.select_cnmf_run(req_uuid, save=False)
+            self.uuid = req_uuid
+        else:
+            uuid = sessinfo.get_selected_uuid()
+            assert uuid is not None, 'Should have a selected UUID if there are CNMF results'
+            self.uuid = uuid
+
+        self.dims = sessinfo.plane_size
         assert (scan_day := sessinfo.scan_day) is not None, 'Should know recording date'
         self.scan_date = scan_day
 
@@ -2415,48 +2455,16 @@ class SessionMappingData:
 
         self.accepted = est.idx_components
         self.snr = est.SNR_comp
-        if session_cell_ids is None:
+        if cell_id_subset is None:
             n_cells = est.A.shape[1]
             self.session_cell_ids = np.arange(n_cells)
         else:
-            n_cells = len(session_cell_ids)
-            self.session_cell_ids = session_cell_ids
+            n_cells = len(cell_id_subset)
+            self.session_cell_ids = cell_id_subset
 
         self.matchings = np.full(n_cells, -1, dtype=int)
 
-        uuid = sessinfo.get_selected_uuid()
-        assert uuid is not None, 'Should have a selected UUID if there are CNMF results'
-        self.uuid = uuid
-
-
-@dataclass(init=False)
-class SessionMappingDataWithFlatFootprints(SessionMappingData):
-    """SessionMappingData plus masks flattened in the Z axis"""
-    dims: tuple[int, int]  # Y, X dimensions of each plane
-    xy_footprints: sparse.csc_matrix[np.floating]  # footprints flattened across the Z axis
-    com: ScaledDataFrame  # x, y, plane coordinates of each ROI, in um
-    weights: np.ndarray  # sum of masks for each component
-
-    def __init__(self, mouse_id: Union[int, str], sess_name: str,
-                 remaps_to_others: dict[str, onp.Array3D[np.floating]], rec_type='learning_ppc',
-                 session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
-                 session_z_offset_um: Optional[float] = None,
-                 pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
-                 include_snr_in_weights=False):
-        """
-        Additional inputs:
-            - session_z_offset_um: Offset of this session in the Z axis (if none, ignore Z axis)
-            - pixel_thr_method, pixel_thr: parameters for counting pixels in each mask to make weights
-        """
-        super().__init__(mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remaps_to_others,
-                         rec_type=rec_type, session_cell_ids=session_cell_ids)
-        
-        if pixel_thr is None:
-            pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
-
-        # retrieve footprints
-        sessinfo = cma.load_latest(mouse_id, sess_name, rec_type=rec_type, quiet=True)
-        self.dims = sessinfo.plane_size
+        # compute centers of mass
         self.com = sessinfo.get_coms_3d(unit='um').iloc[self.session_cell_ids, :]
         if session_z_offset_um is None:
             # ignore Z
@@ -2465,10 +2473,45 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
             # account for session-specific Z offset
             self.com.loc[:, 'plane'] += session_z_offset_um
 
+
+@dataclass
+class SessionMappingDataWithWeightedFootprints(SessionMappingData):
+    """
+    SessionMappingData for algorithm using weights to flatten footprints for matching
+    Here, xy_mappings_to_others must be *not* planewise (i.e., just for a single plane)
+    """
+    xy_footprints: sparse.csc_matrix[np.floating] = field(init=False)
+    com: ScaledDataFrame = field(init=False) # x, y, plane coordinates of each ROI, in um
+    weights: np.ndarray = field(init=False) # sum of masks for each component
+
+    include_snr_in_weights: InitVar[bool] = False
+
+    @property
+    def footprints(self) -> sparse.csc_matrix[np.floating]:
+        return self.xy_footprints
+
+    @property
+    def footprint_dims(self) -> tuple[int, ...]:
+        return self.dims
+
+
+    def __post_init__(
+        self, rec_type: str, cell_id_subset: Optional[onp.Array1D[np.integer]],
+        req_uuid: Optional[str], session_z_offset_um: Optional[float], include_snr_in_weights: bool):
+
+        super().__post_init__(rec_type, cell_id_subset, req_uuid, session_z_offset_um)
+
+        sessinfo = cma.load_latest(self.mouse_id, self.sess_name, rec_type=rec_type, quiet=True)
+        sessinfo.select_cnmf_run(self.uuid, save=False)
+
+        # retrieve footprints and COMs
         xy_footprints = sessinfo.get_xy_footprints(normalize=True)[:, self.session_cell_ids]
-        self.weights = footprints.count_pixels(xy_footprints, method=pixel_thr_method, thr=pixel_thr)
+
+        self.weights = footprint_utils.count_pixels(xy_footprints, method=self.pixel_thr_method, thr=self.binarize_thr)
         if include_snr_in_weights:
             self.weights = self.weights * np.clip(self.snr, 0, None)
+
+        # for this class, footprints used for matching are X/Y footprints
         self.xy_footprints = xy_footprints
 
 
@@ -2479,7 +2522,7 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
         except KeyError:
             raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
         
-        return footprints.map_footprints(self.xy_footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
+        return footprint_utils.map_footprints(self.xy_footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
 
     
     def get_flat_footprints_and_coms_mapped_to_session(
@@ -2495,31 +2538,37 @@ class SessionMappingDataWithFlatFootprints(SessionMappingData):
         return fps, coms
 
 
-class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
-    """SessionMappingData that stores 3D footprints and planewise mappings to other sessions"""
-    footprints: sparse.csc_matrix[np.floating]  # non-flattened footprints (A)
-    # more data needed to compute COMs
-    um_per_pixel_x: float
-    um_per_pixel_y: float
-    depths: onp.Array1D[np.floating]
+@dataclass
+class Session3DFootprintsMixin(SessionMappingData):
+    """Mixin to use 3D footprints as this session's footprints when computing matching costs"""
+    fp_per_plane: footprint_utils.FootprintsPerPlane = field(init=False)
+    um_per_pixel_x: float = field(init=False)
+    um_per_pixel_y: float = field(init=False)
 
-    def __init__(
-        self, mouse_id: Union[int, str], sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]],
-        rec_type='learning_ppc', session_cell_ids: Optional[onp.Array1D[np.integer]] = None,
-        session_z_offset_um: Optional[float] = None,
-        pixel_thr_method: Literal['nrg', 'max'] = 'nrg', pixel_thr: Optional[float] = None,
-        include_snr_in_weights=False):
-        
-        super().__init__(
-            mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remaps_to_others,
-            rec_type=rec_type, session_cell_ids=session_cell_ids, session_z_offset_um=session_z_offset_um,
-            pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr, include_snr_in_weights=include_snr_in_weights)
-        
-        if pixel_thr is None:
-            pixel_thr = 0.9 if pixel_thr_method == 'nrg' else 0.2
+    @property
+    def depths(self) -> onp.Array1D[np.floating]:
+        return self.fp_per_plane.z_positions
+
+    @property
+    def n_planes(self) -> int:
+        return self.fp_per_plane.n_planes
+    
+
+    def add_3d_footprints(self, rec_type: str, session_z_offset_um: float):
+        """
+        To call at the end of __post_init__ to add 3D footprint and depth information
+        (don't use super() to avoid dealing with issues with the signature of __post_init__)
+        """
+
+        self.fp_per_plane = footprint_utils.FootprintsPerPlane.load_from_session(
+            mouse_id=self.mouse_id, sess_id=self.sess_name, tag=None, session_z_offset_um=session_z_offset_um,
+            rec_type=rec_type, session_cell_ids=self.session_cell_ids, uuid=self.uuid
+        )
 
         # retrieve footprints
-        sessinfo = cma.load_latest(mouse_id, sess_name, rec_type=rec_type, quiet=True)
+        sessinfo = cma.load_latest(self.mouse_id, self.sess_name, rec_type=rec_type, quiet=True)
+        sessinfo.select_cnmf_run(self.uuid, save=False)
+
         if sessinfo.cnmf_fit is None:
             raise RuntimeError('CNMF not run?')
         est = sessinfo.cnmf_fit.estimates
@@ -2528,49 +2577,418 @@ class SessionMappingDataWith3DFootprints(SessionMappingDataWithFlatFootprints):
         
         self.um_per_pixel_x = sessinfo.metadata['um_per_pixel_x']
         self.um_per_pixel_y = sessinfo.metadata['um_per_pixel_y']
-        if session_z_offset_um is None:
-            # ignore Z entirely
-            self.depths = np.zeros(sessinfo.metadata['num_planes'])
-        else:
-            # account for session-specific Z offset
-            self.depths = sessinfo.get_relative_depths().astype(float) + session_z_offset_um
-        
-        # save 3D footprints to flatten later
-        self.footprints = footprints.normalize_footprints(est.A[:, self.session_cell_ids])
+
+
+@dataclass
+class SessionMappingDataWithWeighted3DFootprints(Session3DFootprintsMixin, SessionMappingDataWithWeightedFootprints):
+    """
+    SessionMappingData that stores 3D footprints and planewise mappings to other sessions
+    This can now deal with either flat or planewise mappings
+    """
+    session_z_offset_um: InitVar[float] = field(kw_only=True)  # make required
+
+    def __post_init__(
+        self, rec_type: str, cell_id_subset: Optional[onp.Array1D[np.integer]],
+        req_uuid: Optional[str], session_z_offset_um: float, include_snr_in_weights: bool):
+
+        super().__post_init__(rec_type, cell_id_subset, req_uuid, session_z_offset_um, include_snr_in_weights)
+        self.add_3d_footprints(rec_type=rec_type, session_z_offset_um=session_z_offset_um)
 
     
     def get_flat_footprints_mapped_to_session(
         self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> sparse.csc_matrix[np.floating]:
-        try:
-            xy_mapping = self.xy_mappings_to_others[sess_name]
-        except KeyError:
-            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
+        # map
+        mapped_footprints = self.fp_per_plane.select_and_copy(which_cells)
+        mapped_footprints.remap(self.xy_mappings_to_others, to_sess=sess_name)
 
-        mapped_footprints = footprints.map_footprints(self.footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
         # flatten
         n_planes = len(self.depths)
-        xy_footprints = footprints.collapse_footprints_to_xy(mapped_footprints, n_planes, binarize=False)
-        return footprints.normalize_footprints(xy_footprints)
+        xy_footprints = footprint_utils.collapse_footprints_to_xy(mapped_footprints.data, n_planes, binarize=False)
+        return footprint_utils.normalize_footprints(xy_footprints)
 
     
     def get_flat_footprints_and_coms_mapped_to_session(
         self, sess_name: str, which_cells: Union[slice, onp.Array1D] = slice(None)) -> tuple[sparse.csc_matrix[np.floating], ScaledDataFrame]:
         # first map the footprints, then get the COMs from the unflattened footprints, finally flatten the footprints
-        try:
-            xy_mapping = self.xy_mappings_to_others[sess_name]
-        except KeyError:
-            raise ValueError(f'No mapping known from session {self.sess_name} to session {sess_name}')
-        
-        mapped_footprints = footprints.map_footprints(self.footprints[:, which_cells], (xy_mapping[0], xy_mapping[1]))
-        coms = footprints.get_coms_3d(
-            mapped_footprints, plane_shape=self.dims, um_per_pixel_x=self.um_per_pixel_x, um_per_pixel_y=self.um_per_pixel_y,
+        mapped_footprints = self.fp_per_plane.select_and_copy(which_cells)
+        mapped_footprints.remap(self.xy_mappings_to_others, to_sess=sess_name)
+
+        coms = footprint_utils.get_coms_3d(
+            mapped_footprints.data, plane_shape=self.dims, um_per_pixel_x=self.um_per_pixel_x, um_per_pixel_y=self.um_per_pixel_y,
             depths=self.depths, unit='um')
 
         # flatten footprints
-        n_planes = len(self.depths)
-        xy_footprints = footprints.collapse_footprints_to_xy(mapped_footprints, n_planes, binarize=False)
-        fps = footprints.normalize_footprints(xy_footprints)        
+        xy_footprints = footprint_utils.collapse_footprints_to_xy(mapped_footprints.data, self.n_planes, binarize=False)
+        fps = footprint_utils.normalize_footprints(xy_footprints)        
         return fps, coms
+
+
+@dataclass
+class SessionMappingDataForZInterp(Session3DFootprintsMixin):
+    """SessionMappingData storing a FootprintsPerPlane object, for use with the interpolator method"""
+    session_z_offset_um: InitVar[float] = field(kw_only=True)
+
+    @property
+    def footprints(self) -> sparse.csc_matrix[np.floating]:
+        return self.fp_per_plane.data
+
+    @property
+    def footprint_dims(self) -> tuple[int, ...]:
+        return self.dims + (self.fp_per_plane.n_planes,)
+
+    @property
+    def cell_present_per_plane(self) -> onp.Array2D[np.bool_]:
+        return self.fp_per_plane.nonempty
+    
+    def __post_init__(
+        self, rec_type: str, cell_id_subset: Optional[onp.Array1D[np.integer]], req_uuid: Optional[str],
+        session_z_offset_um: float):
+        super().__post_init__(rec_type, cell_id_subset, req_uuid, session_z_offset_um)
+
+        self.add_3d_footprints(rec_type=rec_type, session_z_offset_um=session_z_offset_um)
+
+
+    def get_mapped_binary_footprints(
+        self, to_sess: str, cell_subset: Union[onp.ToInt1D, onp.ToBool1D, slice] = slice(None)
+        ) -> footprint_utils.FootprintsPerPlane:
+        """Make a copy of the footprints that are mapped to the given session and then binarized"""
+        fp_mapped = self.fp_per_plane.select_and_copy(cell_subset)
+        fp_mapped.remap(self.xy_mappings_to_others, to_sess=to_sess)
+        fp_mapped.binarize(method=self.pixel_thr_method, thr=self.binarize_thr)
+        return fp_mapped
+
+
+@dataclass
+class SessionSequenceMapper(Protocol):
+    """Manages session mapping data for a sequence of sessions"""
+    # Required regular parameters
+    mouse_id: Union[int, str] = field()
+    sess_names: Sequence[str] = field()
+
+    # InitVars to create from mouse_id and sessions
+    xy_remaps: InitVar[Array5D[np.floating]] = field()
+    daily_offsets_um: InitVar[Optional[ScaledDataFrame]] = None
+
+    # data from each session filled in by post_init
+    session_data: tuple[SessionMappingData, ...] = field(init=False)
+    dims: tuple[int, int] = field(init=False) # (plane dims)
+
+    # regular parameters
+    rec_type: str = 'learning_ppc'
+    session_cell_ids: Optional[onp.Array1D[np.integer]] = None
+    pixel_thr_method: Literal['nrg', 'max'] = 'nrg'
+    pixel_thr: Optional[float] = None  # see binarize_thr property
+    n_matched_weight: float = 0.5
+    only_count_accepted_for_n_matched: bool = False
+    thresh_cost: float = 0.7
+    max_dist_um: float = 20.
+
+    # state for matching
+    n_cells_union: int = field(init=False)
+    n_matched: onp.Array1D[np.integer] = field(init=False)
+    n_matched_and_accepted: onp.Array1D[np.integer] = field(init=False)
+
+
+    @property
+    def binarize_thr(self) -> float:
+        if self.pixel_thr is None:
+            return 0.9 if self.pixel_thr_method == 'nrg' else 0.2
+        return self.pixel_thr
+
+    @property
+    def n_plane_pixels(self) -> int:
+        return self.dims[0] * self.dims[1]
+
+
+    def construct_session_mapping_data(
+        self, sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]], session_z_offset_um: Optional[float]
+        ) -> SessionMappingData:
+        """Make SessionMappingData of the correct type for the given session"""
+        ...
+
+    def __post_init__(self, xy_remaps: Array5D[np.floating], daily_offsets_um: Optional[ScaledDataFrame]):
+
+        session_data: list[SessionMappingData] = []
+        dims: Optional[tuple[int, int]] = None
+
+        for i, (sess_name, remaps_to_others) in enumerate(zip(self.sess_names, xy_remaps)):
+            (other_names := list(self.sess_names)).pop(i)
+            remap_dict = {name: remap for name, remap in zip(other_names, remaps_to_others)}
+            if daily_offsets_um is None:
+                session_z_offset_um = None
+            else:
+                session_z_offset_um = daily_offsets_um.iloc[i].at['z']
+            
+            this_sess_data = self.construct_session_mapping_data(
+                sess_name=sess_name, remaps_to_others=remap_dict, session_z_offset_um=session_z_offset_um)
+        
+            if dims is None:
+                dims = this_sess_data.dims
+            elif this_sess_data.dims != dims:
+                raise RuntimeError('X/Y dimensions of sessions being registered do not all match')
+            
+            session_data.append(this_sess_data)
+
+        self.session_data = tuple(session_data)
+
+        if dims is None:
+            raise ValueError('Must pass at least one session in sess_names')
+        self.dims = dims
+
+
+    def init_matching(self):
+        """Initialize a new round of matching"""
+        self.n_cells_union = 0
+        self.n_matched = np.zeros((0,), dtype=int)
+        self.n_matched_and_accepted = np.zeros((0,), dtype=int)
+
+
+    def build_union_footprints_to_match_session(
+        self, to_session_idx: int, cells_to_map: onp.Array1D[np.integer], n_cells_union: int,
+        ) -> tuple[sparse.csc_array, onp.Array2D[np.floating]]:
+        """Called to get footprints and centers of mass, to use for this round of matching"""
+        ...
+
+    def finish_matching_to_session(
+        self, to_session_idx, reg_results: RegisterROIsResults, union_ids_used: onp.Array1D[np.integer]):
+        """Called each time new matches have been identified for a session"""
+        to_session = self.session_data[to_session_idx]
+
+        matched_session_inds = reg_results.matched1
+        unmatched_session_inds = reg_results.unmatched1
+        matched_union_inds = union_ids_used[reg_results.matched2]
+        to_session.matchings[matched_session_inds] = matched_union_inds
+        to_session.matchings[unmatched_session_inds] = range(
+            self.n_cells_union, self.n_cells_union + len(unmatched_session_inds))
+        self.n_cells_union += len(unmatched_session_inds)
+        self.n_matched[matched_union_inds] += 1
+        self.n_matched = np.concatenate((self.n_matched, np.ones(len(unmatched_session_inds), dtype=int)))
+        self.n_matched_and_accepted = np.concatenate((self.n_matched_and_accepted, np.zeros(len(unmatched_session_inds), dtype=int)))
+        self.n_matched_and_accepted[to_session.matchings[to_session.accepted]] += 1
+
+
+    def do_matching(self):
+        self.init_matching()
+
+        for i, to_session in enumerate(self.session_data):
+            logging.info(f'Matching to session {to_session.sess_name}')
+            cells_to_map = np.setdiff1d(np.arange(self.n_cells_union), to_session.matchings)
+
+            A_union, com_union = self.build_union_footprints_to_match_session(
+                i, cells_to_map, self.n_cells_union)
+
+            # now find matchings to this session's ROIs using register_ROIs
+            if self.only_count_accepted_for_n_matched:
+                # weigh components by n_matched_and_accepted
+                D_pow = 1 + self.n_matched_weight * (self.n_matched_and_accepted[cells_to_map] - 1)
+            else:
+                # weigh components by n_matched
+                D_pow = 1 + self.n_matched_weight * (self.n_matched[cells_to_map] - 1)
+            
+            A1 = to_session.footprints
+
+            com1 = to_session.com.to_um().to_numpy()
+            # subset to dimensions we have from union
+            com1 = com1[:, :com_union.shape[1]]
+            
+            A1_has_comp_per_plane = getattr(to_session, 'cell_present_per_plane', None)
+
+            reg_results = register_ROIs(
+                A1=A1, A2=A_union, dims=to_session.footprint_dims, align_flag=False,
+                com1=com1, com2=com_union, thr_method=self.pixel_thr_method,
+                thr=self.binarize_thr, thresh_cost=self.thresh_cost, max_dist=self.max_dist_um, D_pow=D_pow,
+                A1_has_comp_per_plane=A1_has_comp_per_plane
+            )
+            
+            # update matchings and other info
+            self.finish_matching_to_session(i, reg_results, cells_to_map)
+
+
+@dataclass
+class FootprintFlatteningMapper(SessionSequenceMapper):
+    """Mapper that uses weights to flatten 3D footprints"""
+    planewise_mappings: bool = field(kw_only=True)
+    footprint_weight_method: Literal['mean', 'max'] = field(kw_only=True)
+    include_snr_in_weights: bool = False
+
+    session_data: tuple[SessionMappingDataWithWeightedFootprints, ...] = field(init=False)
+
+    # state for matching
+    max_weights_union: onp.Array1D[np.floating] = field(init=False)
+
+    def construct_session_mapping_data(
+        self, sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]],
+        session_z_offset_um: Optional[float]) -> SessionMappingDataWithWeightedFootprints:
+
+        if self.planewise_mappings:
+            if session_z_offset_um is None:
+                raise ValueError('session_z_offset_um is required for 3D/planewise footprint mapping method')
+            return SessionMappingDataWithWeighted3DFootprints(
+                mouse_id=self.mouse_id, rec_type=self.rec_type, pixel_thr_method=self.pixel_thr_method, pixel_thr=self.binarize_thr,
+                sess_name=sess_name, xy_mappings_to_others=remaps_to_others, session_z_offset_um=session_z_offset_um,
+                include_snr_in_weights=self.include_snr_in_weights
+            )
+        else:
+            return SessionMappingDataWithWeightedFootprints(
+                mouse_id=self.mouse_id, rec_type=self.rec_type, pixel_thr_method=self.pixel_thr_method, pixel_thr=self.binarize_thr,
+                sess_name=sess_name, xy_mappings_to_others=remaps_to_others, session_z_offset_um=session_z_offset_um,
+                include_snr_in_weights=self.include_snr_in_weights
+            )
+
+    def init_matching(self):
+        super().init_matching()
+        self.max_weights_union = np.zeros((0,))
+
+
+    def build_union_footprints_to_match_session(
+        self, to_session_idx: int, cells_to_map: onp.Array1D[np.integer], n_cells_union: int,
+        ) -> tuple[sparse.csc_array, onp.Array2D[np.floating]]:
+        """
+        For the requested cells, build a footrprints matrix for matching ROIs in to_session by combining footprints
+        from all matched ROIs in other sessions and combining them using weights.
+        Returns (union_footprints, union_coms)
+        """
+        to_session = self.session_data[to_session_idx]
+        A_union = sparse.lil_array((self.n_plane_pixels, n_cells_union))
+        com_union = np.zeros((n_cells_union, 3))
+        weights_added = np.zeros(n_cells_union)
+
+        for other_session in chain(self.session_data[:to_session_idx], self.session_data[to_session_idx+1:]):            
+            # map ROIs
+            map_mask: onp.Array1D[np.bool_] = np.isin(other_session.matchings, cells_to_map)
+            mapped_cell_ids = other_session.matchings[map_mask]
+            A_mapped, coms_mapped = other_session.get_flat_footprints_and_coms_mapped_to_session(
+                to_session.sess_name, map_mask)
+
+            A_union[:, mapped_cell_ids] += A_mapped.multiply(other_session.weights[map_mask])  # type: ignore
+            if self.footprint_weight_method == 'mean':
+                weights = other_session.weights[map_mask]
+            else:
+                assert self.footprint_weight_method == 'max' # only include if weight equals the max value
+                weights = (other_session.weights[map_mask] == self.max_weights_union[mapped_cell_ids])
+            
+            com_union[mapped_cell_ids, :] += coms_mapped.to_numpy() * weights[:, np.newaxis]
+            weights_added[mapped_cell_ids] += weights
+        
+        # Only consider cells that were actually mapped
+        com_union = com_union[cells_to_map, :] / weights_added[cells_to_map, np.newaxis]
+        A_union = sparse.csc_array(A_union[:, cells_to_map])
+
+        return A_union, com_union
+
+
+    def finish_matching_to_session( 
+        self, to_session_idx, reg_results: RegisterROIsResults, union_ids_used: onp.Array1D[np.integer]):
+        super().finish_matching_to_session(to_session_idx, reg_results, union_ids_used)
+
+        if self.footprint_weight_method == 'max':
+            # update max weight
+            to_session = self.session_data[to_session_idx]
+            matched_session_inds = reg_results.matched1
+            unmatched_session_inds = reg_results.unmatched1
+            matched_union_inds = union_ids_used[reg_results.matched2]
+
+            self.max_weights_union[matched_union_inds] = np.maximum(
+                self.max_weights_union[matched_union_inds], to_session.weights[matched_session_inds])
+            self.max_weights_union = np.concatenate((self.max_weights_union, to_session.weights[unmatched_session_inds]))
+
+
+@dataclass
+class FootprintInterpolatingMapper(SessionSequenceMapper):
+    """Mapper that uses interpolators to flatten 3D footprints for each Z position"""
+    session_data: tuple[SessionMappingDataForZInterp, ...] = field(init=False)
+    interp_type: Literal['smoothing_spline', 'rbf', 'gaussian'] = 'gaussian'
+
+    def construct_session_mapping_data(
+        self, sess_name: str, remaps_to_others: dict[str, onp.Array3D[np.floating]],
+        session_z_offset_um: Optional[float]) -> SessionMappingDataForZInterp:
+
+        if session_z_offset_um is None:
+            raise ValueError('session_z_offset_um is required for footprint interpolation method')
+
+        return SessionMappingDataForZInterp(
+            mouse_id=self.mouse_id, rec_type=self.rec_type, pixel_thr_method=self.pixel_thr_method, pixel_thr=self.binarize_thr,
+            sess_name=sess_name, xy_mappings_to_others=remaps_to_others, session_z_offset_um=session_z_offset_um)
+
+
+    def build_union_footprints_to_match_session(
+        self, to_session_idx: int, cells_to_map: onp.Array1D[np.integer], n_cells_union: int
+        ) -> tuple[sparse.csc_array, onp.Array2D[np.floating]]:
+        """
+        We construct an interpolator for each cell and use it to map footprints from other sessions
+        to the average Z position of the current session.
+        """
+        # first get a list of mapped footprints from all other sessions 
+        to_sess_data = self.session_data[to_session_idx]
+        to_sess = to_sess_data.sess_name
+
+        mapped_footprints: list[footprint_utils.FootprintsPerPlane] = []
+        matchings: list[onp.Array1D[np.integer]] = []
+        # make border for each cell to speed interpolation
+        borders = [BorderSpec.maximal(self.dims)] * len(cells_to_map)
+
+        for other_session in chain(self.session_data[:to_session_idx], self.session_data[to_session_idx+1:]):            
+            # find which ROIs to map
+            mapped_cell_ids, inds_of_session, inds_of_union = np.intersect1d(
+                other_session.matchings, cells_to_map, return_indices=True
+            )
+
+            if len(mapped_cell_ids) > 0:
+                mapped_fps = other_session.get_mapped_binary_footprints(to_sess, inds_of_session)
+                # remove any that have become empty
+                still_nonempty = np.any(mapped_fps.nonempty, axis=0)
+                mapped_fps = mapped_fps.select_and_copy(still_nonempty)
+                mapped_cell_ids = mapped_cell_ids[still_nonempty]
+                inds_of_session = inds_of_session[still_nonempty]
+                inds_of_union = inds_of_union[still_nonempty]
+
+                mapped_footprints.append(mapped_fps)
+                matchings.append(mapped_cell_ids)
+
+                # expand borders to include these footprints
+                for plane_bboxes in mapped_fps.bboxes:
+                    for cell_bbox, ind_of_union in zip(plane_bboxes, inds_of_union):
+                        borders[ind_of_union] = BorderSpec.min(borders[ind_of_union], cell_bbox)
+        
+        match self.interp_type:
+            case 'smoothing_spline':
+                interp_settings = footprint_utils.SmoothingSplineInterpSettings(
+                    z_border=self.max_dist_um
+                )
+            case 'rbf':
+                interp_settings = footprint_utils.RBFInterpSettings(
+                    um_per_pixel_x=to_sess_data.um_per_pixel_x, um_per_pixel_y=to_sess_data.um_per_pixel_y,
+                    max_dist=self.max_dist_um, query_zs=to_sess_data.depths
+                )
+            case 'gaussian':
+                interp_settings = footprint_utils.GaussianAverageSettings(
+                    sigma=self.max_dist_um / 2  # 2 sigma ~= radius
+                )
+            case _:
+                raise ValueError('Unknown interp_type')
+
+        fp_interpolators, interp_borders = footprint_utils.footprint_interpolator_per_cell(
+            mapped_footprints, matchings, borders, interp_settings
+        )
+
+        # finally create sparse matrix with footprints interpolated to each of this session's planes
+        # (to compare with 3D footprints from this session)
+        A_union_per_plane = [sparse.lil_array((len(cells_to_map), self.n_plane_pixels)) for _ in range(to_sess_data.n_planes)]
+
+        for k_cell, (cell_id, border) in enumerate(zip(cells_to_map, interp_borders)):
+            interpolator = fp_interpolators(int(cell_id))
+            for k_plane, depth in enumerate(to_sess_data.depths):
+                interp_mask = interpolator(float(depth))
+                A_union_per_plane[k_plane][k_cell, border.flatmask(self.dims, order='F')] = interp_mask.ravel(order='F')
+
+        A_union = sparse.hstack(A_union_per_plane, format="csr").T
+
+        # compute 3D COMs using pixel and plane spacings
+        y_spacing = slice(0, to_sess_data.dims[0] * to_sess_data.um_per_pixel_y, to_sess_data.um_per_pixel_y)
+        x_spacing = slice(0, to_sess_data.dims[1] * to_sess_data.um_per_pixel_x, to_sess_data.um_per_pixel_x)
+        com_union = my_com(A_union, y_spacing, x_spacing, to_sess_data.depths)
+
+        return A_union, com_union
 
 
 def register_ROIs_multisession_3D(
@@ -2580,7 +2998,8 @@ def register_ROIs_multisession_3D(
         use_saved_xy_offsets=False, saved_offset_filename_fmt: Optional[str] = '{}_daily_offsets.csv',
         use_saved_mappings: Optional[bool] = None, save_mappings_with_grouptag: Optional[bool] = None,
         planewise_mappings=True, only_count_accepted_for_n_matched=False, include_snr_in_weights=False,
-        footprint_weight_method: Literal['mean', 'max'] = 'mean') -> dict:
+        footprint_weight_method: Literal['mean', 'max'] = 'mean',
+        interpolate_union_footprints=False, interp_type: Literal['smoothing_spline', 'rbf', 'gaussian'] = 'gaussian') -> dict:
     """
     Register ROIs for individual planes while keeping track of the estimated Z position
     for each ROI, based on size of ROI in each session and estimated Z of each plane
@@ -2630,6 +3049,10 @@ def register_ROIs_multisession_3D(
         
         planewise_mappings (bool):
             Whether to use planewise mapping method rather than assuming that the X/Y mapping is the same for each plane.
+        
+        interpolate_union_footprints (bool):
+            Use an alternate method that interpolates the footprints of all matched sessions to the Z locations of the
+            current session rather than flattening them, and does not use distance.
     """
     if len(sess_ids) == 0:
         raise ValueError('Must include at least one session in registration')
@@ -2658,106 +3081,34 @@ def register_ROIs_multisession_3D(
         
     ## Step 3: load each session and collect masks, COMs, mappings, etc.
     logging.info('Loading ROI info from each session')
-    session_data: list[SessionMappingDataWithFlatFootprints] = []
-    for i, (sess_name, remaps_to_others) in enumerate(zip(sess_names, xy_remaps)):
-        (other_names := sess_names.copy()).pop(i)
-        remap_dict = {name: remap for name, remap in zip(other_names, remaps_to_others)}
-        if daily_offsets_um is None:
-            session_z_offset_um = None
-        else:
-            session_z_offset_um = daily_offsets_um.iloc[i].at['z']
-            assert isinstance(session_z_offset_um, float)
 
-        MappingDataClass = SessionMappingDataWith3DFootprints if planewise_mappings else SessionMappingDataWithFlatFootprints
-        this_session_data = MappingDataClass(
-            mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remap_dict, rec_type=rec_type,
-            session_z_offset_um=session_z_offset_um, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr,
-            include_snr_in_weights=include_snr_in_weights
-        )
-        session_data.append(this_session_data)
+    if interpolate_union_footprints:
+        SessionSequenceMapperClass = partial(
+            FootprintInterpolatingMapper,
+            interp_type=interp_type)
+    else:
+        SessionSequenceMapperClass = partial(
+            FootprintFlatteningMapper,
+            planewise_mappings=planewise_mappings, footprint_weight_method=footprint_weight_method,
+            include_snr_in_weights=include_snr_in_weights)
     
-    if not all(sess.dims == session_data[0].dims for sess in session_data[1:]):
-        raise RuntimeError('X/Y dimensions of sessions being registered do not all match')
+    session_sequence_mapper = SessionSequenceMapperClass(
+        mouse_id=mouse_id, sess_names=sess_names, xy_remaps=xy_remaps, rec_type=rec_type,
+        daily_offsets_um=daily_offsets_um, pixel_thr_method=pixel_thr_method, pixel_thr=pixel_thr,
+        n_matched_weight=n_matched_weight, only_count_accepted_for_n_matched=only_count_accepted_for_n_matched,
+        thresh_cost=thresh_cost, max_dist_um=max_dist_um
+    )
 
-    ## Step 4: session by session, match masks with union of matched cells found so far
-    ## based on XYZ distance in um and XY mask overlap
-    n_cells_union = 0
-    max_weights_union = np.zeros((0,))  # if footprint_weight_method == 'max', this stores the max weight
-    n_matched = np.zeros((0,), dtype=int)
-    n_matched_and_accepted = np.zeros((0,), dtype=int)
-
-    for i, session in enumerate(session_data):
-        logging.info(f'Matching to session {sess_names[i]}')
-        # build A_union and com_union to match with
-        # only consider cells that have not yet been matched - might do multiple passes in the future
-        cells_to_map = np.setdiff1d(np.arange(n_cells_union), session.matchings)
-        A_union = sparse.lil_array((session.xy_footprints.shape[0], n_cells_union))
-        com_union = np.zeros((n_cells_union, 3))
-        weights_added = np.zeros(n_cells_union)
-
-        for other_session in session_data:
-            if other_session is session:
-                continue
-            
-            # map ROIs
-            map_mask: onp.Array1D[np.bool_] = np.isin(other_session.matchings, cells_to_map)
-            mapped_cell_ids = other_session.matchings[map_mask]
-            A_mapped, coms_mapped = other_session.get_flat_footprints_and_coms_mapped_to_session(
-                session.sess_name, map_mask)
-
-            A_union[:, mapped_cell_ids] += A_mapped.multiply(other_session.weights[map_mask])
-            if footprint_weight_method == 'mean':
-                weights = other_session.weights[map_mask]
-            else:
-                assert footprint_weight_method == 'max' # only include if weight equals the max value
-                weights = (other_session.weights[map_mask] == max_weights_union[mapped_cell_ids])
-            
-            com_union[mapped_cell_ids, :] += coms_mapped.to_numpy() * weights[:, np.newaxis]
-            weights_added[mapped_cell_ids] += weights
-        
-        # Only consider cells that were actually mapped
-        com_union = com_union[cells_to_map, :] / weights_added[cells_to_map, np.newaxis]
-        A_union = A_union[:, cells_to_map]
-        # normalize to be unit vectors
-        A_union = sparse.csc_array(A_union / A_union.power(2).sum())
-
-        # now find matchings to this session's ROIs using register_ROIs
-        if only_count_accepted_for_n_matched:
-             # weigh components by n_matched_and_accepted
-            D_pow = 1 + n_matched_weight * (n_matched_and_accepted[cells_to_map] - 1)
-        else:
-            # weigh components by n_matched
-            D_pow = 1 + n_matched_weight * (n_matched[cells_to_map] - 1)
-
-        reg_results = register_ROIs(
-            A1=session.xy_footprints, A2=A_union, dims=session.dims, align_flag=False,
-            com1=session.com.to_um().to_numpy(), com2=com_union, thr_method=pixel_thr_method,
-            thr=pixel_thr, thresh_cost=thresh_cost, max_dist=max_dist_um, D_pow=D_pow
-        )
-        # update matchings and other info
-        matched_session_inds = reg_results.matched1
-        unmatched_session_inds = reg_results.unmatched1
-        matched_union_inds = cells_to_map[reg_results.matched2]
-        session.matchings[matched_session_inds] = matched_union_inds
-        session.matchings[unmatched_session_inds] = range(n_cells_union, n_cells_union + len(unmatched_session_inds))
-        n_cells_union += len(unmatched_session_inds)
-        n_matched[matched_union_inds] += 1
-        n_matched = np.concatenate((n_matched, np.ones(len(unmatched_session_inds), dtype=int)))
-        n_matched_and_accepted = np.concatenate((n_matched_and_accepted, np.zeros(len(unmatched_session_inds), dtype=int)))
-        n_matched_and_accepted[session.matchings[session.accepted]] += 1
-
-        if footprint_weight_method == 'max':
-            max_weights_union[matched_union_inds] = np.maximum(
-                max_weights_union[matched_union_inds], session.weights[matched_session_inds])
-            max_weights_union = np.concatenate((max_weights_union, session.weights[unmatched_session_inds]))
+    ## Step 4: Do the matching
+    session_sequence_mapper.do_matching()
     
     ## Step 5: compile data and save
     matchings: list[np.ndarray] = []
     included_rois: list[np.ndarray] = []
-    assignments = np.full((n_cells_union, len(session_data)), np.nan)
-    accepted = np.zeros((n_cells_union, len(session_data)), dtype=bool)
+    assignments = np.full((session_sequence_mapper.n_cells_union, len(sess_names)), np.nan)
+    accepted = np.zeros((session_sequence_mapper.n_cells_union, len(sess_names)), dtype=bool)
 
-    for sess, assgn_col, accept_col in zip(session_data, assignments.T, accepted.T):
+    for sess, assgn_col, accept_col in zip(session_sequence_mapper.session_data, assignments.T, accepted.T):
         matchings.append(sess.matchings)
         this_included_rois = sess.session_cell_ids
         included_rois.append(this_included_rois)
@@ -2770,7 +3121,7 @@ def register_ROIs_multisession_3D(
         'rec_type': rec_type,
         'processed_sess_ids': np.array(sess_ids),
         'processed_tags': [tag if tag else '' for tag in tags],
-        'cnmf_uuids': [sess.uuid for sess in session_data],
+        'cnmf_uuids': [sess.uuid for sess in session_sequence_mapper.session_data],
         'grouptag': grouptag if grouptag else '',
         'assignments': assignments,
         'accepted': accepted,
@@ -2778,10 +3129,12 @@ def register_ROIs_multisession_3D(
         'cell_subset_name': '',
         'xy_remap_file': os.path.split(xy_remap_path)[1],
         'offset_file': offset_file,
-        'dates': [data.scan_date for data in session_data],
+        'dates': [data.scan_date for data in session_sequence_mapper.session_data],
         'planewise': planewise_mappings,
         'n_matched_weight': n_matched_weight,
-        'only_count_accepted_for_n_matched': only_count_accepted_for_n_matched
+        'only_count_accepted_for_n_matched': only_count_accepted_for_n_matched,
+        'interpolate_union_footprints': interpolate_union_footprints,
+        'interp_type': interp_type
     }
     save_data = tabularize_multisession_data(**save_data)
     save_multisession(save_data)
@@ -2789,7 +3142,7 @@ def register_ROIs_multisession_3D(
 
 
 def rebuild_session_mapping_data_and_footprints(
-        align_results: dict, offset_file: Optional[str] = None) -> tuple[list[SessionMappingData], list[footprints.FootprintsPerPlane]]:
+        align_results: dict, offset_file: Optional[str] = None) -> tuple[list[SessionMappingData], list[footprint_utils.FootprintsPerPlane]]:
     """
     Gather session-mapping data and per-plane footprints from a completed multisession alignment run.
         - offset_file: can be provided to override Z offsets or fill in if the file was not saved with results.
@@ -2800,6 +3153,8 @@ def rebuild_session_mapping_data_and_footprints(
     sessions: pd.DataFrame = align_results['sessions']
     matchings: pd.DataFrame = align_results['matchings']
     xy_remap_file: str = align_results['xy_remap_file']
+    planewise: bool = align_results.get('planewise', False)
+    used_interpolator: bool = align_results.get('interpolate_union_footprints', False)
 
     sess_ids: list[int] = list(sessions.loc[:, 'sess_id'])
     tags: list[str] = list(sessions.loc[:, 'tag'])
@@ -2824,7 +3179,7 @@ def rebuild_session_mapping_data_and_footprints(
         raise RuntimeError('Not all nonrigid mappings for these sessions found in ' + xy_remap_file)
 
     session_data: list[SessionMappingData] = []
-    footprints_per_plane: list[footprints.FootprintsPerPlane] = []
+    footprints_per_plane: list[footprint_utils.FootprintsPerPlane] = []
 
     for i, (sess_id, tag, remaps_to_others, z_offset) in enumerate(zip(sess_ids, tags, all_remaps, z_offsets)):
         sess_name = (other_names := sess_names.copy()).pop(i)
@@ -2832,14 +3187,21 @@ def rebuild_session_mapping_data_and_footprints(
         session_cell_ids = matchings.session_cell_id[matchings.sess_name == sess_name].to_numpy()
         this_matchings = matchings.union_cell_id[matchings.sess_name == sess_name].to_numpy()
 
-        this_session_data = SessionMappingData(
-            mouse_id=mouse_id, sess_name=sess_name, remaps_to_others=remap_dict,
-            rec_type=rec_type, session_cell_ids=session_cell_ids
+        if used_interpolator:
+            cls = SessionMappingDataForZInterp
+        elif planewise:
+            cls = SessionMappingDataWithWeighted3DFootprints
+        else:
+            cls = SessionMappingDataWithWeightedFootprints
+
+        this_session_data = cls(
+            mouse_id=mouse_id, sess_name=sess_name, xy_mappings_to_others=remap_dict,
+            rec_type=rec_type, cell_id_subset=session_cell_ids, session_z_offset_um=z_offset
         )
         this_session_data.matchings = this_matchings
         session_data.append(this_session_data)
 
-        footprints_per_plane.append(footprints.FootprintsPerPlane(
+        footprints_per_plane.append(footprint_utils.FootprintsPerPlane.load_from_session(
             mouse_id=mouse_id, sess_id=sess_id, tag=tag, session_z_offset_um=z_offset,
             rec_type=rec_type, session_cell_ids=session_cell_ids
         ))

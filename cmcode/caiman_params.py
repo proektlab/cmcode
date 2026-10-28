@@ -381,14 +381,36 @@ class SeedParams(StageParams):
 
 @dataclass(kw_only=True, frozen=True)
 class CNMFParamsExtra(StageParams):
-    """Extra parameters for operations associated with CNMF"""
+    """
+    Extra parameters for operations associated with CNMF (that require
+    re-running CNMF entirely if changed)
+    """
     seed_params: SeedParams = SeedParams()
+    # include params that were moved so that unpickling still works (with __setstate__)
+    crossplane_merge_thr: Optional[float] = Field(
+        default=None, exclude=True, repr=False, deprecated='this field is now in cnmf_post')
+    post_merge_within_planes: bool = Field(
+        default=False, exclude=True, repr=False, deprecated='this field is now in cnmf_post')
+    post_merge_dilation: int = Field(
+        default=0, exclude=True, repr=False, deprecated='this field is now in cnmf_post')  # pixels of dilation for the post-merge step
+
+
+@dataclass(kw_only=True, frozen=True)
+class CNMFPostprocessParams(StageParams):
+    """
+    Params that must match for the CNMF estimates to be used/loaded,
+    but that can be changed through post-processing steps (finish_cnmf_processing)
+    Note however, not all changes are possible; if not possible,
+        a runtime error will be thrown and the CNMF stage will be invalidated.
+    """
     crossplane_merge_thr: Optional[float] = None
+    post_merge_within_planes: bool = False  #  whether to also merge within planes in the post-merge step
+    post_merge_dilation: int = 0  # pixels of dilation for the post-merge step
 
 
 @dataclass(kw_only=True, frozen=True)
 class DffParams(StageParams):
-    """Parameters for dF/F computation"""
+    """Parameters for dF/F computation (F_dff and F_dff_denoised)"""
     baseline_pctile: float = 8.  # only used if auto_pctile is False
     auto_pctile: bool = False
     baseline_window: Optional[int] = 500  # frames to compute baseline over
@@ -417,6 +439,7 @@ class AnalysisStage(IntEnum):
     MCORR = auto()       # motion correction
     TRANSPOSE = auto()   # concat/transpose to C order/possibly filter
     CNMF = auto()        # CNMF or CNMFE
+    CNMF_POST = auto()   # CNMF post-processing
     DFF = auto()         # compute dF/F
     EVAL = auto()        # component quality evaluation
     FINAL = auto()
@@ -429,6 +452,7 @@ class AnalysisStage(IntEnum):
             'motion correction',
             'transposition/plane concatenation',
             'CNMF',
+            'CNMF post-processing',
             'dF/F computation',
             'component evaluation',
             'final',
@@ -590,13 +614,81 @@ class CNMFParamStruct(ParamStruct):
     ring_CNN: params.RingCNNParams
     cnmf_extra: CNMFParamsExtra
 
+    @model_validator(mode='before')
+    @classmethod
+    def model_validator(cls, data: Any) -> Any:
+        """Handle compatibility when validating"""
+        if isinstance(data, dict):
+            cls._handle_moved_cnmf_extra_params(data)
+        return data
+
+    @staticmethod
+    def _handle_moved_cnmf_extra_params(data: dict[str, Any]):
+        """Deal with change in subgroup structure when loading data"""
+        if 'cnmf_extra' in data and isinstance(extra := data['cnmf_extra'], dict):
+            # if it's an object, we don't care
+            moved_subparams = ('crossplane_merge_thr', 'post_merge_within_planes', 'post_merge_dilation')
+            for subp in moved_subparams:
+                if subp in extra:
+                    del extra[subp]
+
+
 class UpToCNMFParamStruct(UpToTransposeParamStruct, CNMFParamStruct):
     pass
+
+class CNMFPostParamStruct(ParamStruct):
+    cnmf_post: CNMFPostprocessParams
+
+class UpToCNMFPostParamStruct(UpToCNMFParamStruct, CNMFPostParamStruct):
+
+    @staticmethod
+    def _handle_moved_cnmf_extra_params(data: dict[str, Any]):
+        """Deal with change in subgroup structure when loading data"""
+        moved_subparams = ('crossplane_merge_thr', 'post_merge_within_planes', 'post_merge_dilation')
+        post_missing = 'cnmf_post' not in data  # create object at end (for setstate)
+        post: Union[dict, CNMFPostprocessParams] = data.get('cnmf_post', {})
+
+        if 'cnmf_extra' in data:
+            extra: Union[dict, CNMFParamsExtra] = data['cnmf_extra']
+            
+            if isinstance(extra, CNMFParamsExtra):
+                if isinstance(post, CNMFPostprocessParams):
+                    return  # no reason to think the fields on "extra" are more valid
+                
+                for subp in moved_subparams:
+                    if subp not in post:
+                        # use value from deprecated "extra" field
+                        with warnings.catch_warnings():
+                            warnings.simplefilter('ignore', DeprecationWarning)
+                            post[subp] = getattr(extra, subp)
+            else:
+                # any field we have passed as a dict for "extra" we assume should override
+                post_updates = {k: extra.pop(k) for k in moved_subparams if k in extra}
+                if isinstance(post, CNMFPostprocessParams):
+                    post = post.replace(**post_updates)
+                else:  # both dicts - check for conflicts
+                    for subp, val in post_updates.items():
+                        if subp in post:
+                            raise ValueError(f'Conflicting subkeys: {subp} present in both cnmf_extra and cnmf_post')
+                        else:
+                            post[subp] = val
+
+        if post_missing and isinstance(post, dict):
+            post = CNMFPostprocessParams(**post)
+        data['cnmf_post'] = post
+
+
+    def __setstate__(self, state: dict[str, Any]):
+        """Handle compatibility when unpickling"""
+        actual_state = state.get('__dict__', state)
+        self._handle_moved_cnmf_extra_params(actual_state)
+        super().__setstate__(state)
+ 
 
 class DffParamStruct(ParamStruct):
     dff: DffParams = Field(default_factory=DffParams)
 
-class UpToDffParamStruct(UpToCNMFParamStruct, DffParamStruct):
+class UpToDffParamStruct(UpToCNMFPostParamStruct, DffParamStruct):
     pass
 
 class EvalParamStruct(ParamStruct):
@@ -641,6 +733,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         mcorr_extra: McorrParamsExtra = McorrParamsExtra(),
         transposition: TranspositionParams = TranspositionParams(),
         cnmf_extra: CNMFParamsExtra = CNMFParamsExtra(),
+        cnmf_post: CNMFPostprocessParams = CNMFPostprocessParams(),
         dff: DffParams = DffParams(),
         eval_extra: EvalParamsExtra = EvalParamsExtra()
         ):
@@ -661,6 +754,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             online=cnmf.online,
             ring_CNN=cnmf.ring_CNN,
             cnmf_extra=cnmf_extra,
+            cnmf_post=cnmf_post,
             dff=dff,
             quality=cnmf.quality,
             eval_extra=eval_extra
@@ -688,7 +782,8 @@ class SessionAnalysisParams(UpToEvalParamStruct):
             transposition=TranspositionParams(add_to_mov=0, remove_bg_mean=True, highpass_padtype='even', highpass_padlen=2000),
             cnmf=make_cnmf_params(
                 metadata, ndim=ndim, tif_file=tif_file, snr_type=snr_type, downsample_factor=downsample_factor),
-            cnmf_extra=CNMFParamsExtra(seed_params=SeedParams.default(metadata), crossplane_merge_thr=0.7),
+            cnmf_extra=CNMFParamsExtra(seed_params=SeedParams.default(metadata)),
+            cnmf_post=CNMFPostprocessParams(crossplane_merge_thr=0.6, post_merge_within_planes=True, post_merge_dilation=1),
             eval_extra=EvalParamsExtra(snr_type=snr_type)
         )
 
@@ -821,7 +916,7 @@ class SessionAnalysisParams(UpToEvalParamStruct):
         before finish_cnmf_processing is called.
         """
         new_params = deepcopy(self)
-        new_params.cnmf_extra = self.cnmf_extra.replace(crossplane_merge_thr=None)
+        new_params.cnmf_post = self.cnmf_post.replace(crossplane_merge_thr=None)
         new_params.eval_extra = self.eval_extra.replace(snr_type='normal')
         return new_params
     
@@ -834,6 +929,7 @@ stage_only_params: dict[AnalysisStage, Type[ParamStruct]] = {
     AnalysisStage.MCORR: McorrParamStruct,
     AnalysisStage.TRANSPOSE: TransposeParamStruct,
     AnalysisStage.CNMF: CNMFParamStruct,
+    AnalysisStage.CNMF_POST: CNMFPostParamStruct,
     AnalysisStage.DFF: DffParamStruct,
     AnalysisStage.EVAL: EvalParamStruct,
     AnalysisStage.FINAL: ParamStruct
@@ -846,6 +942,7 @@ stage_cumulative_params: dict[AnalysisStage, Type[ParamStruct]] = {
     AnalysisStage.MCORR: UpToMcorrParamStruct,
     AnalysisStage.TRANSPOSE: UpToTransposeParamStruct,
     AnalysisStage.CNMF: UpToCNMFParamStruct,
+    AnalysisStage.CNMF_POST: UpToCNMFPostParamStruct,
     AnalysisStage.DFF: UpToDffParamStruct,
     AnalysisStage.EVAL: UpToEvalParamStruct,
     AnalysisStage.FINAL: SessionAnalysisParams

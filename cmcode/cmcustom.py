@@ -9,8 +9,8 @@ from matplotlib.axes import Axes
 import numpy as np
 import optype.numpy as onp
 from scipy.ndimage import label
-from scipy.sparse import csc_array, csc_matrix, lil_array
-from scipy.stats import gamma, norm, loggamma
+from scipy.sparse import csc_array, csc_matrix, lil_array, csgraph
+from scipy.stats import gamma, norm, loggamma, pearsonr
 from skimage.morphology import remove_small_objects, remove_small_holes, dilation, closing
 
 from caiman.components_evaluation import estimate_baseline
@@ -24,7 +24,7 @@ def my_plot_contours(est: cnmf.Estimates, img=None, idx=None, thr_method='max',
                      ax: Optional[Axes] = None):
     """
     View contours of all spatial footprints. If idx is provided,
-    plot accepted and rejected contours in different colors rather than on differen axes.
+    plot accepted and rejected contours in different colors rather than on different axes.
 
     Args:
         img :   np.ndarray
@@ -501,3 +501,157 @@ def get_loggamma_logsfs(args: tuple[np.ndarray, np.ndarray, float]) -> np.ndarra
     CYrA_offset = YrA_one + C_one + offset
     CYrA_log = np.log(CYrA_offset)
     return loggamma.logsf(CYrA_log, *params)
+
+
+def distance_masks_per_plane(
+    M_s: Sequence[csc_matrix[np.floating]], cm_s: Sequence[onp.Array2D[np.floating]], max_dist: float,
+    use_comp_per_plane: Sequence[onp.Array2D[np.bool_]], enclosed_thr: Optional[float] = None) -> list[onp.Array2D[np.floating]]:
+    """
+    Compute distance matrix based on an intersection over union metric. Matrix are compared in order,
+    with matrix i compared with matrix i+1
+    In this version, for each A1, only planes that have any nonzero pixels for each cell are used; this should
+        be provided in boolean arrays in use_comp_per_plane.
+
+    Args:
+        M_s: sequence of 2-D sparse arrays
+            The thresholded A matrices (masks) to compare, output of threshold_components
+
+        cm_s: sequence of 2-D arrays
+            the centroids of the components in each M_s
+
+        max_dist: float
+            maximum distance among centroids allowed between components. This corresponds to a distance
+            at which two components are surely disjoined
+        
+        use_comp_per_plane: sequence of boolean n_planes x n_comp matrices (corresponding to M_s[:-1])
+            whether to include pixels from this plane for each component
+
+        enclosed_thr: float
+            if not None set distance to at most the specified value when ground truth is a subset of inferred
+
+    Returns:
+        D_s: list of matrix distances
+
+    Raises:
+        Exception: 'Nan value produced. Error in inputs'
+
+    """
+    D_s: list[onp.Array2D[np.floating]] = []
+
+    for gt_comp, test_comp, cmgt_comp, cmtest_comp, gt_use_comp in zip(M_s[:-1], M_s[1:], cm_s[:-1], cm_s[1:], use_comp_per_plane):
+
+        # todo : better with a function that calls itself
+        # not to interfere with M_s
+        gt_comp = gt_comp.copy()[:, :]
+        test_comp = test_comp.copy()[:, :]
+
+        n_planes = gt_use_comp.shape[0]
+        assert test_comp.shape[0] % n_planes == 0, "Pixels should be a multiple of # of planes"
+        pix_per_plane = test_comp.shape[0] // n_planes
+
+        # the number of components for each
+        nb_gt   = gt_comp.shape[-1]
+        nb_test = test_comp.shape[-1]
+        D = np.ones((nb_gt, nb_test))
+
+        cmgt_comp = np.array(cmgt_comp)
+        cmtest_comp = np.array(cmtest_comp)
+
+        if enclosed_thr is not None:
+            gt_val = gt_comp.T.dot(gt_comp).diagonal()
+
+        for i in range(nb_gt):
+            # for each component of gt
+
+            # zero out entries in planes we're not using (don't care about changing sparsity structure)
+            test_comp_masked = test_comp.copy()
+            data_planes = test_comp_masked.indices // pix_per_plane
+            zero_inds = ~gt_use_comp[:, i][data_planes]
+            test_comp_masked.data[zero_inds] = 0
+
+            k = gt_comp[:, np.repeat(i, nb_test)] + test_comp_masked
+            # k is correlation matrix of this neuron to every other of the test
+            for j in range(nb_test):   # for each components on the tests
+                dist = np.linalg.norm(cmgt_comp[i] - cmtest_comp[j])
+                                       # we compute the distance of this one to the other ones
+                if dist < max_dist:
+                                       # union matrix of the i-th neuron to the jth one
+                    union = k[:, j].sum()
+                                       # we could have used OR for union and AND for intersection while converting
+                                       # the matrice into real boolean before
+
+                    # product of the two elements' matrices
+                    # we multiply the boolean values from the jth omponent to the ith
+                    intersection = np.array(gt_comp[:, i].T.dot(test_comp_masked[:, j]).todense()).squeeze()
+
+                    # if we don't have even a union this is pointless
+                    if union > 0:
+
+                        # intersection is removed from union since union contains twice the overlapping area
+                        # having the values in this format 0-1 is helpful for the hungarian algorithm that follows
+                        D[i, j] = 1 - 1. * intersection / (union - intersection)
+                        if enclosed_thr is not None and (intersection == gt_val[j] or intersection == gt_val[i]):
+                            D[i, j] = min(D[i, j], 0.5)
+                    else:
+                        D[i, j] = 1.
+
+                    if np.isnan(D[i, j]):
+                        raise Exception('Nan value produced. Error in inputs')
+                else:
+                    D[i, j] = 1
+
+        D_s.append(D)
+    return D_s
+
+
+def get_ROIs_to_merge_w_dilation(
+    A: csc_matrix, C: np.ndarray, dims: tuple[int, int], thr=0.85, dilation=1
+    ) -> tuple[Sequence[onp.Array1D[np.integer]], onp.Array1D[np.floating]]:
+    """
+    Find which ROIs to merge, according to a given threshold.
+    Returns the list of ROI indices, sorted by correlation (descending), with no limit on number of merges.
+    Second output is the total correlations between C vectors for ROIs in each merge set.
+    Here, we dilate each component by given # of pixels when computing overlap;
+        this helps because the footprints from seed methods are forced to have 0 overlap,
+        but if they are right next to each other, dilating by 1 pixel will reveal that.
+    """
+    # tests and initialization
+    nr = A.shape[1]
+    A = csc_matrix(A)
+
+    # find graph of overlapping spatial components
+    C_corr = lil_array((nr, nr))
+    C_64 = C.astype(np.float64, copy=False)  # preserve numpy 1.x promotion
+
+    # get structuring element for dilation
+    selem = cv2.getStructuringElement(cv2.MORPH_RECT, (2*dilation+1, 2*dilation+1))
+
+    for ii in range(nr):
+        # dilate component
+        comp_dilated = cv2.dilate(A[:, ii].toarray().reshape(dims, order='F'), selem)
+        overlaps = comp_dilated.reshape((1, -1), order='F') @ A[:, ii+1:]
+        overlap_indices = np.flatnonzero(overlaps) + ii + 1
+
+        if len(overlap_indices) > 0:
+            # we check the correlation of the calcium traces for each overlapping components
+            this_comp = C_64[[ii], :]
+            other_comps = C_64[overlap_indices, :]
+            corr_values = pearsonr(this_comp, other_comps, axis=1).statistic
+            C_corr[ii, overlap_indices] = corr_values
+
+    corr_above_thr = C_corr > thr
+    # extract connected components
+    _, connected_comp = csgraph.connected_components(corr_above_thr) # type: ignore
+
+    # convert to boolean matrix and only keep those with > 1 cell
+    comps, counts = np.unique_counts(connected_comp)
+    comps_multi = comps[counts > 1]
+    list_conxcomp = connected_comp == comps_multi[:, np.newaxis]  # components x ROIs
+
+    # sort components by total correlation (highest to lowest)
+    cor = np.array([C_corr[comp_mask, comp_mask].sum() for comp_mask in list_conxcomp])
+    ind = np.argsort(cor)[::-1]
+    merged_ROIs = [np.flatnonzero(list_conxcomp[i, :]) for i in ind]
+    corrs = cor[ind]
+
+    return merged_ROIs, corrs

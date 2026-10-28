@@ -47,6 +47,10 @@ Array4D = onp.Array[tuple[int, int, int, int], onp._array._SCT]
 Array5D = onp.Array[tuple[int, int, int, int, int], onp._array._SCT]
 
 
+# unions like the types in numbers that work for type checking (only for built-in and numpy types)
+Integral = Union[int, np.integer]
+Real = Union[Integral, float, np.floating]
+
 # helpers for mesmerize-core
 if TYPE_CHECKING:
     class MescoreBatch(pd.DataFrame):
@@ -59,16 +63,16 @@ if TYPE_CHECKING:
             return MescoreSeries
 
         # columns
-        algo: pd.Series[str]
-        item_name: pd.Series[str]
-        input_movie_path: pd.Series[str]
+        algo: pd.Series
+        item_name: pd.Series
+        input_movie_path: pd.Series
         params: pd.Series
         outputs: pd.Series
-        added_time: pd.Series[str]
+        added_time: pd.Series
         ran_time: pd.Series
         algo_duration: pd.Series
         comments: pd.Series
-        uuid: pd.Series[str]
+        uuid: pd.Series
         
         # accessors
         paths: mc.batch_utils.PathsDataFrameExtension

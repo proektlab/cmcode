@@ -51,7 +51,7 @@ from cmcode.util.footprints import (FootprintsPerPlane, collapse_footprints_to_x
                                     map_footprints, maxproj_per_cell, footprint_interpolator_per_cell)
 from cmcode.util.image import remap_image, shift_image_location, make_merge, BorderSpec, preprocess_proj_for_seed
 from cmcode.util.sbx_data import average_raw_frames, find_sess_sbx_files
-from cmcode.util.types import MaybeSparse, Array4D
+from cmcode.util.types import MaybeSparse, Array4D, Integral
 from cmcode.util.scaled import ScaledDataFrame
 
 pn.extension(theme='dark')
@@ -111,8 +111,8 @@ class ManualCurationController:
     def __init__(self):
         self._viz_container: Optional[CNMFVizContainer] = None
 
-        self.accept_list: set[int] = set()
-        self.reject_list: set[int] = set()
+        self.accept_list: set[Integral] = set()
+        self.reject_list: set[Integral] = set()
 
         self._add_accept = Button(description='Add')
         self._add_accept.on_click(lambda _: self._add_cell(True))
@@ -175,7 +175,7 @@ class ManualCurationController:
         est.accepted_list = np.array(list(self.accept_list), dtype=int)
         est.rejected_list = np.array(list(self.reject_list), dtype=int)
 
-    def get_data(self) -> dict[str, set[int]]:
+    def get_data(self) -> dict[str, set[Integral]]:
         return {'accept': self.accept_list, 'reject': self.reject_list}
     
     def add_handler(self, func: Callable[[], None]):
@@ -213,6 +213,10 @@ class ManualCurationController:
         if which_cells is None:
             selector = self._accept_selector if b_accept else self._reject_selector
             which_cells = {int(cell) for cell in selector.value}
+        if not which_cells and self._viz_container is not None:
+            # default to currently selected cell
+            which_cells = {self._viz_container.component_index}
+
         cell_list -= which_cells
         self._call_handlers()
     
@@ -1595,7 +1599,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
 
     # get templates and ROIs
     info1 = cma.load_latest(mouse_id, sessions.at[ind1, 'sess_id'], tag=sessions.at[ind1, 'tag'], rec_type=rec_type)
-    info1.select_gridsearch_run(sessions.at[ind1, 'cnmf_uuid'], quiet=True, save=False)
+    info1.select_cnmf_run(sessions.at[ind1, 'cnmf_uuid'], quiet=True, save=False)
     plane_height, plane_width = info1.plane_size
     num_planes = info1.metadata['num_planes']
     background1 = info1.get_projection_for_seed(**background_params)[0]
@@ -1605,7 +1609,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         A1 = sparse.csc_array(A1)
 
     info2 = cma.load_latest(mouse_id, sessions.at[ind2, 'sess_id'], tag=sessions.at[ind2, 'tag'], rec_type=rec_type)
-    info2.select_gridsearch_run(sessions.at[ind2, 'cnmf_uuid'], quiet=True, save=False)
+    info2.select_cnmf_run(sessions.at[ind2, 'cnmf_uuid'], quiet=True, save=False)
     background2 = info2.get_projection_for_seed(**background_params)[0]
     assert info2.cnmf_fit is not None and info2.cnmf_fit.estimates.A is not None, 'CNMF should be done'
     A2_orig = info2.cnmf_fit.estimates.A

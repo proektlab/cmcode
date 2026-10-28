@@ -1,10 +1,11 @@
 """Utilities for manipulating sets of cell footprints (A)"""
 from collections.abc import Sequence, Mapping, Callable, Generator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace, asdict
 from functools import cache
 import logging
 import math
 from typing import Any, Literal, Union, Optional, overload, cast
+from typing_extensions import Self
 from warnings import warn
 
 import cellpose.models
@@ -14,7 +15,7 @@ import matplotlib.style as mplstyle
 import numpy as np
 import optype.numpy as onp
 import pandas as pd
-from scipy.interpolate import make_smoothing_spline
+from scipy.interpolate import make_smoothing_spline, RBFInterpolator
 from scipy.ndimage import gaussian_filter
 from scipy import sparse
 import torch
@@ -445,164 +446,167 @@ def extract_roi_thumbnail(
     return extract_roi_thumbnails(A, [roi_id], proj, box_size=box_size)[0]
 
 
-def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[float], np.ndarray], n_border_points,
-                                   z_border: float = 20, min_total_points=0) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Add linear ramp to 0 above and below given footprint and z data. n_border_points will be added going up
-    and down until z_border from the max/min z points. If min_total_points is nonzero, will also ensure there are
-    at least this number of points in the resulting arrays (increasing the number of border points if necessary).
-    Returns (footprints_aug, zs_aug).
-    """
-    n_unique = len(set(zs))
-    n_aug_needed = max(2*n_border_points, min_total_points - n_unique)  # make_smoothing_spline requires at least 5 points
-    n_aug_below = n_aug_needed // 2
-    n_aug_above = n_aug_needed - n_aug_below
-    min_z_ind, max_z_ind = int(np.argmin(zs)), int(np.argmax(zs))
-    ramp_z_below = np.linspace(zs[min_z_ind] - z_border, zs[min_z_ind], n_aug_below, endpoint=False)
-    ramp_z_above = np.linspace(zs[max_z_ind] + z_border, zs[max_z_ind], n_aug_above, endpoint=False)
-    ramp_footprints_below = np.linspace(0, footprints[min_z_ind], n_aug_below, endpoint=False)
-    ramp_footprints_above = np.linspace(0, footprints[max_z_ind], n_aug_above, endpoint=False)
+## ----------------- footprint interpolation ------------------ ##
 
-    zs_aug = np.concatenate([zs, ramp_z_below, ramp_z_above])
-    footprints_aug = np.concatenate([footprints, ramp_footprints_below, ramp_footprints_above], axis=0)
-    return footprints_aug, zs_aug
-
-
-def make_footprint_interpolator(footprints: onp.ToArrayStrict2D, zs: Union[Sequence[float], np.ndarray],
-                                z_border: float = 20, n_border_points=0, **mss_kwargs) -> Callable[[float], np.ndarray]:
-    """
-    Make function to interpolate between multiple footprints at different z locations, to a new z location.
-    Each row of footprints should be a single footprint across space, of length prod(dims) in F-order.
-    N-D arrays are also supported, with z along the first axis.
-    The length of zs should equal footprints.shape[0]. Typically this is in um although it only has to be in the 
-        same unit as z_border.
-    z_border is the maximum distance past the edge where the footprint might be nonzero;
-        z values less than min(zs) - z_border or greater than max(zs) + z_border will always yield all 0s.
-    mss_kwargs are passed on to make_smoothing_spline. For example, "lam" controls the smoothness (larger = smoother);
-        by default this is estimated automatically.
-    The return value of the interpolator will be a vector, again flattened in F-order.
-    """
-    footprints = np.asarray(footprints)
-    if footprints.shape[0] != len(zs):
-        raise ValueError('Exactly one z value must be provided for each footprint')
-    
-    if z_border < 0:
-        raise ValueError('z_border must be non-negative')
-    
-    pixel_shape = footprints.shape[1:]
-    n_pixels = np.prod(pixel_shape)
-
-    if len(zs) == 0:
-        # just zeros
-        return lambda _: np.zeros(pixel_shape)
-
-    # find which pixels to include in interpolator
-    inds_to_interp = np.flatnonzero(np.any(footprints != 0, axis=0))
-    data_for_interp = footprints.reshape((len(zs), -1))[:, inds_to_interp]
-    min_data_z, max_data_z = np.min(zs), np.max(zs)
-    min_z = min_data_z - z_border
-    max_z = max_data_z + z_border
-
-    # augment data so that cubic interpolation works
-    data_aug, zs_aug = augment_data_for_interpolation(   # make_smoothing_spline requires at least 5 points
-        data_for_interp, zs, z_border=z_border, n_border_points=n_border_points, min_total_points=5)
-
-    # sort and average any repeats
-    z_sorted, inv_inds, counts = np.unique(zs_aug, return_inverse=True, return_counts=True)
-    data_sorted = np.zeros((len(z_sorted), data_aug.shape[1]))
-    for inv_ind, data in zip(inv_inds, data_aug):  # index into z_sorted and data_sorted for this footprint
-        data_sorted[inv_ind] += data / counts[inv_ind]
-
-    # make functions for interpolation
-    interpolants = [make_smoothing_spline(z_sorted, d, **mss_kwargs) for d in data_sorted.T]
-
-    def interpolator(z: float) -> np.ndarray:
-        interp_vals = np.zeros(n_pixels)
-        if z > min_data_z and z < max_data_z:
-            for ind, interpolant in zip(inds_to_interp, interpolants):
-                interp_vals[ind] = interpolant(z)
-        elif z > min_z and z <= min_data_z:
-            for ind, interpolant in zip(inds_to_interp, interpolants):
-                minval = interpolant(min_data_z)
-                interp_vals[ind] = minval * (z - min_z) / z_border
-        elif z < max_z and z >= max_data_z:
-            for ind, interpolant in zip(inds_to_interp, interpolants):
-                maxval = interpolant(max_data_z)
-                interp_vals[ind] = maxval * (max_z - z) / z_border
-        return interp_vals.reshape(pixel_shape)
-    
-    return interpolator
-
-
-@dataclass(init=False)
+@dataclass
 class FootprintsPerPlane:
-    """Footprints with ROIs on multiple planes separate, with methods to binarize, smooth, etc."""
+    """
+    Footprints with ROIs on multiple planes separate, with methods to binarize, smooth, etc.
+    Methods mutate the object's references, but should not mutate referenced objects themselves, so a shallow copy
+        should be sufficient to avoid changing the original.
+    """
     dims: tuple[int, int]  # Y, X dimensions of each plane
-    data: list[sparse.csc_matrix]  # each entry contains the ROIs from 1 plane
-    z_positions: np.ndarray  # Z position of each plane in xy_masks
-    nonempty: np.ndarray # n_planes x n_rois boolean matrix of whether each ROI is present in each plane
+    data: sparse.csc_matrix  # pixels (flattened in F-order) x cells
+    z_positions: onp.Array1D[np.floating]  # Z position of each plane (um)
+    n_pixels_per_plane: onp.Array2D[np.integer]  # n_planes x n_rois matrix of # of pixels for each ROI in each plane
     bboxes: list[list[BorderSpec]]  # bboxes of nonempty pixels for each cell in each plane
     footprint_type: Literal['raw', 'binary', 'likelihood']  # what kind of data are in data
     source_session: str  # session name of session these are from
     space_of_session: Optional[str]  # session name of session the footprints are in the space of (same as source_session unless they were remapped)
 
-    def __init__(self, mouse_id: Union[int, str], sess_id: int, tag: Optional[str],
-                 session_z_offset_um: float, rec_type='learning_ppc', session_cell_ids: Optional[np.ndarray] = None):
+    @property
+    def n_planes(self) -> int:
+        return self.z_positions.size
+
+    @property
+    def plane_pix(self) -> int:
+        return self.dims[0] * self.dims[1]
+
+    @property
+    def nonempty(self) -> onp.Array2D[np.bool_]:
+        """n_planes x n_rois boolean matrix of whether each ROI is present in each plane"""
+        return self.n_pixels_per_plane > 0
+
+    def plane_data(self, k_plane: int) -> sparse.csc_matrix:
+        if k_plane < 0 or k_plane >= self.n_planes:
+            raise ValueError(f'Invalid plane index; must be in [0, {self.n_planes})')
+        
+        return self.data[k_plane*self.plane_pix:(k_plane+1)*self.plane_pix, :]
+
+    @property
+    def planes(self) -> Generator[sparse.csc_matrix]:
+        for k_plane in range(self.n_planes):
+            yield self.data[k_plane*self.plane_pix:(k_plane+1)*self.plane_pix, :]
+
+
+    @classmethod
+    def load_from_session(
+        cls, mouse_id: Union[int, str], sess_id: Union[int, str], tag: Optional[str], session_z_offset_um: float,
+        rec_type='learning_ppc', session_cell_ids: Optional[np.ndarray] = None, uuid: Optional[str] = None) -> Self:
+        """Typical factory method for loading footprints from SessionAnalysis"""
 
         sessinfo = cma.load_latest(mouse_id, sess_id, rec_type=rec_type, tag=tag, quiet=True)
+        if uuid is not None:
+            sessinfo.select_cnmf_run(uuid, save=False)
+
         if sessinfo.cnmf_fit is None:
             raise RuntimeError('CNMF not run?')
         est = sessinfo.cnmf_fit.estimates
         if est.dims is None or est.A is None:
             raise RuntimeError('No dims or A; CNMF not run?')
 
-        self.dims = (int(est.dims[0]), int(est.dims[1]) // sessinfo.metadata['num_planes'])
-
+        n_cells = est.A.shape[1]
         if session_cell_ids is None:
-            n_cells = est.A.shape[1]
             session_cell_ids = np.arange(n_cells)
 
-        self.data = [A[:, session_cell_ids] for A in sessinfo.get_footprints_per_plane()]
+        footprints = normalize_footprints(sparse.csc_matrix(est.A[:, session_cell_ids]))
+        n_cells = footprints.shape[1]
+
+        z_positions = sessinfo.get_relative_depths() + session_z_offset_um
+        n_planes = z_positions.size
+
+        if isinstance(sess_id, int):
+            source_session = make_sess_name(sess_id, tag)
+        else:
+            source_session = sess_id
+
+        self = cls(
+            dims=(int(est.dims[0]), int(est.dims[1]) // sessinfo.metadata['num_planes']),
+            data=footprints,
+            z_positions=z_positions,
+            n_pixels_per_plane=np.zeros((n_planes, n_cells), dtype=int),
+            bboxes=[],
+            footprint_type='raw',
+            source_session=source_session,
+            space_of_session=source_session
+        )
+
+        # initialize nonempty indicators and bounding boxes
         self.recalc_nonempty()
         self.recalc_bboxes()
-        self.z_positions = sessinfo.get_relative_depths() + session_z_offset_um
-        
-        self.footprint_type = 'raw'
-        self.source_session = make_sess_name(sess_id, tag)
-        self.space_of_session = self.source_session
+        return self
+
+
+    def select_and_copy(self, cell_index: Union[onp.ToInt1D, onp.ToBool1D, slice]):
+        """
+        Copy a subset of cells, specified by a boolean mask, indices, or a slice
+        Note this is always an index directly into the set of cells in self, with no
+        reference to session_cell_ids that may have been used when creating the object.
+        """
+        n_cells = self.data.shape[1]
+        all_inds = np.arange(n_cells, dtype=int)
+        if isinstance(cell_index, slice):
+            cell_inds = all_inds[cell_index]
+        else:
+            cell_inds = all_inds[np.asarray(cell_index)]
+
+        return type(self)(
+            dims=self.dims,
+            data=self.data[:, cell_inds],
+            z_positions=self.z_positions,
+            n_pixels_per_plane=self.n_pixels_per_plane[:, cell_inds],
+            bboxes=[[plane_bboxes[i] for i in cell_inds] for plane_bboxes in self.bboxes],
+            footprint_type=self.footprint_type,
+            source_session=self.source_session,
+            space_of_session=self.space_of_session
+        )
+
 
     def recalc_nonempty(self):
-        self.nonempty = np.stack([masks.getnnz(axis=0) > 0 for masks in self.data])
+        # count pixels in bins of rows and for each component using indptr
+        plane_bins = np.arange(0, self.plane_pix * self.n_planes + 1, self.plane_pix)  # include endpoint
+        comp_bins = self.data.indptr
+        n_per_plane, _ = np.histogramdd((self.data.indices, np.arange(self.data.nnz)), bins=(plane_bins, comp_bins))
+        self.n_pixels_per_plane = n_per_plane.astype(int)
 
     def recalc_bboxes(self):
         self.bboxes = []
-        for A, nonempty in zip(self.data, self.nonempty):
-            self.bboxes.append(get_bboxes(A, dims=self.dims, nonempty_filter=nonempty))
+        for plane_fp, nonempty in zip(self.planes, self.nonempty):
+            self.bboxes.append(get_bboxes(plane_fp, dims=self.dims, nonempty_filter=nonempty))
 
     # transformations:
 
-    def binarize(self, **binarize_kwargs):
-        """Binarize footprints from each plane. Takes same params as footprints.binarize_footprints."""
+    def binarize(self, planewise=True, **binarize_kwargs):
+        """
+        Binarize footprints from each plane. Takes same params as footprints.binarize_footprints.
+        By default, applies binarization to each plane separately; use planewise=False to apply to 3D footprints
+        """
         if self.footprint_type == 'binary':
             return
         
         if self.footprint_type != 'raw':
             logging.warning('Binarizing footprints that are not of type "raw"')
         
-        for i, (A, nonempty) in enumerate(zip(self.data, self.nonempty)):
-            self.data[i] = binarize_footprints(A, nonempty_filter=nonempty, **binarize_kwargs)
+        if planewise:
+            self.data = sparse.vstack([
+                binarize_footprints(A, nonempty_filter=nonempty, **binarize_kwargs)
+                for A, nonempty in zip(self.planes, self.nonempty)
+            ], format="csc")
+        else:
+            self.data = binarize_footprints(self.data, nonempty_filter=np.any(self.nonempty, axis=0), **binarize_kwargs)
         
         self.recalc_nonempty()
         self.footprint_type = 'binary'
     
-    def smooth(self, **smooth_kwargs):
+    def smooth(self, sigma: float, **smooth_kwargs):
         """Smooth footprints from each plane. Takes same params as footprints.smooth_footprints."""
         if self.footprint_type != 'binary':
             logging.warning('Smoothing footprints that are not of type "binary"')
 
-        for i, (A, nonempty, bboxes) in enumerate(zip(self.data, self.nonempty, self.bboxes)):
-            self.data[i] = smooth_footprints(
-                A, self.dims, nonempty_filter=nonempty, bboxes=bboxes, **smooth_kwargs)
+        self.data = sparse.vstack([
+            smooth_footprints(A, self.dims, sigma, nonempty_filter=nonempty, bboxes=bboxes, **smooth_kwargs)
+            for A, nonempty, bboxes in zip(self.planes, self.nonempty, self.bboxes)
+        ], format="csc")
 
         if self.footprint_type == 'binary':
             self.footprint_type = 'likelihood'
@@ -615,17 +619,31 @@ class FootprintsPerPlane:
         xy_remap can either be a single tuple (X, Y) of remapping matrices or a dict mapping from
         session names to mappings to those sessions. If it is a dict, to_sess must be non-None to 
         select the correct mapping. self.space_of_session will be updated to to_sess regardless.
+
+        If x-size of the mapping matches the plane size, it will be interpreted as a flat mapping to apply
+        to each plane; otherwise it will be treated as a mapping that applies over the concatenated planes,
+        if possible.
         """
         if isinstance(xy_remap, Mapping):
             if to_sess is None:
                 raise TypeError('to_sess must be provided if xy_remap is a dict')
             xy_remap = xy_remap[to_sess]
 
-        if len(xy_remap) != 2:
-            raise TypeError('xy_remap must have a size of 2 along the first dimension (X and Y)')
+        remap_dims, remap_len_y, remap_len_x = xy_remap.shape
 
-        this_remap = (xy_remap[0], xy_remap[1])
-        self.data = [map_footprints(fp, this_remap) for fp in self.data]
+        if remap_dims != 2:
+            raise TypeError('xy_remap must have a size of 2 along the first dimension (X and Y)')
+        
+        if remap_len_y == self.dims[0] and remap_len_x == self.dims[1]:
+            # flat remapping
+            self.data = sparse.vstack([
+                map_footprints(A, (xy_remap[0], xy_remap[1])) for A in self.planes
+            ], format="csc")
+
+        elif remap_len_y == self.dims[0] and remap_len_x == self.dims[1] * self.n_planes:
+            # planewise remapping
+            self.data = map_footprints(self.data, (xy_remap[0], xy_remap[1]))
+
         self.space_of_session = to_sess
 
         # recompute nonemepty and bboxes relative to new space
@@ -675,8 +693,10 @@ def maxproj_per_cell(footprints: Sequence[FootprintsPerPlane], matchings: Sequen
                 continue
             sess_cell_ind = sess_cell_inds[0]
 
-            for kplane in np.flatnonzero(fp.nonempty[:, sess_cell_ind]):
-                footprint_2d = fp.data[kplane][:, sess_cell_ind].toarray().reshape(dims, order='F')
+            for kplane in range(fp.n_planes):
+                if not fp.nonempty[kplane, sess_cell_ind]:
+                    continue
+                footprint_2d = fp.plane_data(kplane)[:, sess_cell_ind].toarray().reshape(dims, order='F')
                 footprint_window = footprint_2d[yslice, xslice]
                 maxproj = np.maximum(maxproj, footprint_window)
         return maxproj
@@ -687,23 +707,68 @@ def maxproj_per_cell(footprints: Sequence[FootprintsPerPlane], matchings: Sequen
     return make_max_projection
 
 
+# tagged union indicating what type of footprint interpolation to use and the settings
+@dataclass
+class InterpSettings:
+    pass
+
+@dataclass
+class SmoothingSplineInterpSettings(InterpSettings):
+    z_border: float = 20.  # distance beyond data extent in z where output may be nonzero
+    lam: Optional[float] = None  # smoothing parameter
+
+@dataclass
+class RBFInterpSettings(InterpSettings):
+    um_per_pixel_x: float
+    um_per_pixel_y: float
+    smoothing: float = 1.  # how closely to adhere to original data (does not have to do with spread)
+    expansion_pix: int = 2  # how many pixels to potentially expand footprints by in X and Y
+    reduce_neighbors_based_on_query_zs: bool = True
+    max_dist: float = 20.  # only used for neighbors; should match max dist used for matching
+    query_zs: Optional[onp.Array1D[np.floating]] = None  # only used for neighbors
+
+@dataclass
+class GaussianAverageSettings(InterpSettings):
+    sigma: float  # standard deviation
+
+
 def footprint_interpolator_per_cell(
         footprints: Sequence[FootprintsPerPlane], matchings: Sequence[np.ndarray],
-        borders: Sequence[BorderSpec], cached=False
-        ) -> Callable[[int], Callable[[float], np.ndarray]]:
+        borders: Sequence[BorderSpec], interp_settings: InterpSettings, cached=False
+        ) -> tuple[Callable[[int], Callable[[float], np.ndarray]], Sequence[BorderSpec]]:
     """
     Make a function that maps cell IDs to Z-axis footprint interpolators, optionally with a cache.
         - footprints: list of FootprintsPerPlane objects (1 per session) that are all mapped to the same session
         - matchings: for each session, the union cell ids that each cell in footprints corresponds to
         - borders: list of BorderSpec objects (1 per cell) specifying what region of the image to fit each interpolator to
         - cached: whether to cache the mapping from cell to interpolator.
+        - interp_settings: interpolation settings for the desired interpolator type
+
+    Returns a function that produces the interpolator given a union cell ID and a list of
+        BorderSpecs for the interpolation output
     """
     validate_all_mapped_to_same_session(footprints)
+
+    match interp_settings:
+        case SmoothingSplineInterpSettings():
+            interpolator_fn = make_smoothing_spline_footprint_interpolator
+            borders_exp = borders  # no expansion
+        case RBFInterpSettings(expansion_pix=expansion_pix):
+            interpolator_fn = make_rbf_footprint_interpolator
+            borders_exp = [border.decreased(expansion_pix) for border in borders]
+        case GaussianAverageSettings():
+            interpolator_fn = make_gaussian_average_interpolator
+            borders_exp = borders
+        case other:
+            if other == InterpSettings():
+                raise TypeError('A subclass of InterpSettings matching the interpolator type to use must be passed')
+            else:
+                raise TypeError(f'Unknown InterpSettings subclass {other.__class__.__name__}')
 
     def likelihood_map_interpolator(cell_id: int) -> Callable[[float], np.ndarray]:
         """Cache mappings from z position to likelihood maps"""
         dims = footprints[0].dims
-        plot_slices = borders[cell_id].slices(dims)
+        plot_slices = borders_exp[cell_id].slices(dims)
         zs: list[float] = []
         all_footprints: list[np.ndarray] = []
 
@@ -713,18 +778,198 @@ def footprint_interpolator_per_cell(
                 continue
             sess_cell_ind = sess_cell_inds[0]
 
-            for kplane in np.flatnonzero(fp.nonempty[:, sess_cell_ind]):
+            for kplane in range(fp.n_planes):
+                if not fp.nonempty[kplane, sess_cell_ind]:
+                    continue
+
                 zs.append(float(fp.z_positions[kplane]))
-                footprint_2d = fp.data[kplane][:, sess_cell_ind].toarray().reshape(dims, order='F')
+                footprint_2d = fp.plane_data(kplane)[:, sess_cell_ind].toarray().reshape(dims, order='F')
                 footprint_window = footprint_2d[plot_slices]
                 all_footprints.append(footprint_window)
 
-        return make_footprint_interpolator(all_footprints, zs)
+        if len(all_footprints) == 0:
+            return lambda z: np.zeros(borders_exp[cell_id].center_shape(dims))
+        else:
+            return interpolator_fn(all_footprints, zs, **asdict(interp_settings))
 
     if cached:
         likelihood_map_interpolator = cache(likelihood_map_interpolator)
 
-    return likelihood_map_interpolator
+    return likelihood_map_interpolator, borders_exp
+
+
+def make_gaussian_average_interpolator(
+    footprints: onp.ToArray1D, zs: Union[Sequence[float], onp.Array1D[np.floating]],
+    sigma: float) -> Callable[[float], np.ndarray]:
+    """
+    Make function to not really interpolate, but just take a Gaussian-weighted average
+    of the given footprints along z, with Gaussian centered at the query Z.
+    """
+    footprints = np.asarray(footprints)
+
+    if footprints.shape[0] != len(zs):
+        raise ValueError('Exactly one z value must be provided for each footprint')
+
+    zs_arr = np.asarray(zs)
+
+    def averager(query_z: float) -> np.ndarray:
+        # compute Gaussian weights
+        norm_dist = (zs_arr - query_z) / sigma
+        wts = np.exp(-0.5 * norm_dist ** 2)  # keep unnormalized, max = 1
+        return np.tensordot(wts, footprints, axes=1)
+
+    return averager
+
+
+def make_rbf_footprint_interpolator(
+    footprints: onp.ToArrayStrict3D, zs: Union[Sequence[float], onp.Array1D[np.floating]],
+    um_per_pixel_x: float, um_per_pixel_y: float, smoothing=1., expansion_pix=2,
+    reduce_neighbors_based_on_query_zs=True, max_dist=20., query_zs: Optional[onp.Array1D[np.floating]] = None,
+    min_val: Optional[float] = 0., max_val: Optional[float] = 1.) -> Callable[[float], np.ndarray]:
+    """
+    Make function to interpolate between multiple footprints at different z locations, to a new z location,
+        using SciPy's RBFInterpolator (radial basis function) with a linear kernel.
+    footprints should be a 3D matrix, Z x Y x X, where the Zs match the passed zs and do not need to be sorted or unique.
+    um_per_pixel_x and um_per_pixel_y are needed so that the kernel is isotropic with respect to real distance,
+        assuming that zs are also in um.
+    smoothing: see RBFInterpolator.
+    reduce_neighbors_based_on_query_zs: If True, based on Zs that will be queried later (passed in query_zs)
+        and the max distance at which a match is possible, computes a reduced max number of neighbors to use in the
+        interpolator that is also based on the size of the footprint.
+    min_val, max_val: if not None, clip to these values after interpolating (necessary since it's cubic)
+    The return value of the interpolator matches the shape of the input past the 1st dimension.
+    """
+    # construct grid of points
+    footprints = np.asarray(footprints)
+    nz, ny, nx = footprints.shape
+
+    if nz != len(zs):
+        raise ValueError('Exactly one z value must be provided for each footprint')
+    
+    pts_z, pts_y, pts_x = np.meshgrid(zs, np.arange(ny) * um_per_pixel_y, np.arange(nx) * um_per_pixel_x, indexing='ij')
+    pts = np.stack([pts_z.ravel(), pts_y.ravel(), pts_x.ravel()], axis=1)
+    vals = footprints.ravel()
+
+    if reduce_neighbors_based_on_query_zs and query_zs is not None and query_zs.size > 0:
+        # compute max neighbors we will need
+        neighbors = 0
+        zs_arr = np.asarray(zs)
+        xy_dists_sq_max = pts_x.ravel() ** 2 + pts_y.ravel() ** 2
+
+        for qz in query_zs:
+            zdists_sq = (zs_arr - qz) ** 2
+            zdists_sq = zdists_sq[zdists_sq <= max_dist ** 2]
+            if zdists_sq.size == 0:
+                continue
+
+            # find max Euclidean distance to allow based on expansion_pix
+            max_dist_sq = np.max(zdists_sq) + expansion_pix**2
+
+            # find how many pixels in each used plane should be included
+            this_neighbors = 0
+            for zdist_sq in zdists_sq:
+                this_neighbors += math.ceil(np.sum((xy_dists_sq_max + zdist_sq) <= max_dist_sq))
+
+            neighbors = max(neighbors, this_neighbors)
+    else:
+        neighbors = None
+
+    interpolant = RBFInterpolator(pts, vals,  smoothing=smoothing, neighbors=neighbors, kernel='linear')
+
+    # points for interpolating with a single z
+    pts_yx = np.stack([pts_y[0].ravel(), pts_x[0].ravel()], axis=1)
+
+    def interpolator(z: float) -> np.ndarray:
+        pts = np.concatenate([np.tile([[z]], (pts_yx.shape[0], 1)), pts_yx], axis=1)
+        vals_interp = interpolant(pts)
+        return np.clip(vals_interp, min_val, max_val).reshape((ny, nx))
+
+    return interpolator
+
+
+def make_smoothing_spline_footprint_interpolator(
+    footprints: onp.ToArray2D, zs: Union[Sequence[float], onp.Array1D[np.floating]], z_border: float = 20,
+    min_val: Optional[float] = 0., max_val: Optional[float] = 1., lam: Optional[float] = None
+    ) -> Callable[[float], np.ndarray]:
+    """
+    Make function to interpolate between multiple footprints at different z locations, to a new z location,
+        using SciPy's make_smoothing_spline.
+    Each row of footprints should be a single footprint across space, of length prod(dims) in F-order.
+    N-D arrays are also supported, with z along the first axis.
+    The length of zs should equal footprints.shape[0]. Typically this is in um although it only has to be in the 
+        same unit as z_border.
+    z_border is the maximum distance past the edge where the footprint might be nonzero;
+        z values less than min(zs) - z_border or greater than max(zs) + z_border will always yield all 0s.
+    mss_kwargs are passed on to make_smoothing_spline. For example, "lam" controls the smoothness (larger = smoother);
+        by default this is estimated automatically.
+    min_val, max_val: if not None, clip to these values after interpolating (necessary since it's cubic)
+    The return value of the interpolator matches the shape of the input past the 1st dimension..
+    """
+    footprints = np.asarray(footprints)
+    if footprints.shape[0] != len(zs):
+        raise ValueError('Exactly one z value must be provided for each footprint')
+    
+    if z_border < 0:
+        raise ValueError('z_border must be non-negative')
+    
+    pixel_shape = footprints.shape[1:]
+    n_pixels = int(np.prod(pixel_shape))
+
+    # find which pixels to include in interpolator
+    inds_to_interp = np.flatnonzero(np.any(footprints != 0, axis=0))
+    data_for_interp = footprints.reshape((len(zs), -1))[:, inds_to_interp]
+    min_data_z, max_data_z = np.min(zs), np.max(zs)
+    min_z = min_data_z - z_border
+    max_z = max_data_z + z_border
+
+    # augment data so that cubic interpolation works
+    data_aug, zs_aug = augment_data_for_interpolation(   # make_smoothing_spline requires at least 5 points
+        data_for_interp, zs, z_border=z_border, n_border_points=0, min_total_points=5)
+
+    # sort and average any repeats
+    z_sorted, inv_inds, counts = np.unique(zs_aug, return_inverse=True, return_counts=True)
+    data_sorted = np.zeros((len(z_sorted), data_aug.shape[1]))
+    for inv_ind, data in zip(inv_inds, data_aug):  # index into z_sorted and data_sorted for this footprint
+        data_sorted[inv_ind] += data / counts[inv_ind]
+
+    # make functions for interpolation
+    interpolant = make_smoothing_spline(z_sorted, data_sorted, lam=lam)
+
+    def interpolator(z: float) -> np.ndarray:
+        output_vals = np.zeros(n_pixels)
+        if z > min_data_z and z < max_data_z:
+            output_vals[inds_to_interp] = interpolant(z)
+        elif z > min_z and z <= min_data_z:
+            minvals = interpolant(min_data_z)
+            output_vals[inds_to_interp] = minvals * (z - min_z) / z_border
+        elif z < max_z and z >= max_data_z:
+            maxvals = interpolant(max_data_z)
+            output_vals[inds_to_interp] = maxvals * (max_z - z) / z_border
+        return np.clip(output_vals, min_val, max_val).reshape(pixel_shape)
+    return interpolator
+
+
+def augment_data_for_interpolation(footprints: np.ndarray, zs: Union[Sequence[float], np.ndarray], n_border_points,
+                                   z_border: float = 20, min_total_points=0) -> tuple[np.ndarray, np.ndarray]:
+    """
+    Add linear ramp to 0 above and below given footprint and z data. n_border_points will be added going up
+    and down until z_border from the max/min z points. If min_total_points is nonzero, will also ensure there are
+    at least this number of points in the resulting arrays (increasing the number of border points if necessary).
+    Returns (footprints_aug, zs_aug).
+    """
+    n_unique = len(set(zs))
+    n_aug_needed = max(2*n_border_points, min_total_points - n_unique)  # make_smoothing_spline requires at least 5 points
+    n_aug_below = n_aug_needed // 2
+    n_aug_above = n_aug_needed - n_aug_below
+    min_z_ind, max_z_ind = int(np.argmin(zs)), int(np.argmax(zs))
+    ramp_z_below = np.linspace(zs[min_z_ind] - z_border, zs[min_z_ind], n_aug_below, endpoint=False)
+    ramp_z_above = np.linspace(zs[max_z_ind] + z_border, zs[max_z_ind], n_aug_above, endpoint=False)
+    ramp_footprints_below = np.linspace(0, footprints[min_z_ind], n_aug_below, endpoint=False)
+    ramp_footprints_above = np.linspace(0, footprints[max_z_ind], n_aug_above, endpoint=False)
+
+    zs_aug = np.concatenate([zs, ramp_z_below, ramp_z_above])
+    footprints_aug = np.concatenate([footprints, ramp_footprints_below, ramp_footprints_above], axis=0)
+    return footprints_aug, zs_aug
 
 
 # The below are obsolete (replaced by EstimatesExt.merge_components_crossplane),
@@ -774,7 +1019,7 @@ def get_ROIs_to_merge_crossplane(A: MaybeSparse, C: np.ndarray, n_planes: int, p
         for k_comp, (plane_rois, planes) in enumerate(zip(merged_ROIs, roi_planes)):
             for roi, plane in zip(plane_rois, planes):
                 if plane == k_plane:
-                    A_merged[:, k_comp] += A_flat[:, roi]
+                    A_merged[:, k_comp] += A_flat[:, roi]  # type: ignore
 
         As_merged.append(sparse.csc_matrix(A_merged))
 

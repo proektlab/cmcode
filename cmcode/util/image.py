@@ -3,14 +3,13 @@ from collections.abc import Mapping, Sequence, Callable
 from dataclasses import dataclass
 from functools import partialmethod, partial, reduce
 import math
-from typing import Union, Optional, Any, TypeVar, overload
+from typing import Union, Optional, Any, Literal, TypeVar, overload, get_args
 from typing_extensions import Self
 
 import cv2
 from matplotlib.axes import Axes
 import numpy as np
 from numpy.typing import ArrayLike
-from optype import CanFloat
 import optype.numpy as onp
 import pandas as pd
 from scipy import ndimage, interpolate
@@ -19,6 +18,7 @@ from scipy.ndimage import median_filter
 from mesmerize_core.utils import Border
 
 from cmcode.util.scaled import ScaledDataFrame, ScaledSeries, ScaledPixels
+from cmcode.util.types import Integral, Real
 
 
 COLORS = {
@@ -46,18 +46,18 @@ class BorderSpec:
     bottom_subpix: float
 
     def __init__(
-            self, left: Optional[CanFloat] = None, right: Optional[CanFloat] = None,
-            top: Optional[CanFloat] = None, bottom: Optional[CanFloat] = None,
+            self, left: Optional[Real] = None, right: Optional[Real] = None,
+            top: Optional[Real] = None, bottom: Optional[Real] = None,
             *, left_subpix=0., right_subpix=0., top_subpix=0., bottom_subpix=0.):
         """
         Normal usage: provide borders as positional arguments, or nonzero borders as "left", "right", etc.
         keyword arguments. The *_subpix arguments are also provided so that "replace" works; these are
         used first as defaults, then the non-suffixed arguments are applied on top.
         """
-        left = float(left) if left is not None else left_subpix
-        right = float(right) if right is not None else right_subpix
-        top = float(top) if top is not None else top_subpix
-        bottom = float(bottom) if bottom is not None else bottom_subpix
+        left = left if left is not None else left_subpix
+        right = right if right is not None else right_subpix
+        top = top if top is not None else top_subpix
+        bottom = bottom if bottom is not None else bottom_subpix
 
         object.__setattr__(self, 'left_subpix', float(left))
         object.__setattr__(self, 'right_subpix', float(right))
@@ -105,12 +105,17 @@ class BorderSpec:
         """Get scalar maximum border"""
         return max(self.left, self.right, self.top, self.bottom)
 
+    def round(self) -> Self:
+        """Round (rather than ceil each border)"""
+        return type(self)(
+            left=round(self.left_subpix), right=round(self.right_subpix),
+            top=round(self.top_subpix), bottom=round(self.bottom_subpix))
 
-    def _arithmetic_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> Self:
+    def _arithmetic_op(self, op: str, other: Union[Real, 'BorderSpec']) -> Self:
         """Apply arithmetic operation to all sides"""
         sides = ['left', 'right', 'top', 'bottom']
         op_method = getattr(float, op)
-        if isinstance(other, CanFloat):
+        if isinstance(other, Real):
             res = type(self)(**{side: op_method(getattr(self, side + '_subpix'), float(other)) for side in sides})
         elif isinstance(other, BorderSpec):
             res = type(self)(**{side: op_method(
@@ -120,35 +125,35 @@ class BorderSpec:
             return NotImplemented
         return type(self).max(res, 0)
 
-    def increased(self, other: Union[CanFloat, 'BorderSpec'], shape: Optional[tuple[int, int]] = None) -> Self:
+    def increased(self, other: Union[Real, 'BorderSpec'], shape: Optional[tuple[int, int]] = None) -> Self:
         """Increase borders, limiting result to maximal borders if shape is given"""
         res = self._arithmetic_op('__add__', other)
         if shape is not None:
             res = type(self).min(res, type(self).maximal(shape=shape))
         return res
     
-    def decreased(self, other: Union[CanFloat, 'BorderSpec']) -> Self:
+    def decreased(self, other: Union[Real, 'BorderSpec']) -> Self:
         """Decrease borders"""
         return self._arithmetic_op('__sub__', other)
 
     __mul__ = partialmethod(_arithmetic_op, '__mul__')
     __truediv__ = partialmethod(_arithmetic_op, '__truediv__')
 
-    def shifted(self, x_shift: CanFloat, y_shift: CanFloat) -> Self:
+    def shifted(self, x_shift: Real, y_shift: Real) -> Self:
         """Rigidly shift borders, clipping to 0"""
         res = type(self)(
-            left=self.left_subpix + float(x_shift),
-            right=self.right_subpix - float(x_shift),
-            top=self.top_subpix + float(y_shift),
-            bottom=self.bottom_subpix - float(y_shift)
+            left=self.left_subpix + x_shift,
+            right=self.right_subpix - x_shift,
+            top=self.top_subpix + y_shift,
+            bottom=self.bottom_subpix - y_shift
         )
         return type(self).max(res, 0)
 
-    def _comparison_op(self, op: str, other: Union[CanFloat, 'BorderSpec']) -> bool:
+    def _comparison_op(self, op: str, other: Union[Real, 'BorderSpec']) -> bool:
         """Delegate comparisons to int comparisons of all sides"""
         sides = ['left_subpix', 'right_subpix', 'top_subpix', 'bottom_subpix']
         op_method = getattr(float, op)
-        if isinstance(other, CanFloat):
+        if isinstance(other, Real):
             return all(op_method(getattr(self, side), other) for side in sides)
         elif isinstance(other, BorderSpec):
             return all(op_method(getattr(self, side), getattr(other, side)) for side in sides)
@@ -163,7 +168,7 @@ class BorderSpec:
     __ge__ = partialmethod(_comparison_op, '__ge__')
 
     @classmethod
-    def equal(cls, border: CanFloat) -> Self:
+    def equal(cls, border: Real) -> Self:
         return cls(left=border, right=border, top=border, bottom=border)
     
     @classmethod
@@ -172,11 +177,11 @@ class BorderSpec:
     
     @classmethod
     def combine(cls, fn: Callable[[float, float], float],
-                border1: Union[None, CanFloat, Self], border2: Union[None, CanFloat, Self]) -> Self:
+                border1: Union[None, Real, Self], border2: Union[None, Real, Self]) -> Self:
         """Combine 2 borders into a BorderSpec by applying the given function to each pair of matching dimensions.""" 
-        if isinstance(border1, CanFloat):
+        if isinstance(border1, Real):
             border1 = cls.equal(border1)
-        if isinstance(border2, CanFloat):
+        if isinstance(border2, Real):
             border2 = cls.equal(border2)
 
         if border1 is None:
@@ -194,57 +199,86 @@ class BorderSpec:
         )
 
     @classmethod
-    def max(cls, first: Union[CanFloat, Self], *others: Union[CanFloat, Self]) -> Self:
+    def max(cls, first: Union[Real, Self], *others: Union[Real, Self]) -> Self:
         """Make a BorderSpec for the maximum border along each side"""
-        if isinstance(first, CanFloat):
+        if isinstance(first, Real):
             first = cls.equal(first)
         return reduce(partial(cls.combine, max), others, first)
 
     @classmethod
-    def min(cls, first: Union[CanFloat, Self], *others: Union[CanFloat, Self]) -> Self:
+    def min(cls, first: Union[Real, Self], *others: Union[Real, Self]) -> Self:
         """Make a BorderSpec for the minimum border along each side"""
-        if isinstance(first, CanFloat):
+        if isinstance(first, Real):
             first = cls.equal(first)
         return reduce(partial(cls.combine, min), others, first)
     
+
+    # center-related methods
+    def center_point(self, shape: tuple[int, int]) -> tuple[float, float]:
+        """(Y, X) point in the center of borders, for a given shape"""
+        y_center = (self.top_subpix + shape[0] - self.bottom_subpix) / 2
+        x_center = (self.left_subpix + shape[1] - self.right_subpix) / 2
+        return y_center, x_center
+
+    @classmethod
+    def around_point(
+        cls, shape: tuple[int, int], center_point: tuple[float, float],
+        center_shape: tuple[Real, Real]) -> Self:
+        """
+        Make border for given center shape around a point, for an image of size shape
+        Shifts the border to keep it within bounds, maintaining the same shape if possible
+        If center_shape[i] is an int, result in that dimension is rounded so that it falls on a pixel boundary.
+        """
+        def get_dim_borders(dim: Literal[0, 1]) -> tuple[Real, Real]:
+            if center_shape[dim] >= shape[dim]:
+                start = end = 0  # just use maximal center
+            else:
+                center_coord = center_point[dim]
+                if isinstance(center_shape[dim], Integral):
+                    center_coord = round(center_coord)
+                    start_offset = center_shape[dim] // 2
+                else:
+                    start_offset = center_shape[dim] / 2
+                end_offset = center_shape[dim] - start_offset
+
+                start = center_coord - start_offset
+                end = shape[dim] - center_coord - end_offset
+                # should be able to shift to fit if necessary
+                if start < 0:
+                    end += start
+                    start = 0
+                elif end < 0:
+                    start += end
+                    end = 0
+                
+            return start, end
+        
+        top, bottom = get_dim_borders(0)
+        left, right = get_dim_borders(1)
+        return cls(left=left, right=right, top=top, bottom=bottom)
+
+
     def is_center_nonempty(self, shape: tuple[int, int]) -> bool:
         """Whether there are any pixels left in the center, given shape"""
         center_shape = self.center_shape(shape)
         return center_shape[0] > 0 and center_shape[1] > 0
     
-    def enclosing_square(self, shape: tuple[int, int]) -> Self:
+    def enclosing_square(self, shape: tuple[int, int], min_size=0.) -> Self:
         """
         Transform into another BorderSpec that removes fewer or equal rows and columns than this one
-        and has a square center, if possible. Does nothing if the center is empty.
+        and has a square center, if possible. Does nothing if the center is empty and min_size is 0.
         """
-        if not self.is_center_nonempty(shape):
+        if not self.is_center_nonempty(shape) and min_size == 0:
             return self
         
-        height, width = self.center_shape_subpix(shape)
-        if height == width:
-            return self
-        
-        def distribute_difference(diff: float, border1: float, border2: float) -> tuple[float, float]:  # (newborder1, newborder2)
-            half_diff = diff / 2
-            if border1 >= half_diff and border2 >= half_diff:
-                # typical case
-                return border1 - half_diff, border2 - half_diff
-            elif border1 + border2 >= diff:
-                # can make it square, just won't be symmetric
-                if border1 < half_diff:
-                    return 0, border2 - (diff - border1)
-                else:
-                    return border1 - (diff - border2), 0
-            else:
-                # just return minimum borders
-                return 0, 0
+        height, width = self.center_shape(shape)
+        size = max(height, width, min_size)
 
-        if height > width:
-            new_left, new_right = distribute_difference(height - width, self.left_subpix, self.right_subpix)
-            return type(self)(top=self.top_subpix, bottom=self.bottom_subpix, left=new_left, right=new_right)
-        else:
-            new_top, new_bottom = distribute_difference(width - height, self.top_subpix, self.bottom_subpix)
-            return type(self)(top=new_top, bottom=new_bottom, left=self.left_subpix, right=self.right_subpix)
+        if height == width == size:
+            return self
+
+        center = self.center_point(shape)
+        return type(self).around_point(shape, center_point=center, center_shape=(size, size))
 
 
     def slices(self, shape: Sequence[int]) -> tuple[slice, slice]:
@@ -282,8 +316,8 @@ class BorderedImage:
         if not isinstance(self.image, np.ndarray):
             object.__setattr__(self, 'image', np.asarray(self.image))
 
-        if isinstance(self.border, CanFloat):
-            object.__setattr__(self, 'border', BorderSpec.equal(float(self.border)))
+        if isinstance(self.border, Real):
+            object.__setattr__(self, 'border', BorderSpec.equal(self.border))
 
     # for convenience, provide shape directly to BorderSpec methods
     @property
