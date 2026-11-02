@@ -1189,7 +1189,8 @@ def my_check_register_ROIs(matched1: list[int],
                            highlight2: Sequence[int] = (),
                            show_single_plot_contours=True,
                            plot_labels: Union[bool, onp.Array1D[np.integer]] = True,
-                           sharexy=True):
+                           sharexy=True,
+                           switch_columns=False):
     """Plot results from register_ROIs using matplotlib or fastplotlib"""
     pct_1 = performance['recall'] * 100
     pct_2 = performance['precision'] * 100
@@ -1199,6 +1200,12 @@ def my_check_register_ROIs(matched1: list[int],
         'Matched',
         'Unmatched'
     ]
+
+    if isinstance(contour1_color, str):
+        titles[0] = titles[0] + f' (color: {contour1_color})'
+    
+    if isinstance(contour2_color, str):
+        titles[1] = titles[1] + f' (color: {contour2_color})'
 
     if isinstance(xrange, slice):
         xrange = (xrange, xrange)
@@ -1280,8 +1287,29 @@ def my_check_register_ROIs(matched1: list[int],
     else:
         clims1 = clims2 = clims
 
+    if switch_columns:
+        # switch 1 and 2
+        coords1 = coordinates2
+        coords1_orig = coordinates2_orig
+        coords2 = coordinates1
+        coords2_orig = coordinates1
+        matched1_filtered, matched2_filtered = matched2_filtered, matched1_filtered
+        unmatched1, unmatched2 = unmatched2, unmatched1
+        images[0], images[1] = images[1], images[0]
+        titles[0], titles[1] = titles[1], titles[0]
+        clims1, clims2 = clims2, clims1
+        contour1_color, contour2_color = contour2_color, contour1_color
+        highlight1, highlight2 = highlight2, highlight1
+    else:
+        coords1 = coordinates1
+        coords1_orig = coordinates1
+        coords2 = coordinates2
+        coords2_orig = coordinates2_orig
+
     plot_fn = make_registration_plot_fpl if backend == 'fpl' else make_registration_plot_mpl
-    return plot_fn(images=images, coordinates1=coordinates1, coordinates2=coordinates2, coordinates2_orig=coordinates2_orig,
+    return plot_fn(images=images,
+                   coordinates1_aligned=coords1, coordinates2_aligned=coords2,
+                   coordinates1_orig=coords1_orig, coordinates2_orig=coords2_orig,
                    matched1=matched1_filtered, matched2=matched2_filtered, unmatched1=unmatched1, unmatched2=unmatched2,
                    titles=titles, frame_apply=frame_apply, cmap=cmap, clims1=clims1, clims2=clims2,
                    contour1_color=contour1_color, contour2_color=contour2_color,
@@ -1291,8 +1319,9 @@ def my_check_register_ROIs(matched1: list[int],
     
 
 
-def make_registration_plot_fpl(images: list[np.ndarray], coordinates1: list[np.ndarray],
-                               coordinates2: list[np.ndarray], coordinates2_orig: list[np.ndarray],
+def make_registration_plot_fpl(images: list[np.ndarray],
+                               coordinates1_aligned: list[np.ndarray], coordinates2_aligned: list[np.ndarray],
+                               coordinates1_orig: list[np.ndarray], coordinates2_orig: list[np.ndarray],
                                matched1: Sequence[Optional[int]], matched2: Sequence[Optional[int]],
                                unmatched1: list[int], unmatched2: list[int],
                                titles: list[str], frame_apply: Optional[dict],
@@ -1337,29 +1366,30 @@ def make_registration_plot_fpl(images: list[np.ndarray], coordinates1: list[np.n
                         str(i), tuple(com.astype(int) + (5, 5)) + (0,), face_color=color, anchor='bottom-left')
 
     
-    thicknesses1 = np.full(len(coordinates1), 1.)
+    thicknesses1 = np.full(len(coordinates1_aligned), 1.)
     thicknesses1[highlight1] = 2.
-    thicknesses2 = np.full(len(coordinates2), 1.)
+    thicknesses2 = np.full(len(coordinates2_aligned), 1.)
     thicknesses2[highlight2] = 2.
 
     if show_single_plot_contours:
-        add_contours((0, 0), coordinates1, matched1, thicknesses1,
+        add_contours((0, 0), coordinates1_orig, matched1, thicknesses1,
                      contour1_color if use_contour_colors_for_top_plot else 'w', plot_labels=plot_labels)
-        add_contours((0, 0), coordinates1, unmatched1, thicknesses1, 'gray')
+        add_contours((0, 0), coordinates1_orig, unmatched1, thicknesses1, 'gray')
         add_contours((0, 1), coordinates2_orig, matched2, thicknesses2,
                      contour2_color if use_contour_colors_for_top_plot else 'w', plot_labels=plot_labels)
         add_contours((0, 1), coordinates2_orig, unmatched2, thicknesses2, 'gray')
 
-    add_contours((1, 0), coordinates1, matched1, thicknesses1, contour1_color, plot_labels=plot_labels)
-    add_contours((1, 0), coordinates2, matched2, thicknesses2, contour2_color, plot_labels=plot_labels)
-    add_contours((1, 1), coordinates1, unmatched1, thicknesses1, contour1_color)
-    add_contours((1, 1), coordinates2, unmatched2, thicknesses2, contour2_color)
+    add_contours((1, 0), coordinates1_aligned, matched1, thicknesses1, contour1_color, plot_labels=plot_labels)
+    add_contours((1, 0), coordinates2_aligned, matched2, thicknesses2, contour2_color, plot_labels=plot_labels)
+    add_contours((1, 1), coordinates1_aligned, unmatched1, thicknesses1, contour1_color)
+    add_contours((1, 1), coordinates2_aligned, unmatched2, thicknesses2, contour2_color)
     
     return iw.show()
 
 
-def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.ndarray],
-                               coordinates2: list[np.ndarray], coordinates2_orig: list[np.ndarray],
+def make_registration_plot_mpl(images: list[np.ndarray], 
+                               coordinates1_aligned: list[np.ndarray], coordinates2_aligned: list[np.ndarray], 
+                               coordinates1_orig: list[np.ndarray], coordinates2_orig: list[np.ndarray],
                                matched1: Sequence[Optional[int]], matched2: Sequence[Optional[int]],
                                unmatched1: list[int], unmatched2: list[int],
                                titles: list[str], frame_apply: Optional[dict],
@@ -1367,9 +1397,9 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
                                contour1_color: str, contour2_color: str, use_contour_colors_for_top_plot: bool,
                                highlight1: Sequence[int] = (), highlight2: Sequence[int] = (), show_single_plot_contours=True,
                                plot_labels: Union[bool, onp.Array1D[np.integer]] = True, sharexy=True):
-    lws1 = np.full(len(coordinates1), 1.)
+    lws1 = np.full(len(coordinates1_aligned), 1.)
     lws1[highlight1] = 2.
-    lws2 = np.full(len(coordinates2), 1.)
+    lws2 = np.full(len(coordinates2_aligned), 1.)
     lws2[highlight2] = 2.
 
     if plot_labels is False:
@@ -1381,7 +1411,7 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
         fig, axs = plt.subplots(2, 2, sharex=sharexy, sharey=sharexy)
         # top plots
         for ax, clims, image, coords, matched, unmatched, contour_color, title, lws in zip(
-            axs[0], [clims1, clims2], images[:2], [coordinates1, coordinates2_orig], [matched1, matched2],
+            axs[0], [clims1, clims2], images[:2], [coordinates1_orig, coordinates2_orig], [matched1, matched2],
             [unmatched1, unmatched2], [contour1_color, contour2_color], titles[:2], [lws1, lws2]
         ):
             ax.imshow(image, interpolation=None, cmap=cmap, vmin=clims[0], vmax=clims[1])
@@ -1395,12 +1425,20 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
                         # make sure to plot labels on every plane where the component appears
                         coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
                         for com in coms:
-                            ax.text(*(com + (5, 5)), str(label), c=color, clip_on=True, size='small')
+                            # ax.text(*(com + (5, 5)), str(label), c=color, clip_on=True, size='small')
+                            # include session cell ID
+                            ax.text(*(com + (5, 5)), f'U{label}\nS{cellid}', c=color, clip_on=True, size='small')
                 
                 for cellid in unmatched:
                     if coords[cellid].size == 0:
                         continue
                     ax.plot(*coords[cellid].T, lw=lws[cellid], c='gray')
+                    
+                    # include session cell ID
+                    coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
+                    for com in coms:
+                        ax.text(*(com + (5, 5)), f'S{cellid}', c='gray', clip_on=True, size='small')
+                    
             
             ax.set_axis_off()
             ax.set_title(title)
@@ -1411,16 +1449,19 @@ def make_registration_plot_mpl(images: list[np.ndarray], coordinates1: list[np.n
         ):
             ax.imshow(image, interpolation=None)
             for coords, lws, color, inds in zip(
-                [coordinates1, coordinates2], [lws1, lws2], [contour1_color, contour2_color], [sess1_inds, sess2_inds]):
+                [coordinates1_aligned, coordinates2_aligned], [lws1, lws2], [contour1_color, contour2_color], [sess1_inds, sess2_inds]):
                 for i, cellid in enumerate(inds):
                     if cellid is None or coords[cellid].size == 0:
                         continue
                     ax.plot(*coords[cellid].T, lw=lws[cellid], c=color)
-                    if b_matched and plot_labels[i] != -1:
-                        # make sure to plot labels on every plane where the component appears
-                        coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
-                        for com in coms:
+                    
+                    # make sure to plot labels on every plane where the component appears
+                    coms = get_coms_of_disconnected_coords(coords[cellid], dist_thresh=50)
+                    for com in coms:
+                        if b_matched and plot_labels[i] != -1:
                             ax.text(*(com + (5, 5)), str(plot_labels[i]), c=color, clip_on=True, size='small')
+                        else:
+                            ax.text(*(com + (5, 5)), str(f'S{cellid}'), c=color, clip_on=True, size='small')
             
             ax.set_axis_off()
             ax.set_title(title)
@@ -1683,7 +1724,6 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         'contour1_color': 'g',
         'contour2_color': 'm',
         'use_contour_colors_for_top_plot': True,
-        'merge_colors': ['g', 'm'],
     }
     check_register_ROIs_kwargs = {**check_register_ROIs_defaults, **check_register_ROIs_kwargs}
 
@@ -1696,7 +1736,7 @@ def check_session_alignment(align_results: dict, first_session_to_view: Union[in
         contour2_name=f'Session {sess2_name}' + title_addon,
         x_remap=xy_mapping[0], y_remap=xy_mapping[1], xrange=xrange,
         highlight1=highlight1, highlight2=highlight2, plot_labels=intersection_ids if plot_labels else False,
-        **check_register_ROIs_kwargs)
+        switch_columns=True, **check_register_ROIs_kwargs)
 
 
 def plot_aligned_ROIs(align_results: dict, border_pix=5, map_to: Optional[Union[str, int]] = None,
