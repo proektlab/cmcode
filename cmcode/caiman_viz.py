@@ -22,7 +22,7 @@ from holoviews.operation.datashader import rasterize
 from holoviews.streams import Stream, param
 from IPython.display import display
 from ipywidgets import (HBox, VBox, IntSlider, Label, Layout, Button, Image as ImageWidget, 
-                        Output, SelectMultiple, HTML, CallbackDispatcher)
+                        Output, SelectMultiple, HTML, CallbackDispatcher, FloatText, Dropdown)
 import jupyter_bokeh as jbk
 from matplotlib.axes import Axes
 import matplotlib.style as mplstyle
@@ -361,6 +361,34 @@ def bokeh_apply_dark_background(root_model: Model, bg_color='#15191c'):
                 model.styles = {**model.styles, 'background-color': bg_color}
 
 
+MetricName = Literal['snr', 'spatial_corr', 'cnn_score']
+
+class VisibleRangeCriterion:
+    """Entry in the list of visible range criteria"""
+    def __init__(self, metric='snr', lower=0., upper=1.):
+        self.metric_wgt = Dropdown(
+            options=MetricName.__args__, value=metric, description="Metric range:", disabled=False, layout={'width': '200px'})
+        self.lower_wgt = FloatText(value=lower, step=0.1, description="from", disabled=False, layout={'width': '200px'})
+        self.upper_wgt = FloatText(value=upper, step=0.1, description="to", disabled=False, layout={'width': '200px'})
+        self.remove_button = Button(icon='minus', disabled=False, style={'button_color': 'darkred'}, layout={'width': '30px'})
+
+    @property
+    def metric(self) -> str:
+        return str(self.metric_wgt.value)
+    
+    @property
+    def lower(self) -> float:
+        return self.lower_wgt.value
+    
+    @property
+    def upper(self) -> float:
+        return self.upper_wgt.value
+
+    @property
+    def layout(self) -> HBox:
+        return HBox([self.metric_wgt, self.lower_wgt, self.upper_wgt, self.remove_button])
+
+
 class CNMFVizWideContainer(CNMFVizContainer):
     """
     Drop-in replacement for CNMFVizContainer that works better for wide images
@@ -376,8 +404,6 @@ class CNMFVizWideContainer(CNMFVizContainer):
         'max_equalized'
         ]
     
-    MetricName = Literal['snr', 'spatial_corr', 'cnn_score']
-
     def __init__(
         self,
         dataframe: pd.DataFrame,
@@ -467,7 +493,51 @@ class CNMFVizWideContainer(CNMFVizContainer):
         # force the dark background on each model being rendered
         bokeh_apply_dark_background(self._eval_plots)
 
+        # add contour visibility option based on a metric
+        if "metric range" not in self._radio_visible_components.options:
+            self._radio_visible_components.options += ("metric range",)
         
+        self._criteria_list = VBox()
+        self._add_criterion_button = Button(icon='plus', disabled=False, style={'button_color': 'green'}, layout={'width': '30px'})
+        self._add_criterion_button.on_click(lambda _: self.add_visible_range_criterion())
+        self._visible_range_criteria: list[VisibleRangeCriterion] = []
+
+        self.add_visible_range_criterion()
+
+        self._box_contour_controls.children = [
+            self._dropdown_contour_colors, HBox([
+                self._radio_visible_components, VBox([self._spinbox_alpha_invisible_contours, self._criteria_list])
+            ])
+        ]
+
+
+    def add_visible_range_criterion(self, metric='snr', lower=0., upper=1.):
+        """Add a new entry in the list of visible range criteria, for the "metric range" option"""
+        crit = VisibleRangeCriterion(metric=metric, lower=lower, upper=upper)
+        crit.metric_wgt.observe(self._set_component_visibility_allplots, "value")
+        crit.lower_wgt.observe(self._set_component_visibility_allplots, "value")
+        crit.upper_wgt.observe(self._set_component_visibility_allplots, "value")
+        crit.remove_button.on_click(lambda _: self._remove_visible_range_criterion(crit))
+        
+        self._visible_range_criteria.append(crit)
+        self._update_visible_range_criteria()
+
+
+    def _remove_visible_range_criterion(self, criterion_row: VisibleRangeCriterion):
+        """Delete an entry in the list of visible range criteria"""
+        try:
+            self._visible_range_criteria.remove(criterion_row)
+        except ValueError:
+            pass
+        else:
+            self._update_visible_range_criteria()
+
+
+    def _update_visible_range_criteria(self):
+        self._criteria_list.children = [crit.layout for crit in self._visible_range_criteria] + [self._add_criterion_button]
+        self._set_component_visibility_allplots()
+
+
     @property
     def _cnmf_obj_ext(self) -> CNMFExt:
         # just to help the type checker, identical to _cnmf_obj 
@@ -648,6 +718,14 @@ class CNMFVizWideContainer(CNMFVizContainer):
 
         return mapping
 
+    def _ipywidget_set_component_colors(self, change: dict):
+        """Override handler to bypass set_component_colors for visibility settings"""
+        obj = change['owner']
+        if obj in (self._spinbox_alpha_invisible_contours, self._radio_visible_components):
+            self._set_component_visibility_allplots(change)
+        else:
+            super()._ipywidget_set_component_colors(change)
+
     
     def set_component_colors(self, metric: Union[str, np.ndarray], cmap: Optional[str] = None):
 
@@ -710,12 +788,45 @@ class CNMFVizWideContainer(CNMFVizContainer):
         else:
             super().set_component_colors(metric, cmap)  # type: ignore
 
+    
+    def _set_component_visibility_allplots(self, *_args):
+        """Directly set visibility for event handlers"""
+        for subplot in self._image_widget.gridplot:
+            contour_plot = cast(fpl.LineCollection, subplot['contours'])
+            self._set_component_visibility(contour_plot, self._cnmf_obj_ext)
+
+
+    def _set_component_visibility(self, contours: fpl.LineCollection, cnmf_obj: CNMFExt):
+        """Add "metric range" option for visible contours"""
+        visible = self._radio_visible_components.value
+        alpha_invisible = self._spinbox_alpha_invisible_contours.value
+
+        # initially set all to be visible
+        contours[:].colors[:, -1] = 1
+
+        if visible == "metric range":
+            visible = np.ones(len(contours), dtype=bool)
+            
+            for criterion in self._visible_range_criteria:
+                metric: Optional[MetricInfo] = getattr(cnmf_obj.estimates, criterion.metric, None)
+                assert metric is not None, 'dropdown options should be metric attribute names'
+                if metric.vals is None:
+                    # skip this filter
+                    continue
+
+                visible &= (metric.vals >= criterion.lower) & (metric.vals <= criterion.upper)
+
+            contours[visible].colors[:, -1] = 1
+            contours[~visible].colors[:, -1] = alpha_invisible
+        else:
+            super()._set_component_visibility(contours, cnmf_obj)
+
 
     def metric_histograms(self, n_bins: int = 40) -> tuple[list[MetricHistogram], hv.Layout]:
         """make a layout of DynamicMaps for histograms of metrics parameterized by the current cell and thresholds"""
         hist_objs = []
         hists = []
-        for metric_name in self.MetricName.__args__:
+        for metric_name in MetricName.__args__:
             hist_obj = MetricHistogram(metric_name, self, n_bins=n_bins)
             hist_objs.append(hist_obj)
             hists.append(hist_obj.get_histogram(self._metric_stream))
