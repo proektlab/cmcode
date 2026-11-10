@@ -76,6 +76,8 @@ def get_mouse_params(mouse_id: Union[int, str]) -> dict[str, dict[str, Any]]:
     if params_filename.exists():
         with open(params_filename, 'r') as json_fh:
             mouse_params: dict[str, dict[str, Any]] = json.load(json_fh)
+        if '_comment' in mouse_params:
+            del mouse_params['_comment']
     else:
         mouse_params = {}
     return mouse_params
@@ -161,10 +163,12 @@ class SessionAnalysis:
     PATH_FIELDS = ['image_dir', 'data_dir', 'sbx_files', 'plane_tifs',
                    'mc_result', 'mmap_file_transposed', 'cnmf_fit2_filename', 'cnmf_fit_filename']
 
-    def __init__(self, mouse_id: Union[int, str] = 0, sess_id=0, trials_to_include: Optional[Sequence[int]] = None, *,
+    def __init__(self, mouse_id: Union[int, str] = 0, sess_id=0,
+                 trials_to_include: Union[Optional[Sequence[int]], Sequence[Optional[Sequence[int]]]] = None, *,
                  rec_type='learning_ppc', tag: Optional[str] = None, loaded_info: Optional[dict[str, Any]] = None,
                  sess_filename: Optional[str] = None, param_overrides: Optional[dict[str, dict[str, Any]]] = None,
-                 downsample_factor: Optional[int] = None, trials_to_exclude: Optional[Sequence[int]] = None):
+                 trials_to_exclude: Union[Optional[Sequence[int]], Sequence[Optional[Sequence[int]]]] = None,
+                 downsample_factor: Optional[int] = None, source_sessions: Optional[Sequence[int]] = None):
         """
         Make an object to manage analyzing one session (or part of a session, if trials_to_include is given)
         If loaded_info is not none, ignores all other arguments and constructs from the passed dict.
@@ -187,7 +191,7 @@ class SessionAnalysis:
         self.plane_tifs: Optional[list[str]] = None      # flag for CONVERT stage; paths to plane TIF files
         self.mc_result: Optional[mcorr.MCResult] = None  # flag for MCORR stage; results of motion correction
         self.mmap_file_transposed: Optional[str] = None  # flag for TRANSPOSE stage; transposed, concatenated video
-        self._cnmf_uuid: Optional[str] = None             # flag for CNMF stage (property reads from cnmf_fit_filename first)
+        self._cnmf_uuid: Optional[str] = None            # flag for CNMF stage (property reads from cnmf_fit_filename first)
         self.cnmf_fit_filename: Optional[str] = None     # flag for CNMF_POST stage; path to save location for CNMF results (HDF5 file)
 
         self.params_to_search: Optional[Union[ParamGrid, Sequence[ParamGrid]]] = None   # used if we are doing a CNMF gridsearch
@@ -203,8 +207,18 @@ class SessionAnalysis:
             self.tag: Optional[str] = tag
             self.mouse_id: Union[int, str] = mouse_id
             self.sess_id: int = sess_id
-            self.rec_type: Optional[str] = rec_type
+            self.rec_type: str = rec_type
 
+            # potentially multiple sessions that are being concatenated
+            if source_sessions is None:
+                source_sessions = [sess_id]
+            elif len(source_sessions) == 0:
+                raise ValueError('Source sessions cannot be empty')
+            elif source_sessions[0] != sess_id:
+                logging.warning('First source session does not match sess_id - this could be confusing!')
+
+            self.source_sessions: Sequence[int] = source_sessions
+            
             # get mouse-specific overrides
             mouse_params = get_mouse_params(self.mouse_id)
 
@@ -219,8 +233,9 @@ class SessionAnalysis:
                     snr_type = params_dict['eval_extra']['snr_type']
 
             self.data_dir = paths.get_processed_dir(self.mouse_id, rec_type=rec_type, create_if_not_found=True)
-            self.sbx_files = find_sess_sbx_files(mouse_id, sess_id, trials_to_include=trials_to_include, trials_to_exclude=trials_to_exclude,
-                                                 rec_type=rec_type, remove_ext=True)
+            self.sbx_files, self.trial_numbers = find_sess_sbx_files(
+                mouse_id, self.source_sessions, trials_to_include=trials_to_include, trials_to_exclude=trials_to_exclude, rec_type=rec_type, remove_ext=True)
+
             if len(self.sbx_files) > 0:
                 logging.info('Files found:\n' +
                               str(self.sbx_files) if len(self.sbx_files) < 5 else 
@@ -259,13 +274,24 @@ class SessionAnalysis:
             # fix int16 plane size
             self.metadata['frame_size'] = [int(sz) for sz in self.metadata['frame_size']]
 
-    @property
-    def trial_numbers(self) -> np.ndarray:
-        nums, b_valid = get_trial_numbers_from_files(self.sbx_files)
-        if not all(b_valid):
-            raise RuntimeError('Not all trials have trial numbers')
-        return nums
-    
+            # fill trial numbers if missing (previously was computed dynamically)
+            if not hasattr(self, 'trial_numbers'):
+                if len(self.source_sessions) == 1:
+                    self.trial_numbers, _ = get_trial_numbers_from_files(self.sbx_files)
+                else:
+                    # try to find files again to recompute relative trial numbers
+                    all_files, all_trial_numbers = find_sess_sbx_files(
+                        self.mouse_id, self.source_sessions, rec_type=self.rec_type, remove_ext=True)
+
+                    try:
+                        which_files = [all_files.index(f) for f in self.sbx_files]
+                    except ValueError as e:
+                        raise RuntimeError(
+                            'Trial numbers for concatenated sessions not saved, and some file(s) could not be found '
+                            'when trying to regenerate trial numbers') from e
+
+                    self.trial_numbers = all_trial_numbers[which_files]
+
 
     @property
     def frames_per_trial(self) -> np.ndarray:
@@ -2098,8 +2124,15 @@ class SessionAnalysis:
         save_data = {field: getattr(est, field) for field in est_data_fields if getattr(est, field) is not None}
         save_meta = {field: getattr(est, field) for field in est_meta_fields if getattr(est, field) is not None}
 
-        sess_fields_to_save = ['frames_per_trial', 'trial_numbers', 'mouse_id', 'sess_id', 'tag', 'metadata', 'scan_day']
-        save_meta.update({field: getattr(self, field) for field in sess_fields_to_save if getattr(self, field) is not None})
+        sess_fields_to_save = ['frames_per_trial', 'trial_numbers', 'mouse_id', 'sess_id', 'tag', 'metadata', 'scan_day', 'source_sessions', 'sbx_files']
+        for field in sess_fields_to_save:
+            val = getattr(self, field)
+
+            if field in self.PATH_FIELDS:
+                val = paths.relativize_path(val)
+
+            save_meta[field] = val
+
         if self.tag is None:
             save_meta['tag'] = ''
 

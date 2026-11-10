@@ -33,6 +33,9 @@ def _populate_missing_fields(loaded_info: dict[str, Any]):
     if 'tag' not in loaded_info:
         loaded_info['tag'] = None
 
+    if 'source_sessions' not in loaded_info:
+        loaded_info['source_sessions'] = [loaded_info['sess_id']]
+
     if 'plane_tifs' not in loaded_info:
         loaded_info['plane_tifs'] = None
 
@@ -52,7 +55,6 @@ def _populate_missing_fields(loaded_info: dict[str, Any]):
             loaded_info['rec_type'] = os.path.split(os.path.split(loaded_info['data_dir'])[0])[1]
         else:
             loaded_info['rec_type'] = None
-
 
 def _set_params(sessdata: 'cma.SessionAnalysis', loaded_info: dict[str, Any]):
     """

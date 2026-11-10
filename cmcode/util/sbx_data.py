@@ -3,7 +3,7 @@ import glob
 import os
 import re
 import logging
-from typing import Optional, Sequence, Union
+from typing import Optional, Sequence, Union, cast
 
 from caiman.utils import sbx_utils
 import numpy as np
@@ -11,6 +11,7 @@ from numpy.typing import DTypeLike
 from tqdm import tqdm
 
 from cmcode.util import paths
+from cmcode.util.types import Integral
 
 def subinds_per_file(sbx_files: list[str], frames: Union[int, slice]
                      ) -> tuple[dict[int, slice], int, tuple[int, int, int]]:
@@ -74,7 +75,7 @@ def average_raw_frames(sbx_files: list[str], frames: Union[int, slice], *, chann
             curr_subinds_x = subinds_spatial[1]
             if isinstance(curr_subinds_x, slice):
                 curr_subinds_x = range(dims[1])[curr_subinds_x]
-            new_subinds_x = list(np.setdiff1d(curr_subinds_x, range(ndead)))
+            new_subinds_x = list(np.setdiff1d(np.asarray(curr_subinds_x), range(ndead)))
             subinds_spatial = list(subinds_spatial)
             subinds_spatial[1] = new_subinds_x
 
@@ -105,36 +106,85 @@ def get_trial_numbers_from_files(sbx_files: list[str]) -> tuple[np.ndarray, list
     return trial_numbers, [m is not None for m in trial_number_maybe_matches]
 
 
-def find_sess_sbx_files(mouse_id: Union[int, str], sess_id: int, trials_to_include: Optional[Sequence[int]] = None,
-                        trials_to_exclude: Optional[Sequence[int]] = None,
-                        rec_type: str = 'learning_ppc', remove_ext: bool = False) -> list[str]:
-    """Gets a list of SBX files for the given mouse, session, etc. Removes the ".sbx" if remove_ext is true."""
-    image_dir = paths.get_raw_dir(mouse_id, rec_type)
-    sbx_files = sorted(glob.glob(
-        os.path.join(image_dir, f'{mouse_id}_{sess_id:03d}_*.sbx')))
+def find_sess_sbx_files(mouse_id: Union[int, str], sess_id: Union[int, Sequence[int]],
+                        trials_to_include: Union[Optional[Sequence[int]], Sequence[Optional[Sequence[int]]]] = None,
+                        trials_to_exclude: Union[Optional[Sequence[int]], Sequence[Optional[Sequence[int]]]] = None,
+                        rec_type: str = 'learning_ppc', remove_ext: bool = False) -> tuple[list[str], np.ndarray]:
+    """
+    Gets a list of SBX files for the given mouse, session, etc. Removes the ".sbx" if remove_ext is true.
+    If a list of sess_ids is given, returns a concatenated list of files from each session.
+    Also returns the (0-based) trial indices from the full set of trials from all requested sessions.
+    """
+    if not isinstance(sess_id, Sequence) and (isinstance(sess_id, int) or np.ndim(sess_id) == 0):  # include numpy scalars
+        sess_id = [sess_id]
+        if not (trials_to_include is None or all(isinstance(tr, Integral) for tr in trials_to_include)):
+            raise TypeError('trials_to_include cannot be a list of lists or None if a scalar session is passed')
+        
+        trials_to_include_each = cast(Sequence[Optional[Sequence[int]]], [trials_to_include])
 
-    # remove any files that don't have a trial number for some reason
-    trial_numbers, b_valid = get_trial_numbers_from_files(sbx_files)
-    sbx_files = [f for f, bv in zip(sbx_files, b_valid) if bv]
-    if not all(b_valid):
-        logging.warning(f'Ignoring {sum(~np.array(b_valid))} .sbx files with no trial number')
-
-    # apply trials_to_include
-    if trials_to_include is not None:
-        b_include = np.isin(trial_numbers, trials_to_include)
+        if not (trials_to_exclude is None or all(isinstance(tr, Integral) for tr in trials_to_exclude)):
+            raise TypeError('trials_to_exclude cannot be a list of lists or None if a scalar session is passed')
+        
+        trials_to_exclude_each = cast(Sequence[Optional[Sequence[int]]], [trials_to_exclude])
     else:
-        b_include = np.ones(trial_numbers.shape, dtype=bool)
+        if trials_to_include is None:
+            trials_to_include_each = [None] * len(sess_id)
+        else:
+            if any(isinstance(tr, Integral) for tr in trials_to_include):
+                raise TypeError('trials_to_include cannot be a single list of ints if multiple sessions are passed')
+            
+            trials_to_include_each = cast(Sequence[Optional[Sequence[int]]], trials_to_include)
 
-    if trials_to_exclude is not None:
-        b_include = b_include & ~np.isin(trial_numbers, trials_to_exclude)
+        if trials_to_exclude is None:
+            trials_to_exclude_each = [None] * len(sess_id)
+        else:
+            if any(isinstance(tr, Integral) for tr in trials_to_exclude):
+                raise TypeError('trials_to_exclude cannot be a single list of ints if multiple sessions are passed')
+            
+            trials_to_exclude_each = cast(Sequence[Optional[Sequence[int]]], trials_to_exclude)
 
-    trial_numbers = trial_numbers[b_include]
-    if trials_to_include is not None and any(~np.isin(trials_to_include, trial_numbers)):
-        logging.warning('Not all requested trials were found')
-    sbx_files = [f for f, bi in zip(sbx_files, b_include) if bi]
 
-    # strip off extension if requested
-    if remove_ext:
-        sbx_files = [os.path.splitext(f)[0] for f in sbx_files]
+    image_dir = paths.get_raw_dir(mouse_id, rec_type)
 
-    return sbx_files
+    trial_number_offset = 0
+    numbers_per_sess: list[np.ndarray] = []
+    sbx_files_all: list[str] = []
+
+    for this_sess_id, tr_in, tr_ex in zip(sess_id, trials_to_include_each, trials_to_exclude_each):
+
+        sbx_files = sorted(glob.glob(
+            os.path.join(image_dir, f'{mouse_id}_{this_sess_id:03d}_*.sbx')))
+
+        # remove any files that don't have a trial number for some reason
+        trial_numbers, b_valid = get_trial_numbers_from_files(sbx_files)
+        this_sess_n_trials = trial_numbers.size
+        sbx_files = [f for f, bv in zip(sbx_files, b_valid) if bv]
+        if not all(b_valid):
+            logging.warning(f'Ignoring {sum(~np.array(b_valid))} .sbx files with no trial number')
+
+        # apply trials_to_include
+        if tr_in is not None:
+            b_include = np.isin(trial_numbers, tr_in)
+        else:
+            b_include = np.ones(trial_numbers.shape, dtype=bool)
+
+        if tr_ex is not None:
+            b_include = b_include & ~np.isin(trial_numbers, tr_ex)
+
+        trial_numbers = trial_numbers[b_include]
+
+        if tr_in is not None and any(~np.isin(tr_in, trial_numbers)):
+            logging.warning('Not all requested trials were found')
+
+        sbx_files = [f for f, bi in zip(sbx_files, b_include) if bi]
+
+        # strip off extension if requested
+        if remove_ext:
+            sbx_files = [os.path.splitext(f)[0] for f in sbx_files]
+
+        numbers_per_sess.append(trial_numbers + trial_number_offset)
+        trial_number_offset += this_sess_n_trials
+        sbx_files_all.extend(sbx_files)
+
+    trial_numbers_cat = np.concatenate(numbers_per_sess)
+    return sbx_files_all, trial_numbers_cat
